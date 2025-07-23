@@ -33,9 +33,11 @@ var _ = Describe("VM Agent behaviour during the application lifecycle", func() {
 		ctx = testutil.StartSpecTracerForGinkgo(suiteCtx)
 		harness = e2e.NewTestHarness(ctx)
 		deviceId = harness.StartVMAndEnroll()
+		fmt.Println("disconnection_start")
 	})
 
 	AfterEach(func() {
+		fmt.Println("disconnection_end")
 		harness.Cleanup(true)
 	})
 

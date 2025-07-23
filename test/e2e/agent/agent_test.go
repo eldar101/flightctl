@@ -27,9 +27,11 @@ var _ = Describe("VM Agent behavior", func() {
 		harness = e2e.NewTestHarness(ctx)
 		err := harness.VM.RunAndWaitForSSH()
 		Expect(err).ToNot(HaveOccurred())
+		fmt.Println("disconnection_start")
 	})
 
 	AfterEach(func() {
+		fmt.Println("disconnection_end")
 		err := harness.CleanUpAllResources()
 		Expect(err).ToNot(HaveOccurred())
 		harness.Cleanup(true)
