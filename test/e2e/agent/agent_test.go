@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-
 	"github.com/flightctl/flightctl/api/v1alpha1"
 	apiclient "github.com/flightctl/flightctl/internal/api/client"
 	"github.com/flightctl/flightctl/internal/store/model"
@@ -32,9 +31,6 @@ var _ = Describe("VM Agent behavior", func() {
 
 	AfterEach(func() {
 		fmt.Println("disconnection_end")
-		err := harness.CleanUpAllResources()
-		Expect(err).ToNot(HaveOccurred())
-		harness.Cleanup(true)
 	})
 
 	Context("vm", func() {

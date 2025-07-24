@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
-
 	"github.com/flightctl/flightctl/api/v1alpha1"
 	"github.com/flightctl/flightctl/test/harness/e2e"
 	testutil "github.com/flightctl/flightctl/test/util"
@@ -38,7 +37,6 @@ var _ = Describe("VM Agent behaviour during the application lifecycle", func() {
 
 	AfterEach(func() {
 		fmt.Println("disconnection_end")
-		harness.Cleanup(true)
 	})
 
 	Context("application", func() {
