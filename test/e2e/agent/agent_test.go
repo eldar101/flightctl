@@ -31,6 +31,9 @@ var _ = Describe("VM Agent behavior", func() {
 
 	AfterEach(func() {
 		fmt.Println("disconnection_end")
+		err := harness.CleanUpAllResources()
+		Expect(err).ToNot(HaveOccurred())
+		harness.Cleanup(true)
 	})
 
 	Context("vm", func() {
