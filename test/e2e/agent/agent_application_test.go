@@ -37,6 +37,7 @@ var _ = Describe("VM Agent behaviour during the application lifecycle", func() {
 
 	AfterEach(func() {
 		fmt.Println("disconnection_end")
+		harness.Cleanup(true)
 	})
 
 	Context("application", func() {
