@@ -30,6 +30,9 @@ var _ = Describe("Agent System Info", func() {
 
 	AfterEach(func() {
 		fmt.Println("disconnection_end")
+		err := harness.CleanUpAllResources()
+		Expect(err).ToNot(HaveOccurred())
+		harness.Cleanup(true)
 	})
 
 	It("should show default system infos in the systemInfo status after enrollment and update it", Label("81787", "sanity"), func() {
