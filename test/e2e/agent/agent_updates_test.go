@@ -32,6 +32,7 @@ var _ = Describe("VM Agent behavior during updates", func() {
 
 	AfterEach(func() {
 		fmt.Println("disconnection_end")
+		harness.Cleanup(true)
 	})
 
 	Context("updates", func() {
