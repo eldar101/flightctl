@@ -160,6 +160,12 @@ var _ = Describe("cli operation", func() {
 			badRequestMessage := fmt.Sprintf("%d %s", http.StatusBadRequest, http.StatusText(http.StatusBadRequest))
 			Expect(out).To(ContainSubstring(badRequestMessage))
 			Expect(out).To(ContainSubstring("a resource with this name already exists"))
+
+			By("Deleting possible pending ER and device")
+			_, _ = harness.CLI("delete", fmt.Sprintf("%s/%s", util.Device, erName))
+			_, _ = harness.CLI("delete", fmt.Sprintf("%s/%s", util.EnrollmentRequest, erName))
+			Expect(err).ToNot(HaveOccurred())
+			Expect(out).To(ContainSubstring("Deletion request for enrollmentrequest"))
 		})
 	})
 
@@ -311,6 +317,7 @@ var _ = Describe("cli operation", func() {
 
 			_, err = harness.CLI("delete", fmt.Sprintf("%s/%s", util.EnrollmentRequest, erNewName))
 			Expect(err).ToNot(HaveOccurred())
+			Expect(out).To(ContainSubstring("Deletion request for enrollmentrequest"))
 
 			By("CertificateSigningRequest: Resources lifecycle")
 			uniqueCsrYAML, err := util.CreateUniqueYAMLFile("csr.yaml", harness.GetTestIDFromContext())
