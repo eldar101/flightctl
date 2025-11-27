@@ -13,7 +13,7 @@ spec:
         fleet: default
     spec:
       os:
-        image: quay.io/redhat/rhde:9.2
+        image: quay.io/kenosborn/drone-image:v1:v1
       config:
         - name: base
           gitRef:

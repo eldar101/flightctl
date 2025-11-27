@@ -3,6 +3,7 @@ kind: ResourceSync
 metadata:
   name: default-sync
 spec:
-  repository: flightctl
-  path: /examples/fleet.yaml
-  targetRevision: main
+  repository: eldar-flightctl     # matches metadata.name above
+  path: /examples/fleet.yaml      # same as before
+  targetRevision: fake_rs         # your branch in the fork
+
