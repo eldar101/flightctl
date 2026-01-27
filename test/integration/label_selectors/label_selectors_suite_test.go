@@ -1,6 +1,7 @@
-package basic_operations
+package label_selectors
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/flightctl/flightctl/test/harness/e2e"
@@ -9,12 +10,16 @@ import (
 	. "github.com/onsi/gomega"
 )
 
-func TestBasicOperations(t *testing.T) {
+func TestLabelSelectors(t *testing.T) {
 	RegisterFailHandler(Fail)
-	RunSpecs(t, "Basic Operations E2E Suite")
+	RunSpecs(t, "Label Selectors Integration Suite")
 }
 
 var _ = BeforeSuite(func() {
+	if _, err := e2e.GetBaseDiskPath(); err != nil {
+		Skip(fmt.Sprintf("skipping VM-based suite: %v", err))
+	}
+
 	// Setup VM and harness for this worker
 	_, _, err := e2e.SetupWorkerHarness()
 	Expect(err).ToNot(HaveOccurred())
@@ -59,3 +64,8 @@ var _ = AfterEach(func() {
 
 	GinkgoWriter.Printf("✅ [AfterEach] Worker %d: Test cleanup completed\n", workerID)
 })
+
+const (
+	uniqueLabelKey = "unique"
+	deviceCount    = 10
+)

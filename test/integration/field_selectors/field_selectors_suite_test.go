@@ -1,6 +1,7 @@
-package label_selectors
+package field_selectors
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/flightctl/flightctl/test/harness/e2e"
@@ -9,12 +10,16 @@ import (
 	. "github.com/onsi/gomega"
 )
 
-func TestLabelSelectors(t *testing.T) {
+func TestFieldSelector(t *testing.T) {
 	RegisterFailHandler(Fail)
-	RunSpecs(t, "Label Selectors E2E Suite")
+	RunSpecs(t, "Field selectors Extension E2E Suite")
 }
 
 var _ = BeforeSuite(func() {
+	if _, err := e2e.GetBaseDiskPath(); err != nil {
+		Skip(fmt.Sprintf("skipping VM-based suite: %v", err))
+	}
+
 	// Setup VM and harness for this worker
 	_, _, err := e2e.SetupWorkerHarness()
 	Expect(err).ToNot(HaveOccurred())
@@ -61,6 +66,11 @@ var _ = AfterEach(func() {
 })
 
 const (
-	uniqueLabelKey = "unique"
-	deviceCount    = 10
+	templateImage    = "quay.io/redhat/rhde:9.2"
+	repositoryUrl    = "https://github.com/flightctl/flightctl.git"
+	devicePrefix     = "device"
+	fleetPrefix      = "fleet"
+	repositoryPrefix = "repository"
+	fleetName        = "fleet-1"
+	resourceCount    = 10
 )
