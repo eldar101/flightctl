@@ -1,0 +1,166 @@
+name: Daily merged PRs digest (upstream, test/ yesterday @ 08:00 Israel)
+
+on:
+  schedule:
+    # 08:00 Asia/Jerusalem = 06:00 UTC in winter (UTC+2)
+    - cron: "0 6 * * *"
+    # 08:00 Asia/Jerusalem = 05:00 UTC in summer (UTC+3)
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  send_digest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Build merged PRs digest (flightctl/flightctl, test/, yesterday)
+        id: digest
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const TZ = "Asia/Jerusalem";
+            const UPSTREAM_OWNER = "flightctl";
+            const UPSTREAM_REPO = "flightctl";
+            const UPSTREAM = `${UPSTREAM_OWNER}/${UPSTREAM_REPO}`;
+            const FOLDER_PREFIX = "test/";
+
+            function getParts(date, timeZone) {
+              const dtf = new Intl.DateTimeFormat("en-US", {
+                timeZone,
+                year: "numeric",
+                month: "2-digit",
+                day: "2-digit",
+                hour: "2-digit",
+                minute: "2-digit",
+                second: "2-digit",
+                hour12: false,
+              });
+              const parts = dtf.formatToParts(date);
+              const get = (t) => parts.find(p => p.type === t).value;
+              return {
+                year: Number(get("year")),
+                month: Number(get("month")),
+                day: Number(get("day")),
+                hour: Number(get("hour")),
+                minute: Number(get("minute")),
+                second: Number(get("second")),
+              };
+            }
+
+            function tzOffsetMinutesAtInstant(date, timeZone) {
+              const p = getParts(date, timeZone);
+              const asUTC = Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second);
+              return (asUTC - date.getTime()) / 60000;
+            }
+
+            function zonedWallClockToUTC({year, month, day, hour, minute, second}, timeZone) {
+              let guess = new Date(Date.UTC(year, month - 1, day, hour, minute, second));
+              let offset1 = tzOffsetMinutesAtInstant(guess, timeZone);
+              let utcMs = Date.UTC(year, month - 1, day, hour, minute, second) - offset1 * 60000;
+
+              let refined = new Date(utcMs);
+              let offset2 = tzOffsetMinutesAtInstant(refined, timeZone);
+              utcMs = Date.UTC(year, month - 1, day, hour, minute, second) - offset2 * 60000;
+
+              return new Date(utcMs);
+            }
+
+            const now = new Date();
+            const nowJerusalem = new Intl.DateTimeFormat("en-GB", {
+              timeZone: TZ,
+              hour: "2-digit",
+              minute: "2-digit",
+              hour12: false,
+            }).format(now);
+
+            const eventName = context.eventName;
+            const SHOULD_SEND = (nowJerusalem === "08:00") || (eventName === "workflow_dispatch");
+            core.setOutput("send", SHOULD_SEND ? "true" : "false");
+
+            const todayIsrael = getParts(now, TZ);
+
+            const endUTCDate = zonedWallClockToUTC({
+              year: todayIsrael.year,
+              month: todayIsrael.month,
+              day: todayIsrael.day,
+              hour: 0, minute: 0, second: 0
+            }, TZ);
+
+            const probe = new Date(endUTCDate.getTime() - 36 * 3600 * 1000);
+            const yesterdayIsrael = getParts(probe, TZ);
+
+            const startUTCDate = zonedWallClockToUTC({
+              year: yesterdayIsrael.year,
+              month: yesterdayIsrael.month,
+              day: yesterdayIsrael.day,
+              hour: 0, minute: 0, second: 0
+            }, TZ);
+
+            const startUTC = startUTCDate.toISOString().replace(".000Z", "Z");
+            const endUTC = endUTCDate.toISOString().replace(".000Z", "Z");
+
+            const ymd = `${yesterdayIsrael.year}-${String(yesterdayIsrael.month).padStart(2,"0")}-${String(yesterdayIsrael.day).padStart(2,"0")}`;
+
+            if (!SHOULD_SEND) {
+              core.setOutput("subject", `Skip – ${UPSTREAM} – ${FOLDER_PREFIX}`);
+              core.setOutput("body", `Not 08:00 Asia/Jerusalem (it's ${nowJerusalem}).`);
+              return;
+            }
+
+            const q = `repo:${UPSTREAM} is:pr is:merged merged:${startUTC}..${endUTC}`;
+            const res = await github.rest.search.issuesAndPullRequests({
+              q,
+              per_page: 100,
+              sort: "updated",
+              order: "desc"
+            });
+
+            const items = res.data.items || [];
+            const matched = [];
+
+            for (const pr of items) {
+              const files = await github.paginate(
+                github.rest.pulls.listFiles,
+                { owner: UPSTREAM_OWNER, repo: UPSTREAM_REPO, pull_number: pr.number, per_page: 100 }
+              );
+
+              if (files.some(f => (f.filename || "").startsWith(FOLDER_PREFIX))) {
+                matched.push(pr);
+              }
+            }
+
+            let body =
+              `Merged PRs for ${UPSTREAM}\n` +
+              `Folder: ${FOLDER_PREFIX}\n` +
+              `Day covered (Israel time): ${ymd}\n` +
+              `UTC range: ${startUTC} → ${endUTC}\n\n`;
+
+            if (matched.length === 0) {
+              body += "No PRs matching this folder were merged yesterday.\n";
+            } else {
+              for (const pr of matched) {
+                body += `- #${pr.number} ${pr.title} (${pr.user?.login ?? "unknown"})\n  ${pr.html_url}\n`;
+              }
+            }
+
+            core.setOutput(
+              "subject",
+              `flightctl test/ daily PR report – ${ymd} (${matched.length} merges)`
+            );
+            core.setOutput("body", body);
+
+      - name: Send email
+        if: steps.digest.outputs.send == 'true'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.MAIL_SERVER }}
+          server_port: ${{ secrets.MAIL_PORT }}
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: ${{ steps.digest.outputs.subject }}
+          body: ${{ steps.digest.outputs.body }}
+          to: ${{ secrets.MAIL_TO }}
+          from: ${{ secrets.MAIL_FROM }}
