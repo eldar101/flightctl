@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>E2E CI Scope Audit Demo</title>
+  <style>
+    body {
+      font-family: Arial, Helvetica, sans-serif;
+      color: #111;
+      line-height: 1.45;
+      margin: 40px auto;
+      max-width: 900px;
+      padding: 0 24px 48px;
+    }
+    h1, h2, h3 {
+      color: #111;
+      margin-top: 28px;
+      margin-bottom: 10px;
+    }
+    h1 { font-size: 28px; }
+    h2 { font-size: 22px; }
+    h3 { font-size: 18px; }
+    p { margin: 10px 0; }
+    ul, ol { margin: 8px 0 12px 24px; }
+    li { margin: 4px 0; }
+    code {
+      font-family: Consolas, "Courier New", monospace;
+      background: #f4f4f4;
+      padding: 1px 4px;
+      border-radius: 3px;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      margin: 12px 0 20px;
+    }
+    th, td {
+      border: 1px solid #ccc;
+      padding: 8px 10px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      background: #f0f0f0;
+      font-weight: 700;
+    }
+    .note {
+      color: #444;
+    }
+  </style>
+</head>
+<body>
+  <h1>E2E CI Scope Audit Demo</h1>
+
+  <p>This audit is for a 5 to 10 minute walkthrough. It focuses on the decision, the evidence behind it, and the two implementation options.</p>
+
+  <h2>Terminology</h2>
+  <ul>
+    <li><code>spec</code> = one individual Ginkgo test case.</li>
+    <li><code>bucket</code> = one CI test grouping defined by a label filter, such as non-agent sanity or agent slow.</li>
+    <li><code>node</code> = one parallel Ginkgo worker running part of a bucket.</li>
+    <li><code>job</code> = one CI execution unit in GitHub Actions or Jenkins.</li>
+    <li><code>matrix entry</code> = one specific GitHub workflow combination, such as an OS variant plus a label-filter bucket.</li>
+    <li><code>artifact</code> = saved CI output such as logs or JUnit XML results.</li>
+    <li><code>wall time</code> = the total elapsed clock time for a CI run or job.</li>
+    <li><code>queue wait</code> = the time a job spends waiting before it actually starts running.</li>
+    <li><code>slice</code> = the chosen subset of tests kept together for a specific CI purpose. In this audit, it usually means the tests kept in the required merge-queue path.</li>
+    <li><code>merge_group</code> = GitHub's merge queue run. This is the required CI path that must pass before code reaches <code>main</code>.</li>
+    <li><code>required merge-queue path</code> = the set of checks that block the merge queue. If a test is in this path, it can stop a PR from landing.</li>
+    <li><code>time-to-main</code> = the total time from a ready PR until the change is actually available in <code>main</code>.</li>
+    <li><code>sanity</code> = the current label used for the smaller, higher-priority E2E subset. It does not mean all important tests, only the tests currently tagged that way.</li>
+    <li><code>control-plane subset</code> = tests of the central service behavior rather than device-internal behavior. In this proposal that is <code>cli</code>, <code>configuration</code>, <code>resourcesync</code>, and <code>selectors</code>.</li>
+    <li><code>agent smoke</code> = a very small set of device-agent health tests. In this proposal that is the retained agent specs for device status, OCI prefetch, systemd reporting, update, and rollback.</li>
+    <li><code>non-agent</code> = tests that do not exercise device-agent behavior directly. In practice these are mostly service-side and control-plane flows.</li>
+    <li><code>agent fast</code> = agent-labeled tests that are not marked <code>slow</code>.</li>
+    <li><code>agent slow</code> = agent-labeled tests marked <code>slow</code>, usually because they involve longer device lifecycle behavior.</li>
+    <li><code>canary specs</code> = one or two very small representative tests kept only to catch obvious regressions early, not to provide broad coverage.</li>
+    <li><code>OS variant</code> = the device image under test, such as <code>cs9-bootc</code> or <code>cs10-bootc</code>.</li>
+    <li><code>broad validation lane</code> = the larger CI lane intended to catch more scenarios, more environments, and slower regressions. In this audit, that is Jenkins.</li>
+    <li><code>Jenkins ACM lane</code> = the main broad Jenkins validation path used in this audit.</li>
+    <li><code>specialized coverage</code> = tests for narrower or heavier areas such as backup and restore, TPM, quadlets, disconnected, external DB, or upgrade.</li>
+    <li><code>post-merge lane</code> = validation that runs after code reaches <code>main</code>, not before.</li>
+    <li><code>required check</code> = a CI result that must pass before the merge queue can continue.</li>
+    <li><code>dry-run discovery</code> = listing which tests would run without actually executing them.</li>
+    <li><code>optional PR validation</code> = a manually triggered GitHub workflow for a specific PR that runs extra tests without expanding the required merge queue.</li>
+    <li><code>selector</code> = the test filter used to decide which tests run, such as <code>sanity &amp;&amp; !agent</code> or <code>!integration</code>.</li>
+  </ul>
+
+  <h2>Data Reviewed</h2>
+  <p>This audit compares current GitHub workflow definitions, current Jenkins test selection, fresh Linux dry-run test discovery, recent GitHub merge-queue timing data, GitHub Actions job logs and JUnit artifacts, Jenkins console logs from saved runs, and a separate GitHub flaky-test review.</p>
+
+  <h2>What the Audit Found</h2>
+  <ul>
+    <li>GitHub <code>merge_group</code> currently runs 68 Go E2E specs.</li>
+    <li>The main Jenkins ACM lane runs 143 Go E2E specs.</li>
+    <li>All 68 GitHub specs also run in Jenkins ACM.</li>
+    <li>GitHub therefore has no unique required coverage relative to the main Jenkins ACM lane.</li>
+    <li>Current GitHub scope was revalidated from Linux dry-run discovery on commit <code>e364d4e9fd1490b197f9f67f18a37f974e51cb89</code>.</li>
+  </ul>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Bucket</th>
+        <th>Filter</th>
+        <th>Specs</th>
+        <th>Nodes</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Non-agent sanity</td>
+        <td><code>sanity &amp;&amp; !agent</code></td>
+        <td>43</td>
+        <td>2</td>
+      </tr>
+      <tr>
+        <td>Agent sanity fast</td>
+        <td><code>sanity &amp;&amp; agent &amp;&amp; !slow</code></td>
+        <td>21</td>
+        <td>2</td>
+      </tr>
+      <tr>
+        <td>Agent sanity slow</td>
+        <td><code>sanity &amp;&amp; agent &amp;&amp; slow</code></td>
+        <td>4</td>
+        <td>2</td>
+      </tr>
+      <tr>
+        <td>Total</td>
+        <td>all three buckets</td>
+        <td>68</td>
+        <td>-</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Why This Matters</h2>
+  <ul>
+    <li>The optimization target is time-to-main.</li>
+    <li>Recent GitHub <code>merge_group</code> runs average 61.71 minutes wall time.</li>
+    <li>The biggest GitHub bottleneck is the non-agent <code>sanity</code> leg at 57.11 minutes average.</li>
+    <li>The heaviest contributors inside that leg are <code>backup_restore</code>, <code>quadlets</code>, <code>parametrisable_templates</code>, <code>rootless</code>, <code>containers</code>, <code>alertmanager_proxy</code>, and <code>tpm</code>.</li>
+    <li>A separate GitHub flakiness review classified 31 of 32 failed runs as flakes, so merge-queue pain is being driven by both runtime and instability.</li>
+    <li>Jenkins remains the broad validation lane and the local sample continues to show it is noisy and expensive, which makes it a poor candidate for the required merge-queue path.</li>
+  </ul>
+
+  <p><strong>Bottom line:</strong></p>
+  <ul>
+    <li>GitHub <code>merge_group</code> is too broad today.</li>
+    <li>Jenkins should stay broad.</li>
+    <li>Required merge-queue coverage should remain a subset of broader Jenkins coverage.</li>
+  </ul>
+
+  <h2>Recommended Direction</h2>
+  <ul>
+    <li>Keep GitHub <code>merge_group</code> as the smallest merge-safety slice.</li>
+    <li>Keep broader <code>sanity</code>, environment-heavy, and specialized coverage in Jenkins.</li>
+    <li>Fix flaky tests and flaky infrastructure, but do not use flakiness alone as the reason to remove coverage.</li>
+    <li>If developers need extra GitHub validation for a PR, provide an optional manual GitHub workflow outside <code>merge_group</code>.</li>
+  </ul>
+
+  <p><strong>Why GitHub should be trimmed but Jenkins can stay broad:</strong></p>
+  <ul>
+    <li>GitHub <code>merge_group</code> is the required merge-queue path, so every added minute there directly delays code reaching <code>main</code>.</li>
+    <li>Jenkins broad lanes are not the required path for every PR, so they can carry slower, broader, and more environment-specific validation without slowing every merge.</li>
+    <li>The two systems therefore have different jobs: GitHub protects merge safety with the smallest practical slice, while Jenkins remains the broad regression and environment-validation lane.</li>
+  </ul>
+
+  <h2>Two Implementation Options</h2>
+
+  <h3>Option 1: Balanced Reduction to 30 Specs</h3>
+  <p>This is the recommended default.</p>
+
+  <p><strong>Keep in <code>merge_group</code>:</strong></p>
+  <ul>
+    <li><strong>Control-plane smoke from <code>sanity &amp;&amp; !agent</code>:</strong></li>
+    <li><code>cli</code> <span class="note">(about 3.4 min total)</span> keeps the most common control-plane create, update, delete, and validation flows in the required merge-queue path.</li>
+    <li><code>configuration</code> <span class="note">(about 2.4 min total)</span> keeps basic config application and reconciliation coverage in the required merge-queue path.</li>
+    <li><code>resourcesync</code> <span class="note">(about 1.3 min total)</span> keeps repository-to-fleet sync behavior in the required merge-queue path.</li>
+    <li><code>selectors</code> <span class="note">(about 1.2 min total)</span> keeps core fleet and device selection logic in the required merge-queue path.</li>
+    <li><strong>Agent smoke on both <code>cs9-bootc</code> and <code>cs10-bootc</code>:</strong></li>
+    <li><code>83871</code> <span class="note">(about 0.9 min per spec)</span> keeps OCI prefetch status coverage.</li>
+    <li><code>86238</code> <span class="note">(about 1.9 min per spec)</span> keeps systemd status reporting coverage.</li>
+    <li><code>75991</code> <span class="note">(about 1.0 min per spec)</span> keeps basic device status reporting coverage.</li>
+    <li><code>77671</code> <span class="note">(about 8.1 min per spec)</span> keeps the update path with an embedded application in the required merge-queue path.</li>
+    <li><code>82481</code> <span class="note">(about 4.2 min per spec)</span> keeps rollback-on-bad-image coverage in the required merge-queue path.</li>
+  </ul>
+
+  <p><strong>Result:</strong></p>
+  <ul>
+    <li>Reduce GitHub merge-queue scope from 68 specs to 30 specs.</li>
+    <li>Preserve merge-time coverage for both control-plane and agent behavior.</li>
+    <li>Estimated E2E critical path after trimming: about <code>15 to 17 min</code>.</li>
+    <li>Estimated full merge-queue wall time after trimming: about <code>19 to 21 min</code>.</li>
+  </ul>
+
+  <p><strong>Estimated runtime breakdown:</strong></p>
+  <ul>
+    <li>Retained non-agent test time is about <code>8.3 min</code>, but the current data also shows about <code>4.1 min</code> of environment setup, suite setup, <code>BeforeEach</code>, and similar overhead in that lane.</li>
+    <li>That puts the trimmed non-agent lane at about <code>12.4 min</code>.</li>
+    <li>The retained agent smoke specs sum to about <code>16.1 min</code> of raw spec time per OS, but with the current 2-node split the slowest node is about <code>12.4 min</code>.</li>
+    <li>After adding roughly <code>2 to 4 min</code> of environment setup, suite startup, and per-spec overhead, the retained agent lane is expected to land around <code>14.5 to 16.5 min</code> per OS.</li>
+    <li>Because the agent smoke jobs on <code>cs9-bootc</code> and <code>cs10-bootc</code> run in parallel, the E2E critical path is expected to be gated by one agent lane rather than by the non-agent lane.</li>
+    <li>Current full <code>merge_group</code> wall time averages <code>61.71 min</code>, while the current non-agent bottleneck alone averages <code>57.11 min</code>, so the remaining workflow overhead outside that bottleneck is about <code>4.6 min</code>.</li>
+    <li>Taken together, that implies Solution 1 is not a 30-minute merge queue: it is roughly <code>4.6 min</code> of non-E2E workflow overhead plus a <code>14.5 to 16.5 min</code> E2E critical path, or about <code>19 to 21 min</code> total.</li>
+  </ul>
+
+  <p><strong>Pros:</strong></p>
+  <ul>
+    <li>Better balance between latency and merge-time signal.</li>
+    <li>Removes the biggest measured non-agent runtime drivers.</li>
+    <li>Lower regression risk than a more aggressive cut.</li>
+  </ul>
+
+  <p><strong>Cons:</strong></p>
+  <ul>
+    <li>May still miss a sub-15-minute target without extra node rebalancing.</li>
+    <li>Keeps some agent runtime in the required merge-queue path.</li>
+  </ul>
+
+  <h3>Option 2: Aggressive Sub-15-Minute Merge Queue</h3>
+  <p>Use this only if the priority is a strict sub-15-minute target.</p>
+
+  <p><strong>Keep in <code>merge_group</code>:</strong></p>
+  <ul>
+    <li><strong>Only the control-plane smoke subset:</strong></li>
+    <li><code>cli</code> <span class="note">(about 3.4 min total)</span> keeps the most common control-plane create, update, delete, and validation flows in the required merge-queue path.</li>
+    <li><code>configuration</code> <span class="note">(about 2.4 min total)</span> keeps basic config application and reconciliation coverage in the required merge-queue path.</li>
+    <li><code>resourcesync</code> <span class="note">(about 1.3 min total)</span> keeps repository-to-fleet sync behavior in the required merge-queue path.</li>
+    <li><code>selectors</code> <span class="note">(about 1.2 min total)</span> keeps core fleet and device selection logic in the required merge-queue path.</li>
+    <li><strong>Optionally 1 to 2 very small agent canary specs, for example:</strong></li>
+    <li><code>75991</code> <span class="note">(about 1.0 min per spec)</span> keeps one minimal device-status signal in the required merge-queue path.</li>
+    <li><code>82481</code> <span class="note">(about 4.2 min per spec)</span> keeps one minimal rollback signal in the required merge-queue path.</li>
+  </ul>
+
+  <p><strong>Why this is smaller:</strong></p>
+  <ul>
+    <li>It keeps only the most common control-plane flows that developers hit frequently.</li>
+    <li>It removes the broader agent smoke slice from the required merge-queue path, or reduces it to a minimal canary.</li>
+    <li>It is the cleanest option if the top priority is a very small required merge-queue path.</li>
+  </ul>
+
+  <p><strong>Result:</strong></p>
+  <ul>
+    <li>Best chance of holding the required merge-queue path under 15 minutes.</li>
+    <li>Materially weaker merge-time agent coverage.</li>
+  </ul>
+
+  <p><strong>Pros:</strong></p>
+  <ul>
+    <li>Fastest possible merge queue.</li>
+    <li>Easiest required merge-queue path to keep stable and predictable.</li>
+  </ul>
+
+  <p><strong>Cons:</strong></p>
+  <ul>
+    <li>More agent regressions will be caught after merge rather than before merge.</li>
+    <li>Higher dependence on Jenkins or optional post-merge GitHub validation.</li>
+  </ul>
+
+  <h2>Suggested Talk Track</h2>
+  <ol>
+    <li>GitHub is currently blocking merges with a 68-spec E2E slice, and all of it already exists in Jenkins ACM.</li>
+    <li>The problem is not lack of coverage. The problem is that the required merge-queue path is too broad.</li>
+    <li>The biggest bottleneck is the non-agent GitHub sanity leg, not the agent OS matrix.</li>
+    <li>Jenkins should stay the broad validation lane, but not become the merge-queue lane.</li>
+    <li>We therefore have two choices: balanced 30-spec merge-safety slice or a more aggressive sub-15-minute slice.</li>
+    <li>The recommended default is the 30-spec option because it cuts latency without dropping too much merge-time signal.</li>
+    <li>If developers need one removed suite on a PR, run it through an optional GitHub workflow outside <code>merge_group</code>, not by dynamically changing the queue.</li>
+  </ol>
+
+  <h2>FAQ</h2>
+
+  <p><strong>Why is <code>sanity</code> still too broad if it is supposed to be the smaller subset?</strong><br>
+  <span class="note"><code>sanity</code> is smaller than the full E2E inventory, but in practice it still includes several expensive and specialized suites. In the current GitHub data, that smaller subset is still large enough to create about an hour of merge-queue runtime.</span></p>
+
+  <p><strong>Why keep any agent coverage in <code>merge_group</code> at all?</strong><br>
+  <span class="note">Because some device-agent failures are core merge-safety risks, not just broad regression risks. Keeping a very small agent slice lets GitHub still catch obvious status, update, prefetch, and rollback regressions before code reaches <code>main</code>.</span></p>
+
+  <p><strong>Why were those 5 specific agent specs chosen?</strong><br>
+  <span class="note">They are the smallest explicit set that still covers the core agent paths this audit treats as merge safety: device status, OCI prefetch, systemd or application state reporting, update, and rollback. They also already exist in the current GitHub <code>sanity</code> inventory.</span></p>
+
+  <p><strong>Why keep both <code>cs9-bootc</code> and <code>cs10-bootc</code> in the balanced option?</strong><br>
+  <span class="note">Because the agent slice is already small, and cross-OS differences are more likely to matter for agent behavior than for the retained control-plane groups. Keeping both OS variants preserves that protection while the slice is still small enough to be practical.</span></p>
+
+  <p><strong>Why is <code>cli</code> kept even though it also appears in flaky runs?</strong><br>
+  <span class="note">Because <code>cli</code> is still core merge-safety coverage. The audit treats flakiness as a problem to fix, not as the main rule for what stays or goes.</span></p>
+
+  <p><strong>Why not just fix flakes and keep the current scope?</strong><br>
+  <span class="note">Because the current problem is not only flakiness. The measured merge-queue runtime is already too high even before accounting for flakes, and flakes add extra retries on top of that.</span></p>
+
+  <p><strong>Why not trim Jenkins too if it is also slow and noisy?</strong><br>
+  <span class="note">Because Jenkins is not the required merge-queue path for every PR. GitHub should be optimized for time-to-main, while Jenkins can remain the broader lane for slower and more environment-heavy validation.</span></p>
+
+  <p><strong>Why is Jenkins considered acceptable as the broad lane despite instability?</strong><br>
+  <span class="note">Because the audit is not recommending Jenkins as the path every merge must wait on. Its instability is a reason not to move that breadth into GitHub merge queue, not a reason to remove broad validation altogether.</span></p>
+
+  <p><strong>If GitHub has no unique coverage, why keep any GitHub E2E at all?</strong><br>
+  <span class="note">Because GitHub still needs a small pre-merge merge-safety signal. The fact that Jenkins also runs that coverage means GitHub should keep only a small subset, not that GitHub should have no E2E protection before merge.</span></p>
+
+  <p><strong>What exactly is lost before merge if we move to the 30-spec option?</strong><br>
+  <span class="note">The broad non-agent suites move out of the required merge-queue path, including backup and restore, quadlets, rootless, containers, alertmanager proxy, TPM, and similar heavier areas. Broad agent coverage also moves out, but the small agent smoke slice remains.</span></p>
+
+  <p><strong>What exactly is lost before merge if we move to the sub-15-minute option?</strong><br>
+  <span class="note">Pre-merge agent protection becomes much smaller. OCI prefetch, systemd reporting, embedded-app update, and part of rollback behavior may no longer be covered before merge unless a canary for that area is kept.</span></p>
+
+  <p><strong>How realistic is the <code>&lt;15 min</code> target without adding nodes?</strong><br>
+  <span class="note">It is much more realistic only with the more aggressive slice. The balanced 30-spec option may still need node rebalancing or additional capacity to stay under that target consistently.</span></p>
+
+  <p><strong>Are the proposed runtimes based on one run or multiple runs?</strong><br>
+  <span class="note">The group timings in the audit come from multiple sampled GitHub <code>merge_group</code> runs. The per-spec brackets in the proposal are approximate values based on saved GitHub JUnit results for those retained specs.</span></p>
+
+  <p><strong>How much confidence do we have in the measured timing data?</strong><br>
+  <span class="note">Enough to support the direction of the recommendation. The exact minute values can move run to run, but the broad conclusion is stable: the current GitHub slice is too expensive, and the biggest pain is concentrated in a small set of suites.</span></p>
+
+  <p><strong>Could the retained slice still regress over time and become too slow again?</strong><br>
+  <span class="note">Yes. That is why the audit includes success metrics and recommends treating the retained slice as something to monitor and adjust, not as a permanent truth.</span></p>
+
+  <p><strong>Why use fixed slices instead of dynamically choosing tests per PR?</strong><br>
+  <span class="note">Because <code>merge_group</code> is a shared queue lane, not a custom path per PR. Making it dynamic would make the queue harder to reason about and would let one PR expand the cost for everyone behind it.</span></p>
+
+  <p><strong>Why not run broader tests as optional GitHub PR validation instead of Jenkins?</strong><br>
+  <span class="note">That is a valid supplement and the audit recommends it. But optional GitHub PR validation should sit outside the required merge-queue path; it does not replace the need for a broad validation lane somewhere.</span></p>
+
+  <p><strong>What should be the decision rule for future tests: GitHub or Jenkins?</strong><br>
+  <span class="note">If a test is part of the smallest practical merge-safety subset, keep it in GitHub <code>merge_group</code>. If it is broader, slower, more environment-specific, or specialized, keep it in Jenkins or an optional GitHub validation path.</span></p>
+
+  <p><strong>What concrete workflow changes are needed to implement Option 1?</strong><br>
+  <span class="note">Limit the non-agent GitHub scope to <code>cli</code>, <code>configuration</code>, <code>resourcesync</code>, and <code>selectors</code>, and limit the agent GitHub scope to the 5 retained agent smoke IDs across <code>cs9-bootc</code> and <code>cs10-bootc</code>.</span></p>
+
+  <p><strong>What concrete workflow changes are needed to implement Option 2?</strong><br>
+  <span class="note">Keep only the retained control-plane groups in GitHub <code>merge_group</code>, optionally keep 1 or 2 agent canaries, and move the rest of the current GitHub <code>sanity</code> breadth to Jenkins or optional GitHub validation outside the required merge-queue path.</span></p>
+</body>
+</html>
