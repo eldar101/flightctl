@@ -1,5 +1,10 @@
 # Developer Documentation
 
+Additional developer documents:
+
+- [E2E CI scope audit for GitHub Actions and Jenkins](e2e-ci-scope-audit.md)
+- [E2E CI scope audit demo](e2e-ci-scope-audit-demo.md)
+
 ## Building
 
 Prerequisites:
