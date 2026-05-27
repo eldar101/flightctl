@@ -9,7 +9,7 @@ module.exports = defineConfig({
       config.env.authProviderAuthorizeUrl =
         process.env.CYPRESS_AUTHPROVIDER_AUTHORIZE_URL || config.env.authProviderAuthorizeUrl || ''
       config.env.authProviderCallbackPort =
-        process.env.CYPRESS_AUTHPROVIDER_CALLBACK_PORT || config.env.authProviderCallbackPort || '18080'
+        process.env.CYPRESS_AUTHPROVIDER_CALLBACK_PORT || config.env.authProviderCallbackPort || '8080'
       config.env.authProviderUI =
         process.env.CYPRESS_AUTHPROVIDER_UI || config.env.authProviderUI || ''
       config.env.authProviderUsername =

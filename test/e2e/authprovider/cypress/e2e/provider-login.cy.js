@@ -1,6 +1,6 @@
 const resolveAuthorizeUrl = () => String(Cypress.env('authProviderAuthorizeUrl') || '').trim()
 const providerUI = () => String(Cypress.env('authProviderUI') || '').trim().toLowerCase()
-const callbackPort = () => String(Cypress.env('authProviderCallbackPort') || '18080').trim()
+const callbackPort = () => String(Cypress.env('authProviderCallbackPort') || '8080').trim()
 const username = () => String(Cypress.env('authProviderUsername') || '').trim()
 const password = () => String(Cypress.env('authProviderPassword') || '').trim()
 const callbackLocationFragment = () => `localhost:${callbackPort()}`

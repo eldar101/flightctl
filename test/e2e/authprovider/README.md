@@ -19,11 +19,11 @@ This suite tests the `EDM-2117` browser-login slice for authentication providers
 
 The Keycloak OIDC and Keycloak-backed OAuth2 browser-login specs remain `chromedp`-based.
 
-The OpenShift and PAM browser-login specs are driven by a suite-local Cypress harness under [`test/e2e/authprovider/cypress`](./cypress).
+The OpenShift, PAM, and AAP browser-login specs are driven by a suite-local Cypress harness under [`test/e2e/authprovider/cypress`](./cypress).
 
-The Go suite invokes [`run-provider-login-cypress.sh`](./cypress/run-provider-login-cypress.sh) for the OpenShift and PAM browser-login specs.
+The Go suite invokes [`run-provider-login-cypress.sh`](./cypress/run-provider-login-cypress.sh) for the OpenShift, PAM, and AAP browser-login specs.
 If Cypress is missing, that wrapper installs it automatically with `npm install` before running the test.
-The wrapper prefers credentials from `USERNAME` and `PASSWORD` environment variables and only falls back to positional arguments if they are provided.
+The wrapper prefers credentials from `USERNAME` and `PASSWORD` environment variables and only falls back to positional arguments if they are provided. The callback port defaults to the CLI default `8080` unless `FLIGHTCTL_CALLBACK_PORT` overrides it.
 
 Requires Chrome/Chromium for the existing `chromedp` Keycloak flow. The suite uses `e2e.SetupWorkerHarnessWithoutVM()` (no device VM).
 
@@ -33,4 +33,4 @@ Requires Chrome/Chromium for the existing `chromedp` Keycloak flow. The suite us
 - **Keycloak / Generic OAuth2:** suite-owned credentials from the test realm (`testuser` / `testpass`) and the suite-owned `flightctl-oauth2-client`
 - **OpenShift:** `OPENSHIFT_USERNAME` / `OPENSHIFT_PASSWORD`, falling back to `kubeadmin` and `KUBEADMIN_PASS`
 - **PAM:** `E2E_PAM_USER` / `E2E_PAM_PASSWORD`, with the same defaults used by the repo
-- **AAP:** `AAP_USERNAME` / `AAP_PASSWORD` (required, no defaults; test is skipped if not set)
+- **AAP:** `AAP_USERNAME` / `AAP_PASSWORD` (required, no defaults; test is skipped if not set). Quadlet AAP setup also requires `AAP_API_URL` and either `AAP_CLIENT_ID` or `AAP_TOKEN`; optional overrides are `AAP_AUTHORIZATION_URL`, `AAP_TOKEN_URL`, `AAP_APP_NAME`, and `AAP_ORGANIZATION_ID`.

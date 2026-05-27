@@ -21,7 +21,7 @@ if [[ -z "$PASSWORD" ]]; then
 fi
 
 FLIGHTCTL_BIN="${FLIGHTCTL:-flightctl}"
-CALLBACK_PORT="${FLIGHTCTL_CALLBACK_PORT:-18080}"
+CALLBACK_PORT="${FLIGHTCTL_CALLBACK_PORT:-8080}"
 LOG="$(mktemp)"
 CYPRESS_BIN="./node_modules/.bin/cypress"
 

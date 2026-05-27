@@ -11,17 +11,22 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/chromedp/chromedp"
+	"github.com/flightctl/flightctl/internal/quadlet/renderer"
 	"github.com/flightctl/flightctl/test/e2e/infra"
 	"github.com/flightctl/flightctl/test/e2e/infra/auxiliary"
+	quadletinfra "github.com/flightctl/flightctl/test/e2e/infra/quadlet"
+	"github.com/flightctl/flightctl/test/e2e/infra/setup"
 	"github.com/flightctl/flightctl/test/harness/e2e"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/sirupsen/logrus"
+	"sigs.k8s.io/yaml"
 )
 
 const (
@@ -40,6 +45,7 @@ const (
 	defaultCypressLoginScript    = "cypress/run-provider-login-cypress.sh"
 	providerVisibilityArg        = "--show-providers"
 	loginInsecureTLSArg          = "--insecure-skip-tls-verify"
+	aapConfigSkipMessage         = "AAP quadlet tests require AAP_API_URL and either AAP_CLIENT_ID or AAP_TOKEN"
 	aapCredentialSkipMessage     = "AAP browser login requires AAP_USERNAME and AAP_PASSWORD"
 	openshiftPasswordMessage     = "OPENSHIFT_PASSWORD or KUBEADMIN_PASS must be set for OpenShift browser login"
 	duplicateOIDCErrorSubstring  = "same issuer and clientId already exists"
@@ -59,6 +65,21 @@ type browserLoginScenario struct {
 	providerUI   string
 	username     string
 	password     string
+}
+
+type quadletAAPConfig struct {
+	APIURL           string
+	AuthorizationURL string
+	TokenURL         string
+	ClientID         string
+	Token            string
+	AppName          string
+	OrganizationID   int
+}
+
+type quadletAAPClientIDSnapshot struct {
+	exists  bool
+	content string
 }
 
 var _ = Describe("Auth provider browser login", func() {
@@ -272,6 +293,7 @@ var _ = Describe("Auth provider browser login", func() {
 	Context("AAP auth on quadlet", func() {
 		It("is visible as an available auth provider", Label("authprovider", "quadlets"), func() {
 			infra.SkipIfNotQuadlet("AAP provider only applies to quadlet deployments")
+			Expect(ensureQuadletAAPProviderConfiguredForCurrentSpec()).To(Succeed())
 
 			By("checking that AAP appears in --show-providers")
 			apiEndpoint := harness.ApiEndpoint()
@@ -288,6 +310,7 @@ var _ = Describe("Auth provider browser login", func() {
 				Skip(aapCredentialSkipMessage + ". Set these environment variables to test AAP browser login flow. " +
 					"Credentials must match a user in the AAP instance configured in the quadlet deployment.")
 			}
+			Expect(ensureQuadletAAPProviderConfiguredForCurrentSpec()).To(Succeed())
 
 			ctx, cancel := context.WithTimeout(harness.GetTestContext(), loginFlowTimeout)
 			defer cancel()
@@ -355,6 +378,233 @@ func aapBrowserScenario() browserLoginScenario {
 		username:   strings.TrimSpace(os.Getenv("AAP_USERNAME")),
 		password:   strings.TrimSpace(os.Getenv("AAP_PASSWORD")),
 	}
+}
+
+func ensureQuadletAAPProviderConfiguredForCurrentSpec() error {
+	aapConfig, skipMessage, err := quadletAAPConfigFromEnv()
+	if err != nil {
+		return err
+	}
+	if skipMessage != "" {
+		Skip(skipMessage + ". Set AAP_API_URL and either AAP_CLIENT_ID or AAP_TOKEN for the quadlet deployment.")
+	}
+	return configureQuadletAAPProviderForTest(aapConfig)
+}
+
+func quadletAAPConfigFromEnv() (*quadletAAPConfig, string, error) {
+	apiURL := strings.TrimSpace(os.Getenv("AAP_API_URL"))
+	clientID := strings.TrimSpace(os.Getenv("AAP_CLIENT_ID"))
+	token := strings.TrimSpace(os.Getenv("AAP_TOKEN"))
+	if apiURL == "" || (clientID == "" && token == "") {
+		return nil, aapConfigSkipMessage, nil
+	}
+
+	organizationID := 0
+	if raw := strings.TrimSpace(os.Getenv("AAP_ORGANIZATION_ID")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil {
+			return nil, "", fmt.Errorf("parse AAP_ORGANIZATION_ID %q: %w", raw, err)
+		}
+		organizationID = parsed
+	}
+
+	return &quadletAAPConfig{
+		APIURL:           apiURL,
+		AuthorizationURL: firstNonEmpty(strings.TrimSpace(os.Getenv("AAP_AUTHORIZATION_URL")), defaultAAPAuthorizationURL(apiURL)),
+		TokenURL:         firstNonEmpty(strings.TrimSpace(os.Getenv("AAP_TOKEN_URL")), defaultAAPTokenURL(apiURL)),
+		ClientID:         clientID,
+		Token:            token,
+		AppName:          strings.TrimSpace(os.Getenv("AAP_APP_NAME")),
+		OrganizationID:   organizationID,
+	}, "", nil
+}
+
+func configureQuadletAAPProviderForTest(aapConfig *quadletAAPConfig) error {
+	if aapConfig == nil {
+		return fmt.Errorf("AAP config is required")
+	}
+
+	providers := setup.GetDefaultProviders()
+	if providers == nil || providers.Infra == nil || providers.Lifecycle == nil {
+		return fmt.Errorf("quadlet providers are not initialized")
+	}
+
+	quadletProvider, ok := providers.Infra.(*quadletinfra.InfraProvider)
+	if !ok {
+		return fmt.Errorf("infra provider %T is not quadlet", providers.Infra)
+	}
+
+	originalConfig, err := quadletProvider.GetStandaloneServiceConfig()
+	if err != nil {
+		return fmt.Errorf("read standalone service config: %w", err)
+	}
+	clientIDSnapshot, err := captureQuadletAAPClientIDSnapshot(quadletProvider)
+	if err != nil {
+		return fmt.Errorf("capture AAP client ID snapshot: %w", err)
+	}
+
+	DeferCleanup(func() {
+		if err := restoreQuadletAAPClientIDSnapshot(quadletProvider, clientIDSnapshot); err != nil {
+			logrus.Warnf("[authprovider] failed to restore AAP client ID file: %v", err)
+		}
+		if err := quadletProvider.SetStandaloneServiceConfig(originalConfig); err != nil {
+			logrus.Warnf("[authprovider] failed to restore standalone service config: %v", err)
+			return
+		}
+		if err := providers.Lifecycle.Restart(infra.ServiceAPI); err != nil {
+			logrus.Warnf("[authprovider] failed to restart API after restoring standalone service config: %v", err)
+			return
+		}
+		if err := providers.Lifecycle.WaitForReady(infra.ServiceAPI, loginFlowTimeout); err != nil {
+			logrus.Warnf("[authprovider] API not ready after restoring standalone service config: %v", err)
+		}
+	})
+
+	updatedConfig, err := withQuadletAAPServiceConfig(originalConfig, aapConfig)
+	if err != nil {
+		return err
+	}
+	if err := quadletProvider.SetStandaloneServiceConfig(updatedConfig); err != nil {
+		return fmt.Errorf("write standalone service config: %w", err)
+	}
+	if aapConfig.Token != "" && aapConfig.ClientID == "" {
+		if _, err := quadletProvider.RunCommand("flightctl-standalone", "aap", "create-oauth-application"); err != nil {
+			return fmt.Errorf("create AAP OAuth application: %w", err)
+		}
+	}
+	if err := providers.Lifecycle.Restart(infra.ServiceAPI); err != nil {
+		return fmt.Errorf("restart API with AAP config: %w", err)
+	}
+	if err := providers.Lifecycle.WaitForReady(infra.ServiceAPI, loginFlowTimeout); err != nil {
+		return fmt.Errorf("wait for API after AAP config: %w", err)
+	}
+
+	return nil
+}
+
+func withQuadletAAPServiceConfig(configYAML string, aapConfig *quadletAAPConfig) (string, error) {
+	if aapConfig == nil {
+		return "", fmt.Errorf("AAP config is required")
+	}
+
+	var root map[string]interface{}
+	if err := yaml.Unmarshal([]byte(configYAML), &root); err != nil {
+		return "", fmt.Errorf("parse standalone service config: %w", err)
+	}
+
+	global := ensureNestedMap(root, "global")
+	auth := ensureNestedMap(global, "auth")
+	aap := ensureNestedMap(auth, "aap")
+
+	auth["type"] = "aap"
+	auth["insecureSkipTlsVerify"] = true
+
+	if pam, ok := auth["pamOidcIssuer"].(map[string]interface{}); ok {
+		pam["enabled"] = false
+	}
+
+	aap["enabled"] = true
+	aap["apiUrl"] = aapConfig.APIURL
+	aap["authorizationUrl"] = aapConfig.AuthorizationURL
+	aap["tokenUrl"] = aapConfig.TokenURL
+
+	if aapConfig.ClientID != "" {
+		aap["clientId"] = aapConfig.ClientID
+	} else {
+		delete(aap, "clientId")
+	}
+
+	if aapConfig.Token != "" {
+		aap["token"] = aapConfig.Token
+	} else {
+		delete(aap, "token")
+	}
+
+	if aapConfig.AppName != "" {
+		aap["appName"] = aapConfig.AppName
+	} else {
+		delete(aap, "appName")
+	}
+
+	if aapConfig.OrganizationID > 0 {
+		aap["organizationId"] = aapConfig.OrganizationID
+	} else {
+		delete(aap, "organizationId")
+	}
+
+	updated, err := yaml.Marshal(root)
+	if err != nil {
+		return "", fmt.Errorf("marshal standalone service config: %w", err)
+	}
+	return string(updated), nil
+}
+
+func ensureNestedMap(root map[string]interface{}, key string) map[string]interface{} {
+	if existing, ok := root[key].(map[string]interface{}); ok {
+		return existing
+	}
+
+	created := map[string]interface{}{}
+	root[key] = created
+	return created
+}
+
+func defaultAAPAuthorizationURL(apiURL string) string {
+	return strings.TrimRight(apiURL, "/") + "/o/authorize/"
+}
+
+func defaultAAPTokenURL(apiURL string) string {
+	return strings.TrimRight(apiURL, "/") + "/o/token/"
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func captureQuadletAAPClientIDSnapshot(provider *quadletinfra.InfraProvider) (*quadletAAPClientIDSnapshot, error) {
+	if provider == nil {
+		return nil, fmt.Errorf("quadlet provider is required")
+	}
+
+	content, err := provider.ReadHostFile(renderer.DefaultAAPClientIDPath)
+	if err != nil {
+		if isMissingHostFileError(err) {
+			return &quadletAAPClientIDSnapshot{}, nil
+		}
+		return nil, err
+	}
+
+	return &quadletAAPClientIDSnapshot{
+		exists:  true,
+		content: content,
+	}, nil
+}
+
+func restoreQuadletAAPClientIDSnapshot(provider *quadletinfra.InfraProvider, snapshot *quadletAAPClientIDSnapshot) error {
+	if provider == nil {
+		return fmt.Errorf("quadlet provider is required")
+	}
+	if snapshot == nil {
+		return fmt.Errorf("AAP client ID snapshot is required")
+	}
+
+	if !snapshot.exists {
+		return provider.RemoveHostFile(renderer.DefaultAAPClientIDPath)
+	}
+
+	return provider.WriteHostFile(renderer.DefaultAAPClientIDPath, []byte(snapshot.content))
+}
+
+func isMissingHostFileError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "No such file or directory")
 }
 
 // authProviderManifestPath returns the temp-file path used for a provider manifest in this suite.
