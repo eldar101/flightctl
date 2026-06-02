@@ -14,7 +14,9 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-const sshWaitTimeout time.Duration = 60 * time.Second
+// SSH timeout increased from 60s to 180s for nested VM environments (OCP)
+// where boot time + SSH startup can exceed 60s under resource contention
+const sshWaitTimeout time.Duration = 180 * time.Second
 
 // sshProbeAttemptTimeout caps a single RunSSH readiness probe so one hung ssh(1)
 // cannot exceed the overall WaitForSSHToBeReady deadline by blocking forever.
@@ -40,7 +42,8 @@ type TestVM struct {
 	MemoryFilePath    string // Path for external snapshot memory file
 	MemoryMiB         int    // VM memory in MiB; 0 means use default (2048)
 	DiskSizeGB        int
-	// SSHWaitTimeout is how long to wait for SSH to become ready. Zero uses the default (60s).
+	TPMDevice         string // Host TPM device path for passthrough (e.g., /dev/tpmrm0); empty uses swtpm emulator
+	// SSHWaitTimeout is how long to wait for SSH to become ready. Zero uses the default (180s).
 	// Use a longer value for first-boot VMs (e.g. imagebuild workflow) where cloud-init or sshd may start late.
 	SSHWaitTimeout time.Duration
 }
@@ -79,6 +82,8 @@ type JournalOpts struct {
 	Unit     string
 	Since    string // time string like "20 minutes ago" or empty for all logs
 	LastBoot bool   // false by default, when true restricts logs to current boot
+	// Lines, if > 0, passes journalctl -n Lines (most recent N entries matching other filters).
+	Lines int
 }
 
 func (v *TestVM) WaitForSSHToBeReady() error {
@@ -189,7 +194,7 @@ func (v *TestVM) RunSSH(inputArgs []string, stdin *bytes.Buffer) (*bytes.Buffer,
 }
 
 func (v *TestVM) JournalLogs(opts JournalOpts) (string, error) {
-	args := []string{"sudo", "journalctl", "--no-pager", "--no-hostname"}
+	args := []string{"sudo", "TZ=UTC", "journalctl", "--no-pager", "--no-hostname"}
 
 	if opts.Unit != "" {
 		args = append(args, "-u", opts.Unit)
@@ -202,7 +207,14 @@ func (v *TestVM) JournalLogs(opts JournalOpts) (string, error) {
 	}
 
 	if opts.Since != "" {
-		args = append(args, "--since", fmt.Sprintf("%q", opts.Since))
+		since := opts.Since
+		if t, err := time.Parse(time.RFC3339, since); err == nil {
+			since = t.UTC().Format("2006-01-02 15:04:05")
+		}
+		args = append(args, "--since", fmt.Sprintf("%q", since))
+	}
+	if opts.Lines > 0 {
+		args = append(args, "-n", strconv.Itoa(opts.Lines))
 	}
 
 	logrus.Debugf("Reading journal logs with command: %s", strings.Join(args, " "))

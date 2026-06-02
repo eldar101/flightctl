@@ -23,15 +23,15 @@ Welcome to the Flight Control user documentation.
     * [Configuring the ImageBuilder Worker](installing/configuring-imagebuilder.md)
     * [Configuring Device Attestation](installing/configuring-device-attestation.md)
     * [Configuring Rate Limits on API Requests](installing/configuring-rate-limiting.md)
+    * [Configuring Vulnerability Integration](installing/configuring-vulnerability-integration.md)
 
   * Monitoring the Flight Control Service
     * [Deploying the Observability Stack on Kubernetes](installing/deploying-observability-kubernetes.md)
     * [Deploying the Observability Stack on Linux](installing/deploying-observability-linux.md)
     * [Configuring Service Tracing](installing/configuring-service-tracing.md) (advanced)
 
-  * Backing-up and Restoring the Flight Control Service
-    * [Backing up the PostgreSQL Database](installing/performing-database-backup.md)
-    * [Restoring from Backup](installing/performing-database-restore.md)
+  * Backing up and Restoring the Flight Control Service
+    * [Backup and Restore](installing/backup-restore.md)
 
 * **[Installing the Flight Control CLI](installing/installing-cli.md)**
 
@@ -63,6 +63,13 @@ Welcome to the Flight Control user documentation.
   * [Selecting Devices into a Fleet](using/managing-fleets.md#selecting-devices-into-a-fleet)
   * [Defining Device Templates](using/managing-fleets.md#defining-device-templates)
   * [Defining Rollout Policies](using/managing-fleets.md#defining-rollout-policies)
+* **[Auto-syncing External Dependencies](using/auto-syncing-dependencies.md)** - How Flight Control automatically detects and applies upstream changes to device configurations.
+* **[Viewing Vulnerabilities](using/viewing-vulnerabilities.md)** - How to view vulnerability data for devices and fleets.
+  * [Viewing the Vulnerability Summary](using/viewing-vulnerabilities.md#viewing-the-vulnerability-summary)
+  * [Viewing Device Vulnerabilities](using/viewing-vulnerabilities.md#viewing-device-vulnerabilities)
+  * [Viewing Fleet Vulnerabilities](using/viewing-vulnerabilities.md#viewing-fleet-vulnerabilities)
+  * [Viewing CVE Impact](using/viewing-vulnerabilities.md#viewing-cve-impact)
+  * [Finding Devices Affected by a CVE](using/viewing-vulnerabilities.md#finding-devices-affected-by-a-cve)
 * **[Software Catalog](using/managing-catalogs.md)** - How to organize and distribute versioned software components using catalogs.
   * [Catalogs](using/managing-catalogs.md#catalogs)
   * [Catalog items](using/managing-catalogs.md#catalog-items)

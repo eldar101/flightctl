@@ -36,6 +36,8 @@ DeviceTemplate
 df
 e.g.
 ECDSA
+EL9
+EL10
 EnrollmentRequest
 EnrollmentRequests
 Envoy
@@ -123,6 +125,8 @@ Skopeo
 spec
 specs
 SpiceDB
+stream9
+stream10
 subdomains
 substring
 systemd
@@ -203,11 +207,15 @@ NVRAM
 RSA
 KV
 Redis
+valkey
+RHEL9
+RHEL10
 AwaitingReconnect
 ConflictPaused
 pg_restore
 psql
 redis-cli
+valkey-cli
 pg_isready
 renderedVersion
 quadlets
@@ -270,7 +278,9 @@ pprof
 RFC3339
 RPC
 sos
+sanitization
 sudo
+systemInfo
 ts
 update_device_status_duration_seconds
 v1.0.0
@@ -291,6 +301,8 @@ subcommand
 statefulsets
 daemonsets
 cronjobs
+CronJob
+Helm
 imagebuilds
 imagebuild
 imageexport
@@ -332,6 +344,18 @@ multicluster
  repos
  RHSM
  volumeMount
+ Syft
+ CycloneDX
+ PURL
+ PURLs
+ referrer
+ imageBuilderWorker
+ GeneratingSBOM
+ vulnerabilityReporting
+ SBOM
+ Trustify
+ distro
+ README
  - docs/user/references/api-resources.md
 CertificateSigningRequest
 AuthConfig
@@ -602,9 +626,36 @@ ImageExport
 OCI
 ReadWrite
 ImageBuilder
- - docs/user/references/agent-architecture.md
+Syft
+CycloneDX
+PURL
+PURLs
+SBOM
+Trustify
+- docs/user/references/agent-architecture.md
 MCD-like
 jumphost-less
  - docs/user/using/greenboot.md
 flightctl_agent_pre_rollback
 redboot-task-runner
+- docs/user/installing/configuring-vulnerability-integration.md
+CVE
+CVEs
+CVSS
+SBOM
+SBOMs
+Trustify
+v2
+canonical
+unencoded
+- docs/user/using/viewing-vulnerabilities.md
+NVD
+- docs/user/using/auto-syncing-dependencies.md
+DependencyChangeDetected
+DependencySyncProbeFailed
+ETag
+ETags
+parameterized
+SharedInformer
+sha256
+runbook

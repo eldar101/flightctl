@@ -1,9 +1,12 @@
 package renderer
 
-import "path/filepath"
+import (
+	"path/filepath"
+	"strings"
+)
 
 func servicesManifest(config *RendererConfig) []InstallAction {
-	return []InstallAction{
+	actions := []InstallAction{
 		// API service
 		{Action: ActionCopyFile, Source: "deploy/podman/flightctl-api/flightctl-api.container", Destination: filepath.Join(config.QuadletFilesOutputDir, "flightctl-api.container"), Template: true, Mode: RegularFileMode},
 		{Action: ActionCopyFile, Source: "deploy/podman/flightctl-api/flightctl-api-init.service", Destination: filepath.Join(config.SystemdUnitOutputDir, "flightctl-api-init.service"), Template: false, Mode: RegularFileMode},
@@ -40,7 +43,6 @@ func servicesManifest(config *RendererConfig) []InstallAction {
 		// KV service
 		{Action: ActionCopyFile, Source: "deploy/podman/flightctl-kv/flightctl-kv.container", Destination: filepath.Join(config.QuadletFilesOutputDir, "flightctl-kv.container"), Template: true, Mode: RegularFileMode},
 		{Action: ActionCopyFile, Source: "deploy/podman/flightctl-kv/flightctl-kv.volume", Destination: filepath.Join(config.QuadletFilesOutputDir, "flightctl-kv.volume"), Template: false, Mode: RegularFileMode},
-		{Action: ActionCopyDir, Source: "deploy/podman/flightctl-kv/flightctl-kv-config/", Destination: filepath.Join(config.ReadOnlyConfigOutputDir, "flightctl-kv/"), Template: false, Mode: RegularFileMode},
 
 		// Alertmanager service
 		{Action: ActionCopyFile, Source: "deploy/podman/flightctl-alertmanager/flightctl-alertmanager.container", Destination: filepath.Join(config.QuadletFilesOutputDir, "flightctl-alertmanager.container"), Template: true, Mode: RegularFileMode},
@@ -59,9 +61,11 @@ func servicesManifest(config *RendererConfig) []InstallAction {
 
 		// CLI Artifacts service
 		{Action: ActionCopyFile, Source: "deploy/podman/flightctl-cli-artifacts/flightctl-cli-artifacts.container", Destination: filepath.Join(config.QuadletFilesOutputDir, "flightctl-cli-artifacts.container"), Template: true, Mode: RegularFileMode},
-		{Action: ActionCopyFile, Source: "deploy/podman/flightctl-cli-artifacts/flightctl-cli-artifacts-init.container", Destination: filepath.Join(config.QuadletFilesOutputDir, "flightctl-cli-artifacts-init.container"), Template: false, Mode: RegularFileMode},
-		{Action: ActionCopyFile, Source: "deploy/podman/flightctl-cli-artifacts/flightctl-cli-artifacts-certs.volume", Destination: filepath.Join(config.QuadletFilesOutputDir, "flightctl-cli-artifacts-certs.volume"), Template: false, Mode: RegularFileMode},
 		{Action: ActionCopyDir, Source: "deploy/podman/flightctl-cli-artifacts/flightctl-cli-artifacts-config/", Destination: filepath.Join(config.ReadOnlyConfigOutputDir, "flightctl-cli-artifacts/"), Template: false, Mode: RegularFileMode},
+
+		// Gateway service
+		{Action: ActionCopyFile, Source: "deploy/podman/flightctl-gateway/flightctl-gateway.container", Destination: filepath.Join(config.QuadletFilesOutputDir, "flightctl-gateway.container"), Template: true, Mode: RegularFileMode},
+		{Action: ActionCopyDir, Source: "deploy/podman/flightctl-gateway/flightctl-gateway-config/", Destination: filepath.Join(config.ReadOnlyConfigOutputDir, "flightctl-gateway/"), Template: false, Mode: RegularFileMode},
 
 		// ImageBuilder API service
 		{Action: ActionCopyFile, Source: "deploy/podman/flightctl-imagebuilder-api/flightctl-imagebuilder-api.container", Destination: filepath.Join(config.QuadletFilesOutputDir, "flightctl-imagebuilder-api.container"), Template: true, Mode: RegularFileMode},
@@ -103,7 +107,8 @@ func servicesManifest(config *RendererConfig) []InstallAction {
 
 		// Helper scripts
 		{Action: ActionCopyFile, Source: "deploy/scripts/init_utils.sh", Destination: filepath.Join(config.ReadOnlyConfigOutputDir, "init_utils.sh"), Template: false, Mode: RegularFileMode},
-		{Action: ActionCopyFile, Source: "deploy/scripts/init_host.sh", Destination: filepath.Join(config.ReadOnlyConfigOutputDir, "init_host.sh"), Template: false, Mode: ExecutableFileMode},
+		{Action: ActionCopyFile, Source: "deploy/scripts/init_db.sh", Destination: filepath.Join(config.ReadOnlyConfigOutputDir, "init_db.sh"), Template: false, Mode: ExecutableFileMode},
+		{Action: ActionCopyFile, Source: "deploy/scripts/init_kv.sh", Destination: filepath.Join(config.ReadOnlyConfigOutputDir, "init_kv.sh"), Template: false, Mode: ExecutableFileMode},
 		{Action: ActionCopyFile, Source: "deploy/scripts/secrets.sh", Destination: filepath.Join(config.ReadOnlyConfigOutputDir, "secrets.sh"), Template: false, Mode: ExecutableFileMode},
 		{Action: ActionCopyFile, Source: "deploy/scripts/yaml_helpers.py", Destination: filepath.Join(config.ReadOnlyConfigOutputDir, "yaml_helpers.py"), Template: false, Mode: RegularFileMode},
 		{Action: ActionCopyFile, Source: "deploy/scripts/init_certs.sh", Destination: filepath.Join(config.ReadOnlyConfigOutputDir, "init_certs.sh"), Template: false, Mode: ExecutableFileMode},
@@ -119,6 +124,7 @@ func servicesManifest(config *RendererConfig) []InstallAction {
 		{Action: ActionCreateEmptyDir, Destination: filepath.Join(config.WriteableConfigOutputDir, "pki", "flightctl-api"), Mode: ExecutableFileMode},
 		{Action: ActionCreateEmptyDir, Destination: filepath.Join(config.WriteableConfigOutputDir, "pki", "flightctl-alertmanager-proxy"), Mode: ExecutableFileMode},
 		{Action: ActionCreateEmptyDir, Destination: filepath.Join(config.WriteableConfigOutputDir, "pki", "flightctl-pam-issuer"), Mode: ExecutableFileMode},
+		{Action: ActionCreateEmptyDir, Destination: filepath.Join(config.WriteableConfigOutputDir, "pki", "flightctl-gateway"), Mode: ExecutableFileMode},
 		{Action: ActionCreateEmptyDir, Destination: filepath.Join(config.WriteableConfigOutputDir, "pki", "flightctl-imagebuilder-api"), Mode: ExecutableFileMode},
 		{Action: ActionCreateEmptyDir, Destination: filepath.Join(config.WriteableConfigOutputDir, "pki", "flightctl-telemetry-gateway"), Mode: ExecutableFileMode},
 		{Action: ActionCreateEmptyDir, Destination: filepath.Join(config.WriteableConfigOutputDir, "pki", "flightctl-prometheus"), Mode: ExecutableFileMode},
@@ -133,6 +139,7 @@ func servicesManifest(config *RendererConfig) []InstallAction {
 		{Action: ActionCreateEmptyDir, Destination: filepath.Join(config.WriteableConfigOutputDir, "flightctl-cli-artifacts"), Mode: ExecutableFileMode},
 		{Action: ActionCreateEmptyDir, Destination: filepath.Join(config.WriteableConfigOutputDir, "flightctl-alertmanager-proxy"), Mode: ExecutableFileMode},
 		{Action: ActionCreateEmptyDir, Destination: filepath.Join(config.WriteableConfigOutputDir, "flightctl-pam-issuer"), Mode: ExecutableFileMode},
+		{Action: ActionCreateEmptyDir, Destination: filepath.Join(config.WriteableConfigOutputDir, "flightctl-gateway"), Mode: ExecutableFileMode},
 		{Action: ActionCreateEmptyDir, Destination: filepath.Join(config.WriteableConfigOutputDir, "flightctl-db-migrate"), Mode: ExecutableFileMode},
 		{Action: ActionCreateEmptyDir, Destination: filepath.Join(config.WriteableConfigOutputDir, "flightctl-imagebuilder-api"), Mode: ExecutableFileMode},
 		{Action: ActionCreateEmptyDir, Destination: filepath.Join(config.WriteableConfigOutputDir, "flightctl-imagebuilder-worker"), Mode: ExecutableFileMode},
@@ -152,4 +159,25 @@ func servicesManifest(config *RendererConfig) []InstallAction {
 		{Action: ActionCreateEmptyDir, Destination: filepath.Join(config.VarLibOutputDir, "grafana"), Mode: ExecutableFileMode},
 		{Action: ActionCreateEmptyDir, Destination: filepath.Join(config.VarLibOutputDir, "prometheus"), Mode: ExecutableFileMode},
 	}
+
+	// Add KV config file based on image type (Valkey for EL10, Redis for EL9)
+	if strings.Contains(config.Kv.Image, "valkey") {
+		actions = append(actions, InstallAction{
+			Action:      ActionCopyFile,
+			Source:      "deploy/podman/flightctl-kv/flightctl-kv-config/valkey.conf",
+			Destination: filepath.Join(config.ReadOnlyConfigOutputDir, "flightctl-kv", "valkey.conf"),
+			Template:    false,
+			Mode:        RegularFileMode,
+		})
+	} else {
+		actions = append(actions, InstallAction{
+			Action:      ActionCopyFile,
+			Source:      "deploy/podman/flightctl-kv/flightctl-kv-config/redis.conf",
+			Destination: filepath.Join(config.ReadOnlyConfigOutputDir, "flightctl-kv", "redis.conf"),
+			Template:    false,
+			Mode:        RegularFileMode,
+		})
+	}
+
+	return actions
 }

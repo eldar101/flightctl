@@ -2,6 +2,7 @@
 package infra
 
 import (
+	"net"
 	"os"
 	"os/exec"
 	"strings"
@@ -21,6 +22,7 @@ type Providers struct {
 	Lifecycle ServiceLifecycleProvider
 	RBAC      RBACProvider
 	Secrets   SecretsProvider
+	TPM       TPMProvider
 }
 
 // EnvironmentConfig holds configuration for the test environment.
@@ -97,7 +99,7 @@ func GetDefaultQuadletAPIEndpoint() string {
 	// Fallback to IP address if FQDN not available
 	hostIP := auxiliary.GetHostIP()
 	if hostIP != "" {
-		return "https://" + hostIP + ":" + DefaultAPIPort
+		return "https://" + net.JoinHostPort(hostIP, DefaultAPIPort)
 	}
 
 	// Last resort fallback
@@ -132,7 +134,7 @@ func GetEnvironmentConfig() *EnvironmentConfig {
 
 	// Normalize environment type
 	if config.Type != "" {
-		config.Type = normalizeEnvironmentType(config.Type)
+		config.Type = NormalizeEnvironmentType(config.Type)
 	}
 
 	return config
@@ -232,8 +234,8 @@ func (f *ProviderFactory) DetectEnvironment() string {
 	return f.envType
 }
 
-// normalizeEnvironmentType normalizes environment type strings.
-func normalizeEnvironmentType(envType string) string {
+// NormalizeEnvironmentType normalizes environment type strings.
+func NormalizeEnvironmentType(envType string) string {
 	envType = strings.ToLower(strings.TrimSpace(envType))
 	switch envType {
 	case "k8s", "kubernetes", "kind":

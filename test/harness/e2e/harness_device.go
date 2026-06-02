@@ -3,12 +3,9 @@ package e2e
 import (
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/flightctl/flightctl/api/core/v1beta1"
 	agentcfg "github.com/flightctl/flightctl/internal/agent/config"
@@ -20,6 +17,8 @@ import (
 	"github.com/sirupsen/logrus"
 	"sigs.k8s.io/yaml"
 )
+
+var errConfigNameMismatch = errors.New("config name mismatch")
 
 func (h *Harness) GetDeviceWithStatusSystem(enrollmentID string) (*apiclient.GetDeviceResponse, error) {
 	device, err := h.Client.GetDeviceWithResponse(h.Context, enrollmentID)
@@ -489,6 +488,24 @@ func (h *Harness) PrepareNextDeviceVersion(deviceId string) (int, error) {
 	return currentVersion + 1, nil
 }
 
+// PrepareNextDeviceVersionFromCurrentStatus polls until Status.Config.RenderedVersion
+// becomes valid (> 0) and returns RenderedVersion+1. Unlike PrepareNextDeviceVersion it
+// does not require the device to be UpToDate, so it is safe to call after greenboot
+// rollback when the device is OutOfDate and may still be re-enrolling.
+func (h *Harness) PrepareNextDeviceVersionFromCurrentStatus(deviceID string) (int, error) {
+	var cur int
+	var lastErr error
+	h.WaitForDeviceContents(deviceID, "rendered version should be valid (> 0)",
+		func(device *v1beta1.Device) bool {
+			cur, lastErr = GetRenderedVersion(device)
+			return lastErr == nil
+		}, TIMEOUT)
+	if lastErr != nil {
+		return -1, lastErr
+	}
+	return cur + 1, nil
+}
+
 func (h *Harness) WaitForDeviceNewRenderedVersion(deviceId string, newRenderedVersionInt int) (err error) {
 	// Check that the device was already approved
 	Eventually(func() v1beta1.DeviceSummaryStatusType {
@@ -643,41 +660,78 @@ func (h *Harness) UpdateDeviceAndWaitForVersion(deviceID string, updateFunc func
 	return nil
 }
 
+// deviceUpdateFailedOrRolledBack is true when the device did not successfully apply the desired
+// spec. That is either a stable Updating/Error (optional message check), or a completed OS/spec
+// rollback where the agent reports Updating/Updated, summary online, and updated OutOfDate — in
+// that case the prefetch or sync error is not always preserved on the condition after rollback.
+func deviceUpdateFailedOrRolledBack(device *v1beta1.Device, expectedMessageSubstrings []string) bool {
+	if device == nil || device.Status == nil {
+		return false
+	}
+
+	if ConditionExists(device, v1beta1.ConditionTypeDeviceUpdating,
+		v1beta1.ConditionStatusFalse, string(v1beta1.UpdateStateError)) {
+		if len(expectedMessageSubstrings) == 0 {
+			return true
+		}
+		cond := v1beta1.FindStatusCondition(device.Status.Conditions, v1beta1.ConditionTypeDeviceUpdating)
+		if cond == nil {
+			return false
+		}
+		for _, substring := range expectedMessageSubstrings {
+			if strings.Contains(cond.Message, substring) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Rollback: bootc/OS rollback or spec rollback can clear Error and leave OutOfDate + Updating/Updated.
+	if device.Status.Updated.Status != v1beta1.DeviceUpdatedStatusOutOfDate ||
+		device.Status.Summary.Status != v1beta1.DeviceSummaryStatusOnline {
+		return false
+	}
+	cond := v1beta1.FindStatusCondition(device.Status.Conditions, v1beta1.ConditionTypeDeviceUpdating)
+	if cond == nil {
+		return false
+	}
+	if cond.Status == v1beta1.ConditionStatusTrue {
+		return false
+	}
+	if cond.Reason != string(v1beta1.UpdateStateUpdated) {
+		return false
+	}
+	if len(expectedMessageSubstrings) == 0 {
+		return true
+	}
+	for _, substring := range expectedMessageSubstrings {
+		if strings.Contains(cond.Message, substring) {
+			return true
+		}
+		if device.Status.Updated.Info != nil && strings.Contains(*device.Status.Updated.Info, substring) {
+			return true
+		}
+	}
+	return true
+}
+
 // UpdateDeviceAndWaitForFailure updates a device and waits for the update to fail with an error.
-// If expectedMessageSubstrings are provided, it verifies that the error message contains at least one of them.
+// If expectedMessageSubstrings are provided, it verifies that the error message contains at least one of them
+// (or that the update rolled back, which may not retain the same message text on the status).
 func (h *Harness) UpdateDeviceAndWaitForFailure(deviceID string, updateFunc func(device *v1beta1.Device), expectedMessageSubstrings ...string) error {
 	err := h.UpdateDeviceWithRetries(deviceID, updateFunc)
 	if err != nil {
 		return fmt.Errorf("failed to update device: %w", err)
 	}
 
-	description := "update should fail with error"
+	description := "update should fail with error or roll back"
 	if len(expectedMessageSubstrings) > 0 {
-		description = fmt.Sprintf("update should fail with error containing one of: %v", expectedMessageSubstrings)
+		description = fmt.Sprintf("update should fail with error (or roll back) matching one of: %v", expectedMessageSubstrings)
 	}
 
 	h.WaitForDeviceContents(deviceID, description,
 		func(device *v1beta1.Device) bool {
-			if device == nil || device.Status == nil {
-				return false
-			}
-			if !ConditionExists(device, v1beta1.ConditionTypeDeviceUpdating,
-				v1beta1.ConditionStatusFalse, string(v1beta1.UpdateStateError)) {
-				return false
-			}
-			if len(expectedMessageSubstrings) == 0 {
-				return true
-			}
-			cond := v1beta1.FindStatusCondition(device.Status.Conditions, v1beta1.ConditionTypeDeviceUpdating)
-			if cond == nil {
-				return false
-			}
-			for _, substring := range expectedMessageSubstrings {
-				if strings.Contains(cond.Message, substring) {
-					return true
-				}
-			}
-			return false
+			return deviceUpdateFailedOrRolledBack(device, expectedMessageSubstrings)
 		}, LONGTIMEOUT)
 
 	h.WaitForDeviceContents(deviceID, "device should be out of date but online after failed update",
@@ -737,12 +791,13 @@ func GetDeviceConfig[T any](device *v1beta1.Device, configType v1beta1.ConfigPro
 				return config, fmt.Errorf("failed to get config type: %w", err)
 			}
 			if itemType == configType {
-				// Convert to the expected config type
 				config, err := asConfig(configItem)
 				if err != nil {
+					if errors.Is(err, errConfigNameMismatch) {
+						continue
+					}
 					return config, fmt.Errorf("failed to convert config: %w", err)
 				}
-
 				return config, nil
 			}
 		}
@@ -764,7 +819,7 @@ func (h *Harness) GetDeviceInlineConfig(device *v1beta1.Device, configName strin
 				logrus.Infof("Inline configuration found %s", configName)
 				return inlineConfig, nil
 			}
-			return v1beta1.InlineConfigProviderSpec{}, fmt.Errorf("inline config not found")
+			return v1beta1.InlineConfigProviderSpec{}, errConfigNameMismatch
 		})
 }
 
@@ -780,7 +835,7 @@ func (h *Harness) GetDeviceGitConfig(device *v1beta1.Device, configName string) 
 				logrus.Infof("Git configuration found %s", configName)
 				return gitConfig, nil
 			}
-			return v1beta1.GitConfigProviderSpec{}, fmt.Errorf("git config not found")
+			return v1beta1.GitConfigProviderSpec{}, errConfigNameMismatch
 		})
 }
 
@@ -796,7 +851,7 @@ func (h *Harness) GetDeviceHttpConfig(device *v1beta1.Device, configName string)
 				logrus.Infof("Http configuration found %s", configName)
 				return httpConfig, nil
 			}
-			return v1beta1.HttpConfigProviderSpec{}, fmt.Errorf("http config not found")
+			return v1beta1.HttpConfigProviderSpec{}, errConfigNameMismatch
 		})
 }
 
@@ -1058,146 +1113,64 @@ func (h *Harness) SetAgentConfig(cfg *agentcfg.Config) error {
 	return nil
 }
 
-// WaitForTPMInitialization waits for TPM hardware to be ready in the VM.
-// This should be called after VM setup but before agent configuration.
-func (h *Harness) WaitForTPMInitialization() error {
-	logrus.Info("Waiting for TPM hardware initialization...")
-	time.Sleep(20 * time.Second)
+// GetAgentConfig reads and parses the agent configuration from the VM.
+func (h *Harness) GetAgentConfig() (*agentcfg.Config, error) {
+	stdout, err := h.VM.RunSSH([]string{"sudo", "cat", "/etc/flightctl/config.yaml"}, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read agent config: %w", err)
+	}
+	if stdout == nil {
+		return nil, fmt.Errorf("agent config output is nil")
+	}
+
+	cfg := &agentcfg.Config{}
+	if err := yaml.Unmarshal(stdout.Bytes(), cfg); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal agent config: %w", err)
+	}
+
+	return cfg, nil
+}
+
+// CheckFleetControllerErrorAnnotation verifies that the device has the fleet controller
+// error annotation set and that it contains the expected key substring. Returns an error
+// suitable for use inside Eventually blocks for retryable polling.
+func (h *Harness) CheckFleetControllerErrorAnnotation(deviceId, expectedKeySubstring string) error {
+	resp, err := h.Client.GetDeviceStatusWithResponse(h.Context, deviceId)
+	if err != nil {
+		return fmt.Errorf("GetDeviceStatusWithResponse failed: %w", err)
+	}
+	if resp.JSON200 == nil {
+		return fmt.Errorf("expected 200 response, got %d", resp.StatusCode())
+	}
+	device := resp.JSON200
+	if device.Status.Updated.Status != v1beta1.DeviceUpdatedStatusOutOfDate {
+		return fmt.Errorf("device status is not OutOfDate, got %s", device.Status.Updated.Status)
+	}
+	if device.Metadata.Annotations == nil {
+		return fmt.Errorf("device annotations are nil")
+	}
+	errorAnnotation, exists := (*device.Metadata.Annotations)[v1beta1.DeviceAnnotationLastRolloutError]
+	if !exists || errorAnnotation == "" {
+		return fmt.Errorf("%s annotation not set", v1beta1.DeviceAnnotationLastRolloutError)
+	}
+	if !strings.Contains(errorAnnotation, expectedKeySubstring) {
+		return fmt.Errorf("%s does not contain expected substring %q, got: %s",
+			v1beta1.DeviceAnnotationLastRolloutError, expectedKeySubstring, errorAnnotation)
+	}
+	GinkgoWriter.Printf("CheckFleetControllerErrorAnnotation: device %s has annotation with expected substring %q\n",
+		deviceId, expectedKeySubstring)
 	return nil
 }
 
-// VerifyTPMFunctionality checks that TPM device is accessible and functional.
-func (h *Harness) VerifyTPMFunctionality() error {
-	// Check TPM device presence
-	stdout, err := h.VM.RunSSH([]string{"sh", "-lc", "ls -la /dev/tpm*"}, nil)
-	if err != nil || !strings.Contains(stdout.String(), "/dev/tpm0") {
-		// Check if we're expecting TPM hardware to be available
-		realTPM := strings.ToLower(os.Getenv("FLIGHTCTL_REAL_TPM")) == "true"
-		skipTPM := strings.ToLower(os.Getenv("FLIGHTCTL_SKIP_TPM")) == "true"
-
-		if realTPM && !skipTPM {
-			// Real TPM was expected but not found
-			return fmt.Errorf("TPM device /dev/tpm0 not available (FLIGHTCTL_REAL_TPM=true but no TPM device found)")
-		}
-
-		// No TPM device found but not in real TPM mode - this is expected for CI/virtual environments
-		logrus.Info("No TPM device found (/dev/tpm0), skipping TPM hardware verification (expected in CI environments)")
-		return nil
-	}
-
-	// Test TPM functionality
-	_, _ = h.VM.RunSSH([]string{"sh", "-lc", "sudo tpm2_startup -c || true"}, nil)
-
-	_, err = h.VM.RunSSH([]string{"sudo", "tpm2_getrandom", "8"}, nil)
+// DeleteDeviceIgnoreNotFound deletes a device, ignoring 404 errors.
+func (h *Harness) DeleteDeviceIgnoreNotFound(deviceName string) error {
+	resp, err := h.Client.DeleteDeviceWithResponse(h.Context, deviceName)
 	if err != nil {
-		return fmt.Errorf("TPM getrandom test failed: %w", err)
+		return fmt.Errorf("failed to delete device %s: %w", deviceName, err)
 	}
-
-	logrus.Info("TPM functionality verified successfully")
-	return nil
-}
-
-// EnableTPMForDevice configures the agent to use TPM for device identity.
-// This reads existing agent config, updates TPM settings, and writes it back.
-func (h *Harness) EnableTPMForDevice() error {
-	// Get existing agent config or create default
-	stdout, err := h.VM.RunSSH([]string{"cat", "/etc/flightctl/config.yaml"}, nil)
-	var agentConfig *agentcfg.Config
-
-	if err == nil && stdout.Len() > 0 {
-		// Parse existing config
-		agentConfig = &agentcfg.Config{}
-		err = yaml.Unmarshal(stdout.Bytes(), agentConfig)
-		if err != nil {
-			logrus.Warnf("Failed to parse existing config, using default: %v", err)
-			agentConfig = &agentcfg.Config{}
-		}
-	} else {
-		// No existing config, create new
-		agentConfig = &agentcfg.Config{}
+	if resp.StatusCode() != 200 && resp.StatusCode() != 404 {
+		return fmt.Errorf("unexpected status deleting device %s: %d", deviceName, resp.StatusCode())
 	}
-
-	// Configure TPM settings
-	agentConfig.TPM = agentcfg.TPM{
-		Enabled:         true,
-		DevicePath:      "/dev/tpm0",
-		StorageFilePath: filepath.Join(agentcfg.DefaultDataDir, agentcfg.DefaultTPMKeyFile),
-		AuthEnabled:     true,
-	}
-
-	// Write the updated config
-	err = h.SetAgentConfig(agentConfig)
-	if err != nil {
-		return fmt.Errorf("failed to set TPM agent config: %w", err)
-	}
-
-	logrus.Info("TPM configuration enabled for device")
-	return nil
-}
-
-// SetupDeviceWithTPM prepares a device VM with TPM functionality enabled.
-// This handles the complete TPM setup process in the correct order.
-func (h *Harness) SetupDeviceWithTPM(workerID int) error {
-	// Setup VM from pool without starting agent
-	err := h.SetupVMFromPool(workerID)
-	if err != nil {
-		return fmt.Errorf("failed to setup VM: %w", err)
-	}
-
-	// Clean CSR from non-TPM agent start to avoid device ID mismatch
-	_, err = h.VM.RunSSH([]string{"sudo", "rm", "-f", "/var/lib/flightctl/certs/agent.csr"}, nil)
-	if err != nil {
-		logrus.Warnf("Failed to clean stale CSR: %v", err)
-	}
-
-	// Wait for TPM hardware initialization
-	err = h.WaitForTPMInitialization()
-	if err != nil {
-		return fmt.Errorf("TPM initialization failed: %w", err)
-	}
-
-	// Verify TPM is functional
-	err = h.VerifyTPMFunctionality()
-	if err != nil {
-		return fmt.Errorf("TPM verification failed: %w", err)
-	}
-
-	// Configure agent for TPM
-	err = h.EnableTPMForDevice()
-	if err != nil {
-		return fmt.Errorf("TPM configuration failed: %w", err)
-	}
-
-	// Start agent with TPM configuration
-	err = h.StartFlightCtlAgent()
-	if err != nil {
-		return fmt.Errorf("failed to start agent with TPM: %w", err)
-	}
-
-	// Brief wait for agent to initialize with TPM
-	time.Sleep(10 * time.Second)
-
-	logrus.Info("Device TPM setup completed successfully")
-	return nil
-}
-
-// VerifyEnrollmentTPMAttestationData checks for TPM attestation data in enrollment request SystemInfo
-// Returns error if no TPM attestation data is found
-func (h *Harness) VerifyEnrollmentTPMAttestationData(systemInfo v1beta1.DeviceSystemInfo) error {
-	// Look for TPM attestation data - check for either key name that might be used
-	_, hasAttestation := systemInfo.Get("attestation")
-	if !hasAttestation {
-		logrus.Infof("No 'attestation' key found, checking for other TPM-related keys...")
-		tpmVendorInfo, hasTmpVendorInfo := systemInfo.Get("tpmVendorInfo")
-		if hasTmpVendorInfo {
-			logrus.Infof("Found 'tpmVendorInfo' key: %s", tpmVendorInfo)
-			logrus.Infof("TPM attestation data found in enrollment request: %s...", tpmVendorInfo)
-			return nil
-		}
-		return errors.New("no TPM attestation data found in enrollment request")
-	}
-
-	logrus.Infof("TPM attestation data found in enrollment request")
 	return nil
 }
 
@@ -1208,30 +1181,4 @@ func (h *Harness) DecommissionDevice(deviceName string) (string, error) {
 		return "", fmt.Errorf("device name is empty")
 	}
 	return h.CLI("decommission", "devices/"+deviceName)
-}
-
-// VerifyDeviceTPMAttestationData checks for TPM attestation data in device SystemInfo
-// Virtual TPM provides "tpmVendorInfo", real TPM provides "attestation"
-// Returns error if attestation data is missing or empty
-func (h *Harness) VerifyDeviceTPMAttestationData(device *v1beta1.Device) error {
-	// Check for TPM vendor info in system info (virtual TPM provides tpmVendorInfo instead of full attestation)
-	tpmVendorInfo, hasTmpVendorInfo := device.Status.SystemInfo.Get("tpmVendorInfo")
-	if hasTmpVendorInfo {
-		if tpmVendorInfo == "" {
-			return fmt.Errorf("tpmVendorInfo is empty in device system info")
-		}
-		logrus.Infof("TPM vendor info found in device system info: %s", tpmVendorInfo)
-		return nil
-	}
-
-	// For real TPM devices, check for full attestation data
-	deviceAttestation, hasAttestation := device.Status.SystemInfo.Get("attestation")
-	if !hasAttestation {
-		return fmt.Errorf("no TPM attestation data found in device system info")
-	}
-	if deviceAttestation == "" {
-		return fmt.Errorf("attestation data is empty in device system info")
-	}
-	logrus.Infof("TPM attestation data found in device system info: %.50s...", deviceAttestation)
-	return nil
 }

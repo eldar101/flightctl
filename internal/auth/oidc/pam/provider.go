@@ -26,6 +26,7 @@ import (
 
 	pamapi "github.com/flightctl/flightctl/api/pam-issuer/v1beta1"
 	"github.com/flightctl/flightctl/internal/auth/authn"
+	authprovider "github.com/flightctl/flightctl/internal/auth/provider"
 	"github.com/flightctl/flightctl/internal/config"
 	fccrypto "github.com/flightctl/flightctl/internal/crypto"
 	"github.com/samber/lo"
@@ -1062,7 +1063,7 @@ func (s *PAMOIDCProvider) Login(ctx context.Context, username, password, encrypt
 	s.log.Debugf("Login: created encrypted session cookie for %s", username)
 
 	// Redirect back to authorization endpoint with all parameters
-	authURL := fmt.Sprintf("/api/v1/auth/authorize?response_type=code&client_id=%s&redirect_uri=%s",
+	authURL := fmt.Sprintf("authorize?response_type=code&client_id=%s&redirect_uri=%s",
 		url.QueryEscape(pendingReq.ClientID), url.QueryEscape(pendingReq.RedirectURI))
 	if pendingReq.State != "" {
 		authURL += fmt.Sprintf("&state=%s", url.QueryEscape(pendingReq.State))
@@ -1148,7 +1149,14 @@ func (s *PAMOIDCProvider) GetOpenIDConfiguration() (*pamapi.OpenIDConfiguration,
 	if s.config == nil || s.config.Issuer == "" {
 		return nil, fmt.Errorf("issuer URL not configured")
 	}
-	issuer := s.config.Issuer
+	issuer, err := authprovider.NormalizeIssuerURL(s.config.Issuer)
+	if err != nil {
+		return nil, fmt.Errorf("invalid issuer URL: %w", err)
+	}
+	base, err := url.Parse(issuer)
+	if err != nil {
+		return nil, fmt.Errorf("invalid issuer URL: %w", err)
+	}
 
 	// Response types and grant types are determined by implementation
 	responseTypes := []string{"code"}                                         // Support authorization code flow
@@ -1189,10 +1197,16 @@ func (s *PAMOIDCProvider) GetOpenIDConfiguration() (*pamapi.OpenIDConfiguration,
 		idTokenSigningAlgs = append(idTokenSigningAlgs, alg)
 	}
 
-	authzEndpoint := issuer + "/authorize"
-	tokenEndpoint := issuer + "/token"
-	userinfoEndpoint := issuer + "/userinfo"
-	jwksURI := issuer + "/jwks"
+	authzURL := base.JoinPath("authorize")
+	tokenURL := base.JoinPath("token")
+	userinfoURL := base.JoinPath("userinfo")
+	jwksURL := base.JoinPath("jwks")
+	endSessionURL := base.JoinPath("logout")
+	authzEndpoint := authzURL.String()
+	tokenEndpoint := tokenURL.String()
+	userinfoEndpoint := userinfoURL.String()
+	jwksURI := jwksURL.String()
+	endSessionEndpoint := endSessionURL.String()
 	claimsSupported := []string{"sub", "preferred_username", "name", "email", "email_verified", "roles", "organizations"}
 	subjectTypesSupported := []pamapi.OpenIDConfigurationSubjectTypesSupported{pamapi.Public}
 	// Determine supported client authentication methods based on configuration
@@ -1215,6 +1229,7 @@ func (s *PAMOIDCProvider) GetOpenIDConfiguration() (*pamapi.OpenIDConfiguration,
 		AuthorizationEndpoint:             &authzEndpoint,
 		TokenEndpoint:                     &tokenEndpoint,
 		UserinfoEndpoint:                  &userinfoEndpoint,
+		EndSessionEndpoint:                &endSessionEndpoint,
 		JwksUri:                           &jwksURI,
 		ResponseTypesSupported:            &responseTypes,
 		GrantTypesSupported:               &grantTypes,
@@ -1225,6 +1240,32 @@ func (s *PAMOIDCProvider) GetOpenIDConfiguration() (*pamapi.OpenIDConfiguration,
 		SubjectTypesSupported:             &subjectTypesSupported,
 		CodeChallengeMethodsSupported:     &codeChallengeMethodsSupported,
 	}, nil
+}
+
+// PostLogoutRedirectAllowed reports whether postLogoutURI is allowed for RP-initiated logout.
+// It must match a registered redirect URI or its UI base (redirect URI with a trailing /callback removed).
+func (s *PAMOIDCProvider) PostLogoutRedirectAllowed(postLogoutURI string) bool {
+	if s.config == nil || strings.TrimSpace(postLogoutURI) == "" {
+		return false
+	}
+	post := normalizePostLogoutURL(postLogoutURI)
+	for _, reg := range s.config.RedirectURIs {
+		regNorm := normalizePostLogoutURL(reg)
+		if post == regNorm {
+			return true
+		}
+		if strings.HasSuffix(regNorm, "/callback") {
+			base := strings.TrimSuffix(regNorm, "/callback")
+			if post == normalizePostLogoutURL(base) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func normalizePostLogoutURL(u string) string {
+	return strings.TrimSuffix(strings.TrimSpace(u), "/")
 }
 
 // GetJWKS returns the JSON Web Key Set
@@ -1402,8 +1443,8 @@ func (s *PAMOIDCProvider) createEncryptedCookieAndReturnLoginForm(req *pamapi.Au
 
 const (
 	defaultDisplayName = "Flight Control"
-	defaultLogoSrc     = "/auth/assets/flight-control-logo.svg"
-	defaultFaviconSrc  = "/auth/assets/favicon.png"
+	defaultLogoSrc     = "../../../auth/assets/flight-control-logo.svg"
+	defaultFaviconSrc  = "../../../auth/assets/favicon.png"
 )
 
 // buildLoginFormData constructs the template data from the provider's branding config.

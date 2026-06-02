@@ -56,6 +56,20 @@ func TestStaticAuthZ_CheckPermission(t *testing.T) {
 			expected: true,
 		},
 		{
+			name:     "admin user can create catalog",
+			roles:    []string{v1beta1.RoleAdmin},
+			resource: "catalogs",
+			op:       "create",
+			expected: true,
+		},
+		{
+			name:     "admin user can edit catalogitems",
+			roles:    []string{v1beta1.RoleAdmin},
+			resource: "catalogitems",
+			op:       "update",
+			expected: true,
+		},
+		{
 			name:     "operator can create devices",
 			roles:    []string{v1beta1.RoleOperator},
 			resource: "devices",
@@ -84,6 +98,55 @@ func TestStaticAuthZ_CheckPermission(t *testing.T) {
 			expected: true,
 		},
 		{
+			name:     "operator can list catalog",
+			roles:    []string{v1beta1.RoleOperator},
+			resource: "catalogs",
+			op:       "list",
+			expected: true,
+		},
+		{
+			name:     "operator can list catalogitems",
+			roles:    []string{v1beta1.RoleOperator},
+			resource: "catalogitems",
+			op:       "list",
+			expected: true,
+		},
+		{
+			name:     "operator cannot delete catalog",
+			roles:    []string{v1beta1.RoleOperator},
+			resource: "catalogs",
+			op:       "delete",
+			expected: false,
+		},
+		{
+			name:     "operator cannot delete catalogitems",
+			roles:    []string{v1beta1.RoleOperator},
+			resource: "catalogitems",
+			op:       "delete",
+			expected: false,
+		},
+		{
+			name:     "operator can list imagepromotions",
+			roles:    []string{v1beta1.RoleOperator},
+			resource: "imagepromotions",
+			op:       "list",
+			expected: true,
+		},
+		{
+			name:     "operator can delete imagepromotions",
+			roles:    []string{v1beta1.RoleOperator},
+			resource: "imagepromotions",
+			op:       "delete",
+			expected: true,
+		},
+		{
+			name:     "operator can create imagepromotions",
+			roles:    []string{v1beta1.RoleOperator},
+			resource: "imagepromotions",
+			op:       "create",
+			expected: true,
+		},
+		{
 			name:     "viewer can list any resource",
 			roles:    []string{v1beta1.RoleViewer},
 			resource: "devices",
@@ -108,6 +171,55 @@ func TestStaticAuthZ_CheckPermission(t *testing.T) {
 			name:     "viewer cannot delete",
 			roles:    []string{v1beta1.RoleViewer},
 			resource: "fleets",
+			op:       "delete",
+			expected: false,
+		},
+		{
+			name:     "viewer can get any resource",
+			roles:    []string{v1beta1.RoleViewer},
+			resource: "repositories",
+			op:       "get",
+			expected: true,
+		},
+		{
+			name:     "viewer cannot access device console",
+			roles:    []string{v1beta1.RoleViewer},
+			resource: "devices/console",
+			op:       "get",
+			expected: false,
+		},
+		{
+			name:     "operator can access device console",
+			roles:    []string{v1beta1.RoleOperator},
+			resource: "devices/console",
+			op:       "get",
+			expected: true,
+		},
+		{
+			name:     "viewer can list catalog",
+			roles:    []string{v1beta1.RoleViewer},
+			resource: "catalogs",
+			op:       "list",
+			expected: true,
+		},
+		{
+			name:     "viewer can list catalogitems",
+			roles:    []string{v1beta1.RoleViewer},
+			resource: "catalogitems",
+			op:       "list",
+			expected: true,
+		},
+		{
+			name:     "viewer cannot delete catalog",
+			roles:    []string{v1beta1.RoleViewer},
+			resource: "catalogs",
+			op:       "delete",
+			expected: false,
+		},
+		{
+			name:     "viewer can not delete catalogitems",
+			roles:    []string{v1beta1.RoleViewer},
+			resource: "catalogitems",
 			op:       "delete",
 			expected: false,
 		},
@@ -174,6 +286,34 @@ func TestStaticAuthZ_CheckPermission(t *testing.T) {
 			op:       "create",
 			expected: false,
 		},
+		{
+			name:     "installer cannot list catalog",
+			roles:    []string{v1beta1.RoleInstaller},
+			resource: "catalogs",
+			op:       "list",
+			expected: false,
+		},
+		{
+			name:     "installer cannot list catalogitems",
+			roles:    []string{v1beta1.RoleInstaller},
+			resource: "catalogitems",
+			op:       "list",
+			expected: false,
+		},
+		{
+			name:     "installer cannot delete catalog",
+			roles:    []string{v1beta1.RoleInstaller},
+			resource: "catalogs",
+			op:       "delete",
+			expected: false,
+		},
+		{
+			name:     "installer can not delete catalogitems",
+			roles:    []string{v1beta1.RoleInstaller},
+			resource: "catalogitems",
+			op:       "delete",
+			expected: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -234,11 +374,11 @@ func TestStaticAuthZ_GetUserPermissions(t *testing.T) {
 				},
 				{
 					Resource:   "catalogitems",
-					Operations: []string{"create", "delete", "get", "list", "patch", "update"},
+					Operations: []string{"get", "list"},
 				},
 				{
 					Resource:   "catalogs",
-					Operations: []string{"create", "delete", "get", "list", "patch", "update"},
+					Operations: []string{"get", "list"},
 				},
 				{
 					Resource:   "devices",
@@ -257,6 +397,10 @@ func TestStaticAuthZ_GetUserPermissions(t *testing.T) {
 					Operations: []string{"create"},
 				},
 				{
+					Resource:   "imagebuilds/newversion",
+					Operations: []string{"create"},
+				},
+				{
 					Resource:   "imageexports",
 					Operations: []string{"create", "delete", "get", "list", "patch", "update"},
 				},
@@ -269,8 +413,20 @@ func TestStaticAuthZ_GetUserPermissions(t *testing.T) {
 					Operations: []string{"get"},
 				},
 				{
+					Resource:   "imagepromotions",
+					Operations: []string{"create", "delete", "get", "list", "patch", "update"},
+				},
+				{
 					Resource:   "repositories",
 					Operations: []string{"create", "delete", "get", "list", "patch", "update"},
+				},
+				{
+					Resource:   "repositories/check-oci-tag",
+					Operations: []string{"create"},
+				},
+				{
+					Resource:   "repositories/check-oci-image",
+					Operations: []string{"create"},
 				},
 				{
 					Resource:   "resourcesyncs",
@@ -285,6 +441,10 @@ func TestStaticAuthZ_GetUserPermissions(t *testing.T) {
 				{
 					Resource:   "*",
 					Operations: []string{"get", "list"},
+				},
+				{
+					Resource:   "devices/console",
+					Operations: []string{}, // Explicitly denied
 				},
 				{
 					Resource:   "imageexports/download",
@@ -337,6 +497,10 @@ func TestStaticAuthZ_GetUserPermissions(t *testing.T) {
 				{
 					Resource:   "certificatesigningrequests",
 					Operations: []string{"create", "get", "list", "update"},
+				},
+				{
+					Resource:   "devices/console",
+					Operations: []string{}, // Explicitly denied by viewer, installer does not grant it
 				},
 				{
 					Resource:   "enrollmentrequests",

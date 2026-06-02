@@ -29,6 +29,8 @@ On OpenShift clusters, the chart automatically creates a SecurityContextConstrai
 
 For additional ImageBuilder Worker configuration options (custom RPM repositories, RHEL entitlement certificates), see the [ImageBuilder configuration documentation](../../../docs/user/installing/configuring-imagebuilder.md).
 
+SBOM defaults (see `imageBuilderWorker.sbom` and `imageBuilderWorker.serviceImages.syft` in the parameters table): when `serviceImages.syft.image` is empty, the worker uses `docker.io/anchore/syft:v1.44.0`. Podman and bootc-image-builder use their own defaults when those image fields are empty.
+
 If you don't need image building capabilities, you can disable the imagebuilder-worker:
 
 ```yaml
@@ -218,9 +220,9 @@ For more detailed configuration options, see the [Values](#values) section below
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| alertExporter | object | `{"enabled":true,"image":{"image":"quay.io/flightctl/flightctl-alert-exporter","pullPolicy":"","tag":""}}` | Alert Exporter Configuration |
+| alertExporter | object | `{"enabled":true,"image":{"image":"quay.io/flightctl/flightctl-alert-exporter-el9","pullPolicy":"","tag":""}}` | Alert Exporter Configuration |
 | alertExporter.enabled | bool | `true` | Enable alert exporter service |
-| alertExporter.image.image | string | `"quay.io/flightctl/flightctl-alert-exporter"` | Alert exporter container image |
+| alertExporter.image.image | string | `"quay.io/flightctl/flightctl-alert-exporter-el9"` | Alert exporter container image |
 | alertExporter.image.pullPolicy | string | `""` | Image pull policy for alert exporter container |
 | alertExporter.image.tag | string | `""` | Alert exporter image tag |
 | alertmanager | object | `{"additionalPVCLabels":null,"additionalRouteLabels":null,"enabled":true,"image":{"image":"quay.io/prometheus/alertmanager","pullPolicy":"","tag":"v0.28.1"}}` | Alertmanager Configuration |
@@ -230,15 +232,15 @@ For more detailed configuration options, see the [Values](#values) section below
 | alertmanager.image.image | string | `"quay.io/prometheus/alertmanager"` | Alertmanager container image |
 | alertmanager.image.pullPolicy | string | `""` | Image pull policy for Alertmanager container |
 | alertmanager.image.tag | string | `"v0.28.1"` | Alertmanager image tag |
-| alertmanagerProxy | object | `{"enabled":true,"image":{"image":"quay.io/flightctl/flightctl-alertmanager-proxy","pullPolicy":"","tag":""}}` | Alertmanager Proxy Configuration |
+| alertmanagerProxy | object | `{"enabled":true,"image":{"image":"quay.io/flightctl/flightctl-alertmanager-proxy-el9","pullPolicy":"","tag":""}}` | Alertmanager Proxy Configuration |
 | alertmanagerProxy.enabled | bool | `true` | Enable Alertmanager proxy service |
-| alertmanagerProxy.image.image | string | `"quay.io/flightctl/flightctl-alertmanager-proxy"` | Alertmanager proxy container image |
+| alertmanagerProxy.image.image | string | `"quay.io/flightctl/flightctl-alertmanager-proxy-el9"` | Alertmanager proxy container image |
 | alertmanagerProxy.image.pullPolicy | string | `""` | Image pull policy for Alertmanager proxy container |
 | alertmanagerProxy.image.tag | string | `""` | Alertmanager proxy image tag |
-| api | object | `{"additionalPVCLabels":null,"additionalRouteLabels":null,"image":{"image":"quay.io/flightctl/flightctl-api","pullPolicy":"","tag":""},"rateLimit":{"authRequests":20,"authWindow":"1h","enabled":true,"requests":300,"trustedProxies":["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16"],"window":"1m"}}` | API Server Configuration |
+| api | object | `{"additionalPVCLabels":null,"additionalRouteLabels":null,"image":{"image":"quay.io/flightctl/flightctl-api-el9","pullPolicy":"","tag":""},"rateLimit":{"authRequests":20,"authWindow":"1h","enabled":true,"requests":300,"trustedProxies":["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16"],"window":"1m"}}` | API Server Configuration |
 | api.additionalPVCLabels | string | `nil` | Additional labels for API PVCs. |
 | api.additionalRouteLabels | string | `nil` | Additional labels for API routes. |
-| api.image.image | string | `"quay.io/flightctl/flightctl-api"` | API server container image |
+| api.image.image | string | `"quay.io/flightctl/flightctl-api-el9"` | API server container image |
 | api.image.pullPolicy | string | `""` | Image pull policy for API server container |
 | api.image.tag | string | `""` | API server image tag (leave empty to use chart appVersion) |
 | api.rateLimit.authRequests | int | `20` | Maximum authentication requests per auth window Auth-specific rate limiting |
@@ -247,10 +249,10 @@ For more detailed configuration options, see the [Values](#values) section below
 | api.rateLimit.requests | int | `300` | Maximum requests per window for general API endpoints General API rate limiting |
 | api.rateLimit.trustedProxies | list | `["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16"]` | List of trusted proxy IP ranges that can set X-Forwarded-For headers Trusted proxies that can set X-Forwarded-For/X-Real-IP headers This should include your load balancer and UI proxy IPs |
 | api.rateLimit.window | string | `"1m"` | Time window for rate limiting (e.g., "1m", "1h") |
-| cliArtifacts | object | `{"additionalRouteLabels":null,"enabled":true,"image":{"image":"quay.io/flightctl/flightctl-cli-artifacts","pullPolicy":"","tag":""}}` | CLI Artifacts Configuration |
+| cliArtifacts | object | `{"additionalRouteLabels":null,"enabled":true,"image":{"image":"quay.io/flightctl/flightctl-cli-artifacts-el9","pullPolicy":"","tag":""}}` | CLI Artifacts Configuration |
 | cliArtifacts.additionalRouteLabels | string | `nil` | Additional labels for CLI Artifacts routes. |
 | cliArtifacts.enabled | bool | `true` | Enable CLI artifacts service |
-| cliArtifacts.image.image | string | `"quay.io/flightctl/flightctl-cli-artifacts"` | CLI artifacts container image |
+| cliArtifacts.image.image | string | `"quay.io/flightctl/flightctl-cli-artifacts-el9"` | CLI artifacts container image |
 | cliArtifacts.image.pullPolicy | string | `""` | Image pull policy for CLI artifacts container |
 | cliArtifacts.image.tag | string | `""` | CLI artifacts image tag |
 | clusterCli | object | `{"image":{"image":"quay.io/openshift/origin-cli","pullPolicy":"","tag":"4.20.0"}}` | Cluster CLI Configuration |
@@ -280,8 +282,8 @@ For more detailed configuration options, see the [Values](#values) section below
 | db.external.tlsSecretName | string | `""` | Secret containing client certificates (automatically mounted at /etc/ssl/postgres/) |
 | db.name | string | `"flightctl"` | Database name for Flight Control |
 | db.type | string | `"builtin"` | Type of database to use. Can be 'builtin' or 'external'. Only PostgreSQL DB is supported. |
-| dbSetup | object | `{"image":{"image":"quay.io/flightctl/flightctl-db-setup","pullPolicy":"","tag":""},"migration":{"activeDeadlineSeconds":0,"backoffLimit":2147483647},"wait":{"sleep":2,"timeout":60}}` | Database Setup Configuration |
-| dbSetup.image.image | string | `"quay.io/flightctl/flightctl-db-setup"` | Database setup container image |
+| dbSetup | object | `{"image":{"image":"quay.io/flightctl/flightctl-db-setup-el9","pullPolicy":"","tag":""},"migration":{"activeDeadlineSeconds":0,"backoffLimit":2147483647},"wait":{"sleep":2,"timeout":60}}` | Database Setup Configuration |
+| dbSetup.image.image | string | `"quay.io/flightctl/flightctl-db-setup-el9"` | Database setup container image |
 | dbSetup.image.pullPolicy | string | `""` | Image pull policy for database setup container |
 | dbSetup.image.tag | string | `""` | Database setup image tag |
 | dbSetup.migration.activeDeadlineSeconds | int | `0` | Maximum runtime in seconds for the migration Job (0 = no deadline) |
@@ -296,6 +298,7 @@ For more detailed configuration options, see the [Values](#values) section below
 | global.auth.aap.clientSecret | string | `""` | OAuth2 client secret (prefer mounting from a secret) |
 | global.auth.aap.enabled | bool | `true` | Whether the AAP provider is enabled |
 | global.auth.aap.externalApiUrl | string | `""` | The URL of the AAP Gateway API endpoint that is reachable by clients |
+| global.auth.aap.organizationNamePrefix | string | `""` | Optional prefix for org names from this provider (e.g. "aap-"). Incoming org names are exposed as prefix + name. |
 | global.auth.aap.scopes | list | `["read","write"]` | List of OAuth2 scopes to request |
 | global.auth.aap.tokenUrl | string | `""` | OAuth2 token endpoint URL |
 | global.auth.caCert | string | `""` | The custom CA cert. |
@@ -303,6 +306,7 @@ For more detailed configuration options, see the [Values](#values) section below
 | global.auth.k8s.apiUrl | string | `"https://kubernetes.default.svc"` | API URL of k8s cluster that will be used as authentication authority |
 | global.auth.k8s.createAdminUser | bool | `true` | Create default flightctl-admin ServiceAccount with admin access |
 | global.auth.k8s.externalApiTokenSecretName | string | `""` | In case flightctl is not running within a cluster, you can provide a name of a secret that holds the API token |
+| global.auth.k8s.organizationNamePrefix | string | `""` | Optional prefix for org names from this provider (e.g. "k8s-"). Incoming org name is exposed as prefix + name. |
 | global.auth.k8s.rbacNs | string | `""` | Namespace that should be used for the RBAC checks |
 | global.auth.oidc.clientId | string | `"flightctl-client"` | OIDC Client ID |
 | global.auth.oidc.clientSecret | string | `""` | OIDC client secret (optional; prefer mounting from a secret) |
@@ -319,6 +323,7 @@ For more detailed configuration options, see the [Values](#values) section below
 | global.auth.openshift.createAdminUser | bool | `true` | Create default flightctl-admin ServiceAccount with admin access |
 | global.auth.openshift.externalApiTokenSecretName | string | `""` | In case flightctl is not running within a cluster, you can provide a name of a secret that holds the API token |
 | global.auth.openshift.issuer | string | `""` | OAuth issuer URL (defaults to authorizationUrl if not specified) |
+| global.auth.openshift.organizationNamePrefix | string | `""` | Optional prefix for org (project) names from this provider (e.g. "ocp-"). Incoming names are exposed as prefix + name. |
 | global.auth.openshift.projectLabelFilter | string | `""` | Project label filter for OpenShift projects (leave empty to use default: io.flightctl/instance=<releaseName>) |
 | global.auth.openshift.tokenUrl | string | `""` | OAuth token URL (leave empty to auto-detect from OpenShift cluster) |
 | global.auth.type | string | `""` | Type of authentication to use. Allowed values: 'k8s', 'oidc', 'aap', 'openshift', 'oauth2', or 'none'. When left empty (default and recommended), authentication type is auto-detected: 'openshift' on OpenShift clusters, 'k8s' otherwise. |
@@ -339,15 +344,15 @@ For more detailed configuration options, see the [Values](#values) section below
 | global.routeExternalCertificate | string | `"auto"` | Whether to use generated TLS certificates on edge-terminated routes via externalCertificate. - auto: use externalCertificate on fresh install and preserve existing behavior on upgrade. - true: always use externalCertificate. - false: never use externalCertificate (rely on default router cert). |
 | global.sshKnownHosts.data | string | `""` | SSH known hosts file content for Git repository host key verification. |
 | global.storageClassName | string | `""` | Storage class name for the PVCs. Keep empty to use the default storage class. |
-| imageBuilderApi | object | `{"enabled":true,"image":{"image":"quay.io/flightctl/flightctl-imagebuilder-api","pullPolicy":"","tag":""}}` | ImageBuilder API Configuration |
+| imageBuilderApi | object | `{"enabled":true,"image":{"image":"quay.io/flightctl/flightctl-imagebuilder-api-el9","pullPolicy":"","tag":""}}` | ImageBuilder API Configuration |
 | imageBuilderApi.enabled | bool | `true` | Enable imagebuilder API service |
-| imageBuilderApi.image.image | string | `"quay.io/flightctl/flightctl-imagebuilder-api"` | ImageBuilder API container image |
+| imageBuilderApi.image.image | string | `"quay.io/flightctl/flightctl-imagebuilder-api-el9"` | ImageBuilder API container image |
 | imageBuilderApi.image.pullPolicy | string | `""` | Image pull policy for ImageBuilder API container |
 | imageBuilderApi.image.tag | string | `""` | ImageBuilder API image tag |
-| imageBuilderWorker | object | `{"defaultTTL":"168h","enabled":true,"image":{"image":"quay.io/flightctl/flightctl-imagebuilder-worker","pullPolicy":"","tag":""},"logLevel":"info","maxConcurrentBuilds":2,"privileged":true,"replicas":1,"resources":{},"rhsmCaSecretName":"","rhsmSecretName":"","serviceImages":{"bootcImageBuilder":{"image":"","skipTlsVerify":false},"podman":{"image":"","skipTlsVerify":false}},"yumReposSecretName":""}` | ImageBuilder Worker Configuration |
+| imageBuilderWorker | object | `{"defaultTTL":"168h","enabled":true,"image":{"image":"quay.io/flightctl/flightctl-imagebuilder-worker-el9","pullPolicy":"","tag":""},"logLevel":"info","maxConcurrentBuilds":2,"privileged":true,"replicas":1,"resources":{},"rhsmCaSecretName":"","rhsmSecretName":"","sbom":{"enabled":true,"purlTransform":{"enabled":true},"pushToRegistry":true,"uploadToTrustify":true},"serviceImages":{"bootcImageBuilder":{"image":"","skipTlsVerify":false},"podman":{"image":"","skipTlsVerify":false},"syft":{"image":"","skipTlsVerify":false}},"yumReposSecretName":""}` | ImageBuilder Worker Configuration |
 | imageBuilderWorker.defaultTTL | string | `"168h"` | Default TTL for image build resources |
 | imageBuilderWorker.enabled | bool | `true` | Enable imagebuilder worker service |
-| imageBuilderWorker.image.image | string | `"quay.io/flightctl/flightctl-imagebuilder-worker"` | ImageBuilder Worker container image |
+| imageBuilderWorker.image.image | string | `"quay.io/flightctl/flightctl-imagebuilder-worker-el9"` | ImageBuilder Worker container image |
 | imageBuilderWorker.image.pullPolicy | string | `""` | Image pull policy for ImageBuilder Worker container |
 | imageBuilderWorker.image.tag | string | `""` | ImageBuilder Worker image tag |
 | imageBuilderWorker.logLevel | string | `"info"` | Log level for the imagebuilder worker |
@@ -357,11 +362,18 @@ For more detailed configuration options, see the [Values](#values) section below
 | imageBuilderWorker.resources | object | `{}` | Resource requests and limits |
 | imageBuilderWorker.rhsmCaSecretName | string | `""` | Secret name containing RHSM CA certificates, mounted at /etc/rhsm/ca |
 | imageBuilderWorker.rhsmSecretName | string | `""` | Secret name containing RHEL subscription manager configuration, mounted at /etc/rhsm |
-| imageBuilderWorker.serviceImages | object | `{"bootcImageBuilder":{"image":"","skipTlsVerify":false},"podman":{"image":"","skipTlsVerify":false}}` | Builder images (podman, bootc-image-builder) and skip-TLS options |
+| imageBuilderWorker.sbom | object | `{"enabled":true,"purlTransform":{"enabled":true},"pushToRegistry":true,"uploadToTrustify":true}` | SBOM generation after image push (Syft produces CycloneDX JSON; PURL normalization; optional OCI referrer push and Trustify upload when configured). |
+| imageBuilderWorker.sbom.enabled | bool | `true` | Run SBOM generation after a successful image push. |
+| imageBuilderWorker.sbom.purlTransform.enabled | bool | `true` | Normalize RPM PURLs (namespace/distro/qualifiers) before push/upload for advisory matching. |
+| imageBuilderWorker.sbom.pushToRegistry | bool | `true` | Attach the SBOM to the pushed image as an OCI 1.1 referrer artifact on the destination registry. |
+| imageBuilderWorker.sbom.uploadToTrustify | bool | `true` | Upload the SBOM to Trustify when vulnerability reporting is enabled and Trustify is configured (same settings as `vulnerabilityReporting` elsewhere in this chart). |
+| imageBuilderWorker.serviceImages | object | `{"bootcImageBuilder":{"image":"","skipTlsVerify":false},"podman":{"image":"","skipTlsVerify":false},"syft":{"image":"","skipTlsVerify":false}}` | Builder images (podman, bootc-image-builder, syft) and skip-TLS options |
 | imageBuilderWorker.serviceImages.bootcImageBuilder.image | string | `""` | bootc-image-builder image (leave empty to use default). |
 | imageBuilderWorker.serviceImages.bootcImageBuilder.skipTlsVerify | bool | `false` | Set to true to skip TLS verification when pulling the bootc-image-builder image. |
 | imageBuilderWorker.serviceImages.podman.image | string | `""` | Podman builder image (leave empty to use default). |
 | imageBuilderWorker.serviceImages.podman.skipTlsVerify | bool | `false` | Set to true to skip TLS verification when pulling the Podman builder image. |
+| imageBuilderWorker.serviceImages.syft.image | string | `""` | Syft image for SBOM generation. If empty, defaults to `docker.io/anchore/syft:v1.44.0`. |
+| imageBuilderWorker.serviceImages.syft.skipTlsVerify | bool | `false` | Set to true to skip TLS verification when pulling the Syft image. |
 | imageBuilderWorker.yumReposSecretName | string | `""` | Secret name containing yum repository configuration files, mounted at /etc/yum.repos.d |
 | kv | object | `{"fsGroup":"","image":{"image":"quay.io/sclorg/redis-7-c9s","pullPolicy":"","tag":"20250108"},"loglevel":"warning","maxmemory":"1gb","maxmemoryPolicy":"allkeys-lru","passwordSecretName":""}` | Key-Value Store Configuration |
 | kv.fsGroup | string | `""` | File system group ID for Redis pod security context |
@@ -372,32 +384,45 @@ For more detailed configuration options, see the [Values](#values) section below
 | kv.maxmemory | string | `"1gb"` | Maximum memory usage for Redis |
 | kv.maxmemoryPolicy | string | `"allkeys-lru"` | Redis memory eviction policy |
 | kv.passwordSecretName | string | `""` | Secret containing password for Redis password (leave empty for auto-generation) |
-| periodic | object | `{"consumers":5,"image":{"image":"quay.io/flightctl/flightctl-periodic","pullPolicy":"","tag":""}}` | Periodic Configuration |
+| periodic | object | `{"clusterLevelSecretAccess":false,"consumers":5,"image":{"image":"quay.io/flightctl/flightctl-periodic-el9","pullPolicy":"","tag":""},"metrics":{"address":":15690","enabled":true}}` | Periodic Configuration |
+| periodic.clusterLevelSecretAccess | bool | `false` | Allow flightctl-periodic to list/watch secrets at the cluster level for change detection |
 | periodic.consumers | int | `5` | Number of periodic consumers |
-| periodic.image.image | string | `"quay.io/flightctl/flightctl-periodic"` | Periodic container image |
+| periodic.image.image | string | `"quay.io/flightctl/flightctl-periodic-el9"` | Periodic container image |
 | periodic.image.pullPolicy | string | `""` | Image pull policy for periodic container |
 | periodic.image.tag | string | `""` | Periodic image tag |
+| periodic.metrics | object | `{"address":":15690","enabled":true}` | Metrics configuration for flightctl-periodic |
+| periodic.metrics.address | string | `":15690"` | Address for the metrics HTTP server |
+| periodic.metrics.enabled | bool | `true` | Enable Prometheus metrics endpoint |
 | telemetryGateway.additionalRouteLabels | string | `nil` |  |
-| telemetryGateway.image.image | string | `"quay.io/flightctl/flightctl-telemetry-gateway"` | Telemetry gateway container image |
+| telemetryGateway.image.image | string | `"quay.io/flightctl/flightctl-telemetry-gateway-el9"` | Telemetry gateway container image |
 | telemetryGateway.image.pullPolicy | string | `""` | Image pull policy for Telemetry gateway container |
 | telemetryGateway.image.tag | string | `""` | Telemetry gateway image tag |
-| ui | object | `{"additionalRouteLabels":null,"auth":{"caCert":"","insecureSkipTlsVerify":false},"enabled":true,"image":{"image":"quay.io/flightctl/flightctl-ui","pluginImage":"quay.io/flightctl/flightctl-ocp-ui","pullPolicy":"","tag":""}}` | UI Configuration |
+| ui | object | `{"additionalRouteLabels":null,"auth":{"caCert":"","insecureSkipTlsVerify":false},"enabled":true,"image":{"image":"quay.io/flightctl/flightctl-ui-el9","pluginImage":"quay.io/flightctl/flightctl-ocp-ui-el9","pullPolicy":"","tag":""},"trustXForwardedHeaders":true,"trustedProxyCidrs":""}` | UI Configuration |
 | ui.additionalRouteLabels | string | `nil` | Additional labels for UI routes. |
 | ui.auth.caCert | string | `""` | A custom CA cert for Auth TLS. |
 | ui.auth.insecureSkipTlsVerify | bool | `false` | Set to true if auth TLS certificate validation should be skipped. |
 | ui.enabled | bool | `true` | Enable web UI deployment |
-| ui.image.image | string | `"quay.io/flightctl/flightctl-ui"` | UI container image |
-| ui.image.pluginImage | string | `"quay.io/flightctl/flightctl-ocp-ui"` | UI Plugin container image |
+| ui.image.image | string | `"quay.io/flightctl/flightctl-ui-el9"` | UI container image |
+| ui.image.pluginImage | string | `"quay.io/flightctl/flightctl-ocp-ui-el9"` | UI Plugin container image |
 | ui.image.pullPolicy | string | `""` | Image pull policy for UI container |
 | ui.image.tag | string | `""` | UI container image tag |
+| ui.trustXForwardedHeaders | bool | `true` | When true, the UI proxy uses X-Forwarded-Proto and X-Forwarded-Host for OAuth redirect validation (required when TLS terminates at an ingress). Disable if the UI is reached directly without a trusted reverse proxy. Optional trustedProxyCidrs restricts this to listed CIDRs. |
+| ui.trustedProxyCidrs | string | `""` | Comma-separated CIDRs for immediate clients that may set forwarded headers (e.g. ingress pod network). Empty means any client when trustXForwardedHeaders is true. |
 | upgradeHooks | object | `{"databaseMigrationDryRun":true,"scaleDown":{"condition":"chart","deployments":["flightctl-periodic","flightctl-worker"],"timeoutSeconds":120}}` | Upgrade hooks |
 | upgradeHooks.databaseMigrationDryRun | bool | `true` | Enable pre-upgrade DB migration dry-run as a hook |
 | upgradeHooks.scaleDown.condition | string | `"chart"` | When to run pre-upgrade scale down job: "always", "never", or "chart" (default). "chart" runs only if helm.sh/chart changed. |
 | upgradeHooks.scaleDown.deployments | list | `["flightctl-periodic","flightctl-worker"]` | List of Deployments to scale down in order |
 | upgradeHooks.scaleDown.timeoutSeconds | int | `120` | Timeout in seconds to wait for rollout per Deployment |
-| worker | object | `{"clusterLevelSecretAccess":false,"image":{"image":"quay.io/flightctl/flightctl-worker","pullPolicy":"","tag":""}}` | Worker Configuration |
+| vulnerabilityReporting | object | `{"enabled":false,"syncInterval":"15m","trustify":{"auth":{"mode":"none","oidcIssuerUrl":"","secretName":""},"endpoint":""}}` | Vulnerability Integration Configuration |
+| vulnerabilityReporting.enabled | bool | `false` | Enable vulnerability integration (sync task + API endpoints). |
+| vulnerabilityReporting.syncInterval | string | `"15m"` | Sync interval for periodic Trustify fetch (e.g. "15m", "1h"). |
+| vulnerabilityReporting.trustify.auth.mode | string | `"none"` | Authentication mode for Trustify. Allowed values: 'client-credentials', 'none'. |
+| vulnerabilityReporting.trustify.auth.oidcIssuerUrl | string | `""` | OIDC issuer URL for client-credentials mode. |
+| vulnerabilityReporting.trustify.auth.secretName | string | `""` | Name of the Kubernetes Secret containing 'client_id' and 'client_secret' keys. |
+| vulnerabilityReporting.trustify.endpoint | string | `""` | Trustify API base URL (do not include /api/v1 or /api/v2 paths). |
+| worker | object | `{"clusterLevelSecretAccess":false,"image":{"image":"quay.io/flightctl/flightctl-worker-el9","pullPolicy":"","tag":""}}` | Worker Configuration |
 | worker.clusterLevelSecretAccess | bool | `false` | Allow flightctl-worker to access secrets at the cluster level for embedding in device configs |
-| worker.image.image | string | `"quay.io/flightctl/flightctl-worker"` | Worker container image |
+| worker.image.image | string | `"quay.io/flightctl/flightctl-worker-el9"` | Worker container image |
 | worker.image.pullPolicy | string | `""` | Image pull policy for worker container |
 | worker.image.tag | string | `""` | Worker image tag |
 

@@ -261,6 +261,10 @@ Usage: {{- $authType := include "flightctl.getEffectiveAuthType" . }}
   {{- end }}
 {{- end }}
 
+{{- define "flightctl.getInternalAlertManagerProxyUrl" }}
+  {{- print "https://flightctl-alertmanager-proxy:8443"}}
+{{- end }}
+
 {{- define "flightctl.getAlertManagerProxyUrl" }}
   {{- $baseDomain := (include "flightctl.getBaseDomain" . )}}
   {{- $scheme := (include "flightctl.getHttpScheme" . )}}
@@ -335,7 +339,7 @@ Parameters:
 {{- $sleep := .sleep | default $context.Values.dbSetup.wait.sleep | default 2 | int }}
 {{- $connectionTimeout := .connectionTimeout | default $context.Values.dbSetup.wait.connectionTimeout | default 3 | int }}
 - name: wait-for-database-{{ $userType }}
-  image: "{{ $context.Values.dbSetup.image.image }}:{{ default $context.Chart.AppVersion $context.Values.dbSetup.image.tag }}"
+  image: "{{ include "flightctl.ensureOsQualifiedImage" $context.Values.dbSetup.image.image }}:{{ default $context.Chart.AppVersion $context.Values.dbSetup.image.tag }}"
   imagePullPolicy: {{ default $context.Values.global.imagePullPolicy $context.Values.dbSetup.image.pullPolicy }}
   command:
   - /app/deploy/scripts/wait-for-database.sh
@@ -482,6 +486,51 @@ Parameters:
         echo "Migration job not found yet, waiting..."
       fi
 
+      sleep 5
+    done
+{{- end }}
+
+{{/*
+API wait init container template.
+Waits for the flightctl-api service to respond on its readiness endpoint before starting the main container.
+Usage: {{- include "flightctl.apiWaitInitContainer" (dict "context" .) | nindent 6 }}
+Parameters:
+- context: The root template context (.)
+- timeout: Optional timeout in seconds (default: 300)
+*/}}
+{{- define "flightctl.apiWaitInitContainer" }}
+{{- $ctx := .context }}
+{{- $timeout := .timeout | default 300 | int }}
+- name: wait-for-api
+  image: "{{ $ctx.Values.clusterCli.image.image }}:{{ $ctx.Values.clusterCli.image.tag }}"
+  imagePullPolicy: {{ default $ctx.Values.global.imagePullPolicy $ctx.Values.clusterCli.image.pullPolicy }}
+  command:
+  - /bin/bash
+  - -c
+  - |
+    set -euo pipefail
+
+    API_URL="https://flightctl-api.{{ $ctx.Release.Namespace }}.svc:3443/readyz"
+    TIMEOUT={{ $timeout }}
+
+    echo "Waiting for API at $API_URL (timeout ${TIMEOUT}s)"
+    start=$(date +%s)
+
+    while true; do
+      elapsed=$(( $(date +%s) - start ))
+
+      if [ $elapsed -ge $TIMEOUT ]; then
+        echo "Timeout waiting for API after ${TIMEOUT}s"
+        exit 1
+      fi
+
+      HTTP_CODE=$(curl -sk --max-time 5 -o /dev/null -w "%{http_code}" "$API_URL" || true)
+      if [ "$HTTP_CODE" = "200" ]; then
+        echo "API is ready"
+        exit 0
+      fi
+
+      echo "API not ready yet (HTTP $HTTP_CODE, ${elapsed}s elapsed), retrying in 5s..."
       sleep 5
     done
 {{- end }}
@@ -695,6 +744,9 @@ auth:
         apiUrl: {{ .Values.global.auth.k8s.apiUrl }}
         rbacNs: {{ default .Release.Namespace .Values.global.auth.k8s.rbacNs }}
         roleSuffix: {{ .Release.Namespace }}
+        {{- if .Values.global.auth.k8s.organizationNamePrefix }}
+        organizationNamePrefix: {{ .Values.global.auth.k8s.organizationNamePrefix }}
+        {{- end }}
     {{- else if eq $effectiveAuthType "openshift" }}
     openshift:
         clusterControlPlaneUrl: {{ default "https://kubernetes.default.svc" .Values.global.auth.openshift.clusterControlPlaneUrl }}
@@ -705,6 +757,9 @@ auth:
         clientSecret: {{ include "flightctl.getOpenShiftOAuthClientSecret" . }}
         projectLabelFilter: {{ include "flightctl.getOpenShiftProjectLabelFilter" . | quote }}
         roleSuffix: {{ .Release.Namespace }}
+        {{- if .Values.global.auth.openshift.organizationNamePrefix }}
+        organizationNamePrefix: {{ .Values.global.auth.openshift.organizationNamePrefix }}
+        {{- end }}
     {{- else if eq $effectiveAuthType "aap" }}
     aap:
         apiUrl: {{ .Values.global.auth.aap.apiUrl }}
@@ -724,6 +779,9 @@ auth:
         enabled: {{ .Values.global.auth.aap.enabled }}
         {{- if .Values.global.auth.aap.scopes }}
         scopes: {{ .Values.global.auth.aap.scopes | toYaml | nindent 12 }}
+        {{- end }}
+        {{- if .Values.global.auth.aap.organizationNamePrefix }}
+        organizationNamePrefix: {{ .Values.global.auth.aap.organizationNamePrefix }}
         {{- end }}
     {{- else }}
     oidc:
@@ -772,3 +830,22 @@ auth:
   {{- end }}
   {{- $caCrt }}
 {{- end }}
+
+{{- /*
+Ensure image names are OS-qualified for backward compatibility during helm upgrades.
+This helper migrates non-OS-qualified image names (from main branch) to OS-qualified names (PR branch).
+For example: quay.io/flightctl/flightctl-api -> quay.io/flightctl/flightctl-api-el9
+
+Usage: {{ include "flightctl.ensureOsQualifiedImage" .Values.api.image.image }}
+*/}}
+{{- define "flightctl.ensureOsQualifiedImage" -}}
+  {{- $imageName := . -}}
+  {{- /* Check if image already has OS suffix (-el9, -el10, -cs9, -cs10) */ -}}
+  {{- if or (hasSuffix "-el9" $imageName) (hasSuffix "-el10" $imageName) (hasSuffix "-cs9" $imageName) (hasSuffix "-cs10" $imageName) (hasSuffix "-rhel9" $imageName) (hasSuffix "-rhel10" $imageName) -}}
+    {{- /* Image already has OS suffix, use as-is */ -}}
+    {{- $imageName -}}
+  {{- else -}}
+    {{- /* Image lacks OS suffix, add default -el9 for backward compatibility */ -}}
+    {{- printf "%s-el9" $imageName -}}
+  {{- end -}}
+{{- end -}}

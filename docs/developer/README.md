@@ -24,9 +24,51 @@ To run unit tests, use `make unit-test`.  This requires installing gotestsum:
 
 `go install gotest.tools/gotestsum@latest`
 
+To run integration tests, use `make integration-test`. This requires Podman (or Docker) - the test
+framework uses testcontainers to automatically start ephemeral Postgres, Redis, and Alertmanager
+instances. No manual setup is required.
+
+Key options for integration tests:
+- `INTEGRATION_PROCS=N` - Number of parallel processes (default: 4)
+- `TEST_DIR=./test/integration/store` - Run specific test suite
+- `INTEGRATION_GINKGO_FOCUS="pattern"` - Run tests matching pattern
+
+Example: `make integration-test TEST_DIR=./test/integration/agent INTEGRATION_PROCS=1`
+
 To generate API code and mocks, use `make generate`  This requires installing mockgen:
 
 `go install go.uber.org/mock/mockgen@v0.4.0`
+
+### Container image building
+
+Flight Control supports building containers for multiple Enterprise Linux versions using OS-qualified image naming. The build system uses an `OS` variable to specify the target Enterprise Linux version:
+
+```bash
+# Build containers for Enterprise Linux 9 (default)
+make build-containers OS=el9
+
+# Build containers for Enterprise Linux 10
+make build-containers OS=el10
+```
+
+**OS-Qualified Image Names:**
+
+All Flight Control service containers use OS-qualified naming with the format `flightctl-{service}-{OS}:latest`:
+
+- **EL9**: `flightctl-api-el9:latest`, `flightctl-worker-el9:latest`, etc.
+- **EL10**: `flightctl-api-el10:latest`, `flightctl-worker-el10:latest`, etc.
+
+This naming scheme prevents conflicts when building and deploying containers across different Enterprise Linux versions.
+
+**Available Make Targets:**
+
+- `make build-containers` - Build all service containers (defaults to `OS=el9`)
+- `make clean-containers` - Remove containers for the current OS
+- `make bundle-containers` - Bundle containers for distribution
+
+**Registry Image Naming:**
+
+Registry images follow the same pattern: `quay.io/flightctl/flightctl-{service}-{OS}:{version}`
 
 ## Running
 
@@ -40,6 +82,14 @@ podman login registry.redhat.io
 The service can be deployed locally in kind with the following command:
 ```
 make deploy
+```
+
+Note: An update to firewalld may need to be made if the agent is unable to connect to the api instance:
+
+```bash
+VIRBR0_SUBNET=`ip a | grep 'virbr0:' -A 2 | tail -1 | awk '{print $2}'`
+sudo firewall-cmd --zone=libvirt --add-rich-rule="rule family=\"ipv4\" source address=\"$VIRBR0_SUBNET\" accept" --permanent
+sudo firewall-cmd --reload
 ```
 
 ### Deployment using Quadlets
@@ -64,13 +114,6 @@ bin/flightctl get fleet fleet1 fleet2  # Get multiple specific resources
 Use an agent VM to test a device interaction, an image is automatically created from
 hack/Containerfile.local and a qcow2 image is derived in output/qcow2/disk.qcow2, currently
 this only works on a Linux host.
-
-Note: An update to firewalld may need to be made if the agent is unable to connect to the api instance:
-
-```bash
-sudo firewall-cmd --zone=libvirt --add-rich-rule='rule family="ipv4" source address="<virbr0s subnet here>" accept' --permanent
-sudo firewall-cmd --reload
-```
 
 You can deploy a DB container of different sizes using a DB_VERSION variable for make command:
 * e2e (default) - minimal footprint for e2e testing
@@ -139,6 +182,10 @@ Use the **[devicesimulator](devicesimulator.md)** to simulate load from devices
 ```
 bin/devicesimulator --count=100
 ```
+
+## Backup and restore
+
+For backup and restore procedures applicable to development deployments, see [Backup and Restore](../user/installing/backup-restore.md). Development deployments using kind or quadlets can use the same `flightctl-backup` and `flightctl-restore` commands documented for production environments.
 
 ## Metrics
 

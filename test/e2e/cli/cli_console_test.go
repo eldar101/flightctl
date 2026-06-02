@@ -30,6 +30,9 @@ var _ = Describe("CLI - device console", func() {
 		// Get harness directly - no shared package-level variable
 		harness := e2e.GetWorkerHarness()
 
+		By("resetting the agent config for console tests")
+		Expect(resetConsoleTestAgentConfig(harness)).To(Succeed())
+
 		By("enrolling the device")
 		deviceID, _ = harness.EnrollAndWaitForOnlineStatus()
 	})
@@ -37,9 +40,10 @@ var _ = Describe("CLI - device console", func() {
 	AfterEach(func() {
 		harness := e2e.GetWorkerHarness()
 		harness.PrintAgentLogsIfFailed()
+		harness.CaptureDeploymentLogsIfFailed()
 	})
 
-	It("connects to a device and executes a simple command", Label("80483", "sanity", "agent"), func() {
+	It("connects to a device and executes a simple command", Label("80483", "sanity", "agent", "client"), func() {
 		// Get harness directly - no shared package-level variable
 		harness := e2e.GetWorkerHarness()
 
@@ -49,7 +53,7 @@ var _ = Describe("CLI - device console", func() {
 		cs.Close()
 	})
 
-	It("supports multiple simultaneous console sessions", Label("81737", "agent"), func() {
+	It("supports multiple simultaneous console sessions", Label("81737", "agent", "client"), func() {
 		// Get harness directly - no shared package-level variable
 		harness := e2e.GetWorkerHarness()
 
@@ -83,7 +87,7 @@ var _ = Describe("CLI - device console", func() {
 		cs2.Close()
 	})
 
-	It("keeps console sessions open during a device update", Label("81786"), func() {
+	It("keeps console sessions open during a device update", Label("81786", "client"), func() {
 		// Get harness directly - no shared package-level variable
 		harness := e2e.GetWorkerHarness()
 
@@ -130,7 +134,7 @@ var _ = Describe("CLI - device console", func() {
 		Expect(out).To(ContainSubstring("not found"))
 	})
 
-	It("recovers from image pull network disruption", Label("82541"), func() {
+	It("recovers from image pull network disruption", Label("82541", "client"), func() {
 		// Get harness directly - no shared package-level variable
 		harness := e2e.GetWorkerHarness()
 
@@ -169,11 +173,12 @@ var _ = Describe("CLI - device console", func() {
 			Should(WithTransform((*v1beta1.Device).IsUpdatedToDeviceSpec, BeTrue()))
 	})
 
-	It("uses the flightctl-console user and has sudo access", Label("87848"), func() {
+	It("uses the flightctl-console user and has sudo access", Label("87848", "client"), func() {
 		// Get harness directly - no shared package-level variable
 		harness := e2e.GetWorkerHarness()
 
 		session := harness.NewConsoleSession(deviceID)
+		DeferCleanup(session.Close)
 
 		session.MustSend(`whoami`)
 		session.MustExpect(`flightctl-console`)
@@ -218,7 +223,7 @@ var _ = Describe("CLI - device console", func() {
 		}
 	})
 
-	It("recovers from image pull network connection error", Label("83029"), func() {
+	It("recovers from image pull network connection error", Label("83029", "client"), func() {
 		// Get harness directly - no shared package-level variable
 		harness := e2e.GetWorkerHarness()
 
@@ -262,7 +267,7 @@ var _ = Describe("CLI - device console", func() {
 			Should(WithTransform((*v1beta1.Device).IsUpdatedToDeviceSpec, BeTrue()))
 	})
 
-	It("provides console --help and auxiliary features", Label("81866", "sanity", "agent"), func() {
+	It("provides console --help and auxiliary features", Label("81866", "sanity", "agent", "client"), func() {
 		// Get harness directly - no shared package-level variable
 		harness := e2e.GetWorkerHarness()
 
@@ -277,6 +282,9 @@ var _ = Describe("CLI - device console", func() {
 
 		By("verifying that the ~. sequence exits the shell")
 		cs := harness.NewConsoleSession(deviceID)
+		cs.SkipGracefulExitOnClose()
+		DeferCleanup(cs.Close)
+
 		Expect(cs.Stdin.Write([]byte("\n~.\n"))).To(BeNumerically(">", 0))
 		Eventually(cs.Stdout.Closed).Should(BeTrue())
 
@@ -371,3 +379,33 @@ var _ = Describe("CLI - device console", func() {
 
 // 	return validateIntervalTiming(timestamps, expectedInterval)
 // }
+
+// resetConsoleTestAgentConfig clears enrollment state and enrollment labels so
+// console tests start from a predictable enrollment configuration.
+func resetConsoleTestAgentConfig(harness *e2e.Harness) error {
+	if harness == nil {
+		return fmt.Errorf("harness is nil")
+	}
+
+	if err := harness.ResetAgentEnrollmentState(); err != nil {
+		return fmt.Errorf("resetting agent enrollment state: %w", err)
+	}
+
+	cfg, err := harness.GetAgentConfig()
+	if err != nil {
+		return fmt.Errorf("getting agent config: %w", err)
+	}
+
+	cfg.DefaultLabels = map[string]string{}
+	cfg.LabelFromSystemInfo = map[string]string{}
+
+	if err := harness.SetAgentConfig(cfg); err != nil {
+		return fmt.Errorf("setting agent config: %w", err)
+	}
+
+	if err := harness.StartFlightCtlAgent(); err != nil {
+		return fmt.Errorf("starting flightctl-agent: %w", err)
+	}
+
+	return nil
+}

@@ -1,4 +1,4 @@
-FROM registry.access.redhat.com/ubi9/go-toolset:1.24.6-1762373805 as build
+FROM registry.access.redhat.com/ubi9/go-toolset:1.25.8-1774618347 as build
 WORKDIR /app
 ARG SOURCE_GIT_TAG
 ARG SOURCE_GIT_TREE_STATE
@@ -60,7 +60,6 @@ COPY --from=build /app/bin/flightctl-db-migrate /usr/local/bin/flightctl-db-migr
 
 # Copy the database setup scripts
 COPY --chmod=0755 ./deploy/scripts/setup_database_users.sh \
-                  ./deploy/scripts/migration-setup.sh \
                   ./deploy/scripts/wait-for-database.sh \
                   ./deploy/scripts/yaml_helpers.py \
                   ./deploy/scripts/

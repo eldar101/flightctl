@@ -55,6 +55,7 @@ import (
 	"bytes"
 	"context"
 	cryptorand "crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -71,7 +72,6 @@ import (
 	"github.com/creack/pty"
 	"github.com/flightctl/flightctl/api/core/v1beta1"
 	apiclient "github.com/flightctl/flightctl/internal/api/client"
-	imagebuilderclient "github.com/flightctl/flightctl/internal/api/imagebuilder/client"
 	"github.com/flightctl/flightctl/internal/client"
 	service "github.com/flightctl/flightctl/internal/service/common"
 	"github.com/flightctl/flightctl/test/harness/e2e/vm"
@@ -89,10 +89,21 @@ const fiveSecondTimeout = 5 * time.Second
 // setupSnapshotRestoreTimeout is the maximum time allowed for VM snapshot restore in BeforeEach.
 const setupSnapshotRestoreTimeout = 10 * time.Minute
 
-const POLLING = "250ms"
-const POLLINGLONG = "1s"
-const TIMEOUT = "5m"
-const LONGTIMEOUT = "10m"
+const (
+	POLLING     = "250ms"
+	POLLINGLONG = "1s"
+	TIMEOUT     = "5m"
+	LONGTIMEOUT = "10m"
+)
+
+// Service name constants for flightctl deployment components.
+const (
+	ServiceAPI      = "flightctl-api"
+	ServiceWorker   = "flightctl-worker"
+	ServicePeriodic = "flightctl-periodic"
+	ServiceUI       = "flightctl-ui"
+	ServiceDB       = "flightctl-db"
+)
 
 // Operation constants for RBAC testing
 const (
@@ -106,7 +117,7 @@ const (
 
 type Harness struct {
 	Client             *apiclient.ClientWithResponses
-	ImageBuilderClient *imagebuilderclient.ClientWithResponses
+	ImageBuilderClient *client.ImageBuilderClient
 	Context            context.Context
 	ctxCancel          context.CancelFunc
 	startTime          time.Time
@@ -149,19 +160,6 @@ func findTopLevelDir() string { //nolint:unused
 	return ""
 }
 
-// ReadPrimaryVMAgentLogs reads flightctl-agent journalctl logs from the primary VM
-func (h *Harness) ReadPrimaryVMAgentLogs(since string, unit string) (string, error) {
-	if h.VM == nil {
-		return "", fmt.Errorf("VM is not initialized")
-	}
-	logs, err := h.VM.JournalLogs(vm.JournalOpts{
-		Since: since,
-		Unit:  unit,
-	})
-
-	return logs, err
-}
-
 // ReadClientConfig returns the client config for at the specified location. The default config path is used if no path is
 // specified
 func (h *Harness) ReadClientConfig(filePath string) (*client.Config, error) {
@@ -175,7 +173,7 @@ func (h *Harness) ReadClientConfig(filePath string) (*client.Config, error) {
 	return client.ParseConfigFile(filePath)
 }
 
-// RefreshClient recreates the FlightCtl API client from the config file.
+// RefreshClient recreates the FlightCtl API client and ImageBuilder client from the config file.
 // This is useful after login when the config file has been updated with new authentication or organization information.
 func (h *Harness) RefreshClient() error {
 	baseDir, err := client.DefaultFlightctlClientConfigPath()
@@ -187,7 +185,35 @@ func (h *Harness) RefreshClient() error {
 	if err != nil {
 		return fmt.Errorf("failed to recreate client: %w", err)
 	}
+	if h.clientWrapper != nil {
+		h.clientWrapper.Stop()
+	}
+	c.Start(h.Context)
+	h.clientWrapper = c
 	h.Client = c.ClientWithResponses
+
+	config, err := client.ParseConfigFile(baseDir)
+	if err != nil {
+		return fmt.Errorf("failed to parse config for imagebuilder client: %w", err)
+	}
+	imageBuilderServer := config.GetImageBuilderServer()
+	if imageBuilderServer != "" {
+		if h.ImageBuilderClient != nil {
+			h.ImageBuilderClient.Stop()
+		}
+		ibClient, err := client.NewImageBuilderClientFromConfig(config, baseDir, imageBuilderServer, config.Organization)
+		if err != nil {
+			return fmt.Errorf("failed to recreate imagebuilder client: %w", err)
+		}
+		ibClient.Start(h.Context)
+		h.ImageBuilderClient = ibClient
+	} else {
+		if h.ImageBuilderClient != nil {
+			h.ImageBuilderClient.Stop()
+		}
+		h.ImageBuilderClient = nil
+	}
+
 	logrus.Infof("Refreshed FlightCtl API client from config file")
 	return nil
 }
@@ -298,6 +324,9 @@ func (h *Harness) Cleanup(printConsole bool) {
 	if h.clientWrapper != nil {
 		h.clientWrapper.Stop()
 	}
+	if h.ImageBuilderClient != nil {
+		h.ImageBuilderClient.Stop()
+	}
 
 	// Cancel the context to stop any blocking operations
 	h.ctxCancel()
@@ -333,6 +362,25 @@ func (h *Harness) PrintAgentLogsIfFailed() {
 	}
 }
 
+// CaptureDeploymentLogsIfFailed captures deployment pod logs to the artifacts
+// directory when the current test has failed. Intended to be called from AfterEach
+// alongside PrintAgentLogsIfFailed.
+func (h *Harness) CaptureDeploymentLogsIfFailed() {
+	if !CurrentSpecReport().Failed() {
+		return
+	}
+
+	artifactDir := filepath.Join(util.GetTopLevelDir(), "artifacts", "deployment-logs", h.GetTestIDFromContext())
+	if err := os.MkdirAll(artifactDir, 0o755); err != nil {
+		logrus.Errorf("CaptureDeploymentLogsIfFailed: failed to create artifact dir: %v", err)
+		return
+	}
+
+	if err := h.CaptureDeploymentLogs(artifactDir); err != nil {
+		logrus.Errorf("CaptureDeploymentLogsIfFailed: %v", err)
+	}
+}
+
 // checkLogsForPanicAVC checks both agent VM logs and service pod logs for
 // Go panics and SELinux AVC denials, failing the current test if any are found.
 // Registered via DeferCleanup in SetTestContext so it runs for every test.
@@ -351,15 +399,19 @@ func (h *Harness) checkLogsForPanicAVC(sinceTime time.Time) {
 		}
 	}
 	if isK8sEnvironment() {
-		for _, svc := range []string{"flightctl-api", "flightctl-worker", "flightctl-periodic"} {
-			nsOut, err := exec.Command("kubectl", "get", "pods", "--all-namespaces", //nolint:gosec // svc iterates a hardcoded list
+		for _, svc := range []string{ServiceAPI, ServiceWorker, ServicePeriodic} {
+			cmdCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			nsOut, err := exec.CommandContext(cmdCtx, "kubectl", "get", "pods", "--all-namespaces", //nolint:gosec // svc iterates a hardcoded list
 				"-l", "flightctl.service="+svc, "-o", "jsonpath={.items[0].metadata.namespace}").Output()
+			cancel()
 			if err != nil || len(nsOut) == 0 {
 				continue
 			}
 			ns := string(nsOut)
-			out, err := exec.Command("kubectl", "logs", "-n", ns, "-l", "flightctl.service="+svc,
+			cmdCtx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
+			out, err := exec.CommandContext(cmdCtx, "kubectl", "logs", "-n", ns, "-l", "flightctl.service="+svc,
 				"--since-time="+sinceArg).Output()
+			cancel()
 			if err != nil {
 				logrus.Warnf("checkLogsForPanicAVC: failed to read logs for %s: %v", svc, err)
 				continue
@@ -398,7 +450,21 @@ func isK8sEnvironment() bool {
 	if env := os.Getenv("E2E_ENVIRONMENT"); env != "" {
 		return env == "kind" || env == "ocp" || env == "k8s"
 	}
-	return exec.Command("kubectl", "config", "current-context").Run() == nil
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return exec.CommandContext(ctx, "kubectl", "config", "current-context").Run() == nil
+}
+
+// isQuadletEnvironment returns true if running in a quadlet (systemd + Podman) environment.
+func isQuadletEnvironment() bool {
+	if env := os.Getenv("E2E_ENVIRONMENT"); env != "" {
+		isQuadlet := env == "quadlet"
+		logrus.Infof("E2E_ENVIRONMENT is set to %q, isQuadlet=%v", env, isQuadlet)
+		return isQuadlet
+	}
+	isActive := exec.Command("sudo", "systemctl", "is-active", ServiceAPI+".service").Run() == nil
+	logrus.Infof("E2E_ENVIRONMENT not set, detecting quadlet via systemctl: isActive=%v", isActive)
+	return isActive
 }
 
 // GetServiceLogs returns the logs from the specified service using journalctl.
@@ -407,10 +473,147 @@ func (h *Harness) GetServiceLogs(serviceName string) (string, error) {
 	return h.VM.GetServiceLogs(serviceName)
 }
 
-// GetServiceLogs returns the logs from the specified service using journalctl.
-// This is useful for debugging service output and capturing logs from the latest service invocation.
+// GetFlightctlAgentLogs returns the logs from the flightctl-agent service using journalctl.
 func (h *Harness) GetFlightctlAgentLogs() (string, error) {
 	return h.VM.GetServiceLogs("flightctl-agent")
+}
+
+// CaptureDeploymentLogs fetches logs from the flightctl deployment services
+// and stores each as an artifact file in the given directory.
+// In Kubernetes environments, services are discovered dynamically via the
+func (h *Harness) CaptureDeploymentLogs(artifactDir string) error {
+	if isK8sEnvironment() {
+		services, err := discoverK8sFlightctlServices()
+		if err != nil {
+			return fmt.Errorf("CaptureDeploymentLogs: service discovery failed: %w", err)
+		}
+		if len(services) == 0 {
+			GinkgoWriter.Println("CaptureDeploymentLogs: no flightctl services discovered in cluster, skipping")
+			return nil
+		}
+		return h.captureK8sServiceLogs(artifactDir, services)
+	}
+	if isQuadletEnvironment() {
+		services := []string{
+			ServiceAPI,
+			ServiceWorker,
+			ServicePeriodic,
+			ServiceUI,
+			ServiceDB,
+		}
+		return h.captureQuadletServiceLogs(artifactDir, services)
+	}
+
+	GinkgoWriter.Println("CaptureDeploymentLogs: unknown environment, skipping")
+	return nil
+}
+
+// discoverK8sFlightctlServices returns the unique set of flightctl.service
+// label values from pods across all namespaces. This avoids hardcoding the
+// list of deployed services.
+func discoverK8sFlightctlServices() ([]string, error) {
+	out, err := exec.Command("kubectl", "get", "pods", "--all-namespaces",
+		"-l", "flightctl.service",
+		"-o", "jsonpath={.items[*].metadata.labels.flightctl\\.service}").Output()
+	if err != nil {
+		return nil, fmt.Errorf("kubectl get pods failed: %w", err)
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	seen := map[string]struct{}{}
+	var services []string
+	for _, s := range strings.Fields(string(out)) {
+		if _, ok := seen[s]; !ok {
+			seen[s] = struct{}{}
+			services = append(services, s)
+		}
+	}
+	return services, nil
+}
+
+// getK8sServicePodLogs fetches logs from pods matching flightctl.service=<svc>.
+// Extra kubectl-logs arguments (e.g. --since-time, --tail) can be passed via extraArgs.
+func getK8sServicePodLogs(svc string, extraArgs ...string) ([]byte, error) {
+	nsOut, err := exec.Command("kubectl", "get", "pods", "--all-namespaces", //nolint:gosec
+		"-l", "flightctl.service="+svc, "-o", "jsonpath={.items[0].metadata.namespace}").Output()
+	if err != nil || len(nsOut) == 0 {
+		return nil, fmt.Errorf("no pods found for %s", svc)
+	}
+
+	args := []string{"logs", "-n", string(nsOut), "-l", "flightctl.service=" + svc}
+	args = append(args, extraArgs...)
+	return exec.Command("kubectl", args...).Output() //nolint:gosec
+}
+
+func (h *Harness) captureK8sServiceLogs(artifactDir string, services []string) error {
+	var errs []error
+	for _, svc := range services {
+		out, err := getK8sServicePodLogs(svc, "--tail=-1")
+		if err != nil {
+			GinkgoWriter.Printf("CaptureDeploymentLogs: %s: %v, skipping\n", svc, err)
+			errs = append(errs, fmt.Errorf("%s: %w", svc, err))
+			continue
+		}
+
+		filename := fmt.Sprintf("deployment_%s_logs.txt", svc)
+		if writeErr := os.WriteFile(filepath.Join(artifactDir, filename), out, 0o600); writeErr != nil {
+			errs = append(errs, fmt.Errorf("writing %s: %w", filename, writeErr))
+			continue
+		}
+		GinkgoWriter.Printf("CaptureDeploymentLogs: wrote %s\n", filepath.Join(artifactDir, filename))
+	}
+	return errors.Join(errs...)
+}
+
+func (h *Harness) captureQuadletServiceLogs(artifactDir string, services []string) error {
+	host := os.Getenv("QUADLET_HOST")
+	sshUser := os.Getenv("E2E_SSH_USER")
+	sshKeyPath := os.Getenv("E2E_SSH_KEY_PATH")
+	sshPassword := os.Getenv("E2E_SSH_PASSWORD")
+	remote := sshUser != "" && host != "" && host != "localhost" && host != "127.0.0.1"
+
+	var errs []error
+	for _, svc := range services {
+		unit := svc + ".service"
+
+		var cmd *exec.Cmd
+		if remote {
+			sshArgs := []string{"-o", "StrictHostKeyChecking=no"}
+			usePassword := sshKeyPath == "" && sshPassword != ""
+			if sshKeyPath != "" {
+				sshArgs = append(sshArgs, "-o", "BatchMode=yes", "-i", sshKeyPath)
+			} else if !usePassword {
+				sshArgs = append(sshArgs, "-o", "BatchMode=yes")
+			}
+			sshArgs = append(sshArgs, fmt.Sprintf("%s@%s", sshUser, host))
+			sshArgs = append(sshArgs, fmt.Sprintf("sudo journalctl -u %s --no-pager", unit))
+
+			if usePassword {
+				cmd = exec.Command("sshpass", append([]string{"-e", "ssh"}, sshArgs...)...) //nolint:gosec
+				cmd.Env = append(os.Environ(), "SSHPASS="+sshPassword)
+			} else {
+				cmd = exec.Command("ssh", sshArgs...) //nolint:gosec
+			}
+		} else {
+			cmd = exec.Command("sudo", "journalctl", "-u", unit, "--no-pager") //nolint:gosec
+		}
+
+		out, err := cmd.Output()
+		if err != nil {
+			GinkgoWriter.Printf("CaptureDeploymentLogs: failed to get logs for %s: %v\n", unit, err)
+			errs = append(errs, fmt.Errorf("%s: %w", svc, err))
+			continue
+		}
+
+		filename := fmt.Sprintf("deployment_%s_logs.txt", svc)
+		if writeErr := os.WriteFile(filepath.Join(artifactDir, filename), out, 0o600); writeErr != nil {
+			errs = append(errs, fmt.Errorf("writing %s: %w", filename, writeErr))
+			continue
+		}
+		GinkgoWriter.Printf("CaptureDeploymentLogs: wrote %s\n", filepath.Join(artifactDir, filename))
+	}
+	return errors.Join(errs...)
 }
 
 // GetEnrollmentIDFromServiceLogs returns the enrollment ID from the service logs using journalctl.
@@ -421,7 +624,6 @@ func (h *Harness) GetEnrollmentIDFromServiceLogs(serviceName string) string {
 	Eventually(func() string {
 		// Get logs from the latest service invocation using systemd invocation ID
 		output, err := h.GetServiceLogs(serviceName)
-
 		if err != nil {
 			logrus.Debugf("Failed to get service logs: %v", err)
 			return ""
@@ -523,15 +725,23 @@ func (h *Harness) RunInteractiveCLI(args ...string) (io.WriteCloser, io.ReadClos
 	cmd := exec.Command(flightctlPath()) //nolint:gosec // flightctlPath constructs path from project directory structure for test purposes
 	h.setArgsInCmd(cmd, args...)
 
-	// create a pty/tty pair
-	ptmx, tty, err := pty.Open()
-	if err != nil {
-		return nil, nil, err
-	}
+	// create a pty/tty pair (requires /dev/ptmx + devpts so slaves exist under /dev/pts/)
 
+	var ptmx, tty *os.File
+	var err error
+
+	Eventually(func() error {
+		ptmx, tty, err = pty.Open()
+		if err != nil {
+			return err
+		}
+		return nil
+	}, TIMEOUT, POLLING).Should(Succeed(), "failed to open pty/tty pair")
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = tty, tty, tty
 
 	if err := cmd.Start(); err != nil {
+		_ = ptmx.Close()
+		_ = tty.Close()
 		return nil, nil, fmt.Errorf("error starting interactive process: %w", err)
 	}
 	go func() {
@@ -561,7 +771,6 @@ func (h *Harness) SHWithStdin(stdin, command string, args ...string) (string, er
 
 	logrus.Infof("running: %s with stdin: %s", strings.Join(cmd.Args, " "), stdin)
 	output, err := cmd.CombinedOutput()
-
 	if err != nil {
 		logrus.Errorf("executing cli: %s", err)
 		// keeping standard error output for debugging, otherwise log output
@@ -586,6 +795,11 @@ func (h *Harness) GetFlightctlRestorePath() string {
 	return filepath.Join(util.GetTopLevelDir(), "bin", "flightctl-restore")
 }
 
+// GetFlightctlBackupPath returns the path to the flightctl-backup binary (same directory as the CLI).
+func (h *Harness) GetFlightctlBackupPath() string {
+	return filepath.Join(util.GetTopLevelDir(), "bin", "flightctl-backup")
+}
+
 func (h *Harness) CLI(args ...string) (string, error) {
 	return h.CLIWithStdin("", args...)
 }
@@ -604,7 +818,6 @@ func (h *Harness) CLIWithEnvAndShell(env map[string]string, shellCommand string)
 
 	logrus.Infof("running shell command with env: %v", env)
 	output, err := cmd.CombinedOutput()
-
 	if err != nil {
 		logrus.Errorf("executing shell command: %s", err)
 		// keeping standard error output for debugging, otherwise log output
@@ -712,6 +925,7 @@ func (h *Harness) EnrollAndWaitForOnlineStatus(labels ...map[string]string) (str
 	Expect(*device.Status.Summary.Info).To(Equal(service.DeviceStatusInfoHealthy))
 	return deviceId, device
 }
+
 func (h *Harness) TestEnrollmentApproval(labels ...map[string]string) *v1beta1.EnrollmentRequestApproval {
 	mergedLabels := map[string]string{"test-id": h.GetTestIDFromContext()}
 	for _, label := range labels {
@@ -723,6 +937,21 @@ func (h *Harness) TestEnrollmentApproval(labels ...map[string]string) *v1beta1.E
 		Approved: true,
 		Labels:   &mergedLabels,
 	}
+}
+
+// TestResourceLabels returns the test-id label used by e2e cleanup.
+func (h *Harness) TestResourceLabels() (map[string]string, error) {
+	if h == nil {
+		return nil, fmt.Errorf("harness is nil")
+	}
+	if h.Context == nil {
+		return nil, fmt.Errorf("test ID not found in harness context")
+	}
+	testID, ok := h.Context.Value(util.TestIDKey).(string)
+	if !ok || testID == "" {
+		return nil, fmt.Errorf("test ID not found in harness context")
+	}
+	return map[string]string{"test-id": testID}, nil
 }
 
 func (h *Harness) CleanUpAllTestResources() error {
@@ -925,7 +1154,7 @@ func (h *Harness) CreateRepository(repositorySpec v1beta1.RepositorySpec, metada
 	// Add test label to metadata
 	h.addTestLabelToResource(&metadata)
 
-	var repository = v1beta1.Repository{
+	repository := v1beta1.Repository{
 		ApiVersion: v1beta1.RepositoryAPIVersion,
 		Kind:       v1beta1.RepositoryKind,
 
@@ -938,7 +1167,7 @@ func (h *Harness) CreateRepository(repositorySpec v1beta1.RepositorySpec, metada
 
 // ReplaceRepository ensures the specified repository exists and is updated to the appropriate values
 func (h *Harness) ReplaceRepository(repositorySpec v1beta1.RepositorySpec, metadata v1beta1.ObjectMeta) error {
-	var repository = v1beta1.Repository{
+	repository := v1beta1.Repository{
 		ApiVersion: v1beta1.RepositoryAPIVersion,
 		Kind:       v1beta1.RepositoryKind,
 
@@ -955,13 +1184,30 @@ func (h *Harness) DeleteRepository(name string) error {
 	return err
 }
 
+// getIPTablesCommand returns the appropriate iptables command (iptables or ip6tables)
+// based on the IP version. Resolves hostnames and respects IPV6_ONLY environment variable.
+func getIPTablesCommand(host string) string {
+	ip := net.ParseIP(host)
+	if ip == nil {
+		if ips, err := net.LookupIP(host); err == nil && len(ips) > 0 {
+			ip = ips[0]
+		}
+	}
+	if ip != nil && ip.To4() == nil {
+		return "ip6tables"
+	}
+	return "iptables"
+}
+
 func tcpNetworkTableRule(ip, port string, remove bool) []string {
 	flag := "-A" // Add rule
 	if remove {
 		flag = "-D" // Delete rule
 	}
 
-	rule := []string{"iptables", flag, "OUTPUT"}
+	iptablesCmd := getIPTablesCommand(ip)
+
+	rule := []string{iptablesCmd, flag, "OUTPUT"}
 
 	if ip != "" {
 		rule = append(rule, "-d", ip)
@@ -977,7 +1223,8 @@ func tcpNetworkTableRule(ip, port string, remove bool) []string {
 }
 
 func buildIPTablesCmd(ip, port string, remove bool) []string {
-	return append([]string{"sudo"}, tcpNetworkTableRule(ip, port, remove)...)
+	rule := tcpNetworkTableRule(ip, port, remove)
+	return append([]string{"sudo"}, rule...)
 }
 
 // SimulateNetworkFailure blocks VM traffic to the given registry host:port via iptables.
@@ -986,7 +1233,9 @@ func (h *Harness) SimulateNetworkFailure(registryHost, registryPort string) erro
 	if registryHost == "" || registryPort == "" {
 		return fmt.Errorf("registry host and port are required for network failure simulation")
 	}
-	blockCommands := [][]string{buildIPTablesCmd(registryHost, registryPort, false)}
+
+	blockCmd := buildIPTablesCmd(registryHost, registryPort, false)
+	blockCommands := [][]string{blockCmd}
 
 	for _, cmd := range blockCommands {
 		stdout, err := h.VM.RunSSH(cmd, nil)
@@ -995,11 +1244,13 @@ func (h *Harness) SimulateNetworkFailure(registryHost, registryPort string) erro
 		}
 	}
 
-	stdout, err := h.VM.RunSSH([]string{"sudo", "iptables", "-L", "OUTPUT"}, nil)
+	// List iptables rules for debugging (use appropriate command based on IP version)
+	iptablesListCmd := getIPTablesCommand(registryHost)
+	stdout, err := h.VM.RunSSH([]string{"sudo", iptablesListCmd, "-L", "OUTPUT"}, nil)
 	if err != nil {
-		logrus.Warnf("Failed to list iptables rules: %v", err)
+		logrus.Warnf("Failed to list %s rules: %v", iptablesListCmd, err)
 	} else {
-		logrus.Debugf("Current iptables rules:\n%s", stdout.String())
+		logrus.Debugf("Current %s rules:\n%s", iptablesListCmd, stdout.String())
 	}
 
 	return nil
@@ -1009,6 +1260,7 @@ func (h *Harness) SimulateNetworkFailure(registryHost, registryPort string) erro
 // It returns a function that will only execute once to undo the iptables modification
 func (h *Harness) SimulateNetworkFailureForCLI(ip, port string) (func() error, error) {
 	args := tcpNetworkTableRule(ip, port, false)
+
 	_, err := h.SH("sudo", args...)
 	noop := func() error { return nil }
 	if err != nil {
@@ -1029,7 +1281,9 @@ func (h *Harness) FixNetworkFailure(registryHost, registryPort string) error {
 	if registryHost == "" || registryPort == "" {
 		return fmt.Errorf("registry host and port are required for network failure fix")
 	}
-	unblockCommands := [][]string{buildIPTablesCmd(registryHost, registryPort, true)}
+
+	unblockCmd := buildIPTablesCmd(registryHost, registryPort, true)
+	unblockCommands := [][]string{unblockCmd}
 
 	for _, cmd := range unblockCommands {
 		stdout, err := h.VM.RunSSH(cmd, nil)
@@ -1041,11 +1295,13 @@ func (h *Harness) FixNetworkFailure(registryHost, registryPort string) error {
 	// Clear any remaining DNS cache
 	_, _ = h.VM.RunSSH([]string{"sudo", "systemd-resolve", "--flush-caches"}, nil)
 
-	stdout, err := h.VM.RunSSH([]string{"sudo", "iptables", "-L", "OUTPUT"}, nil)
+	// List iptables rules for debugging (use appropriate command based on IP version)
+	iptablesListCmd := getIPTablesCommand(registryHost)
+	stdout, err := h.VM.RunSSH([]string{"sudo", iptablesListCmd, "-L", "OUTPUT"}, nil)
 	if err != nil {
-		logrus.Warnf("Failed to list iptables rules: %v", err)
+		logrus.Warnf("Failed to list %s rules: %v", iptablesListCmd, err)
 	} else {
-		logrus.Debugf("Current iptables rules after recovery:\n%s", stdout.String())
+		logrus.Debugf("Current %s rules after recovery:\n%s", iptablesListCmd, stdout.String())
 	}
 
 	return nil
@@ -1055,9 +1311,10 @@ func (h *Harness) FixNetworkFailure(registryHost, registryPort string) error {
 // if no entry for the ip:port combo exists
 func (h *Harness) FixNetworkFailureForCLI(ip, port string) error {
 	args := tcpNetworkTableRule(ip, port, true)
+
 	_, err := h.SH("sudo", args...)
 	if err != nil {
-		return fmt.Errorf("failed to add iptables rule %v: %w", args, err)
+		return fmt.Errorf("failed to remove iptables rule %v: %w", args, err)
 	}
 	_, _ = h.SH("sudo", "systemd-resolve", "--flush-caches")
 
@@ -1091,7 +1348,13 @@ func (h *Harness) GetOrganizationID() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if resp.JSON200 == nil || len(resp.JSON200.Items) == 0 {
+	if resp.JSON200 == nil {
+		if resp.StatusCode() != 200 {
+			return "", fmt.Errorf("ListOrganizationsWithResponse: HTTP %d: %s", resp.StatusCode(), string(resp.Body))
+		}
+		return "", fmt.Errorf("no organizations response")
+	}
+	if len(resp.JSON200.Items) == 0 {
 		return "", fmt.Errorf("no organizations returned")
 	}
 	name := resp.JSON200.Items[0].Metadata.Name
@@ -1099,6 +1362,31 @@ func (h *Harness) GetOrganizationID() (string, error) {
 		return "", fmt.Errorf("organization name is empty")
 	}
 	return *name, nil
+}
+
+// GetOrganizationIDByDisplayName returns the organization ID (UUID) whose Spec.DisplayName matches the given display name.
+func (h *Harness) GetOrganizationIDByDisplayName(displayName string) (string, error) {
+	if displayName == "" {
+		return "", fmt.Errorf("display name is empty")
+	}
+	resp, err := h.Client.ListOrganizationsWithResponse(h.Context, nil)
+	if err != nil {
+		return "", err
+	}
+	if resp.JSON200 == nil {
+		if resp.StatusCode() != 200 {
+			return "", fmt.Errorf("ListOrganizationsWithResponse: HTTP %d: %s", resp.StatusCode(), string(resp.Body))
+		}
+		return "", fmt.Errorf("no organizations response")
+	}
+	for _, org := range resp.JSON200.Items {
+		if org.Spec != nil && org.Spec.DisplayName != nil && *org.Spec.DisplayName == displayName {
+			if org.Metadata.Name != nil && *org.Metadata.Name != "" {
+				return *org.Metadata.Name, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("no organization found with displayName %q", displayName)
 }
 
 func (h *Harness) CheckApplicationDirectoryExist(applicationName string) error {
@@ -1156,13 +1444,6 @@ func (h *Harness) CheckEnvInjectedToApplication(envVarName string, image string)
 // RunGetDevices executes "get devices" CLI command with optional arguments.
 func (h *Harness) RunGetDevices(args ...string) (string, error) {
 	allArgs := append([]string{"get", "devices"}, args...)
-	return h.CLI(allArgs...)
-}
-
-// RunGetEvents executes "get events" CLI command with optional arguments.
-func (h *Harness) RunGetEvents(args ...string) (string, error) {
-	// Starting with the base command to get events
-	allArgs := append([]string{"get", "events"}, args...)
 	return h.CLI(allArgs...)
 }
 
@@ -1378,22 +1659,22 @@ func newTestHarnessBase(ctx context.Context) (*Harness, error) {
 	if imageBuilderServer == "" {
 		return nil, fmt.Errorf("imagebuilder server URL not configured in client config")
 	}
-	ibClientWrapper, err := client.NewImageBuilderClientFromConfig(config, baseDir, imageBuilderServer, config.Organization)
+	ibClient, err := client.NewImageBuilderClientFromConfig(config, baseDir, imageBuilderServer, config.Organization)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create imagebuilder client: %w", err)
 	}
-	ibClient := ibClientWrapper.ClientWithResponses
 	ctx, cancel := context.WithCancel(ctx)
 
 	// Initialize git repository management
 	gitWorkDir := filepath.Join(GinkgoT().TempDir(), "git-repos")
-	err = os.MkdirAll(gitWorkDir, 0755)
+	err = os.MkdirAll(gitWorkDir, 0o755)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("failed to create git work directory: %w", err)
 	}
 
 	c.Start(ctx)
+	ibClient.Start(ctx)
 
 	h := &Harness{
 		Client:             c.ClientWithResponses,
@@ -1501,6 +1782,13 @@ func (h *Harness) setupVMFromPoolNoTimeout(workerID int) error {
 	// Wait for SSH to be ready
 	if err := testVM.WaitForSSHToBeReady(); err != nil {
 		return fmt.Errorf("failed to wait for SSH: %w", err)
+	}
+
+	// Sync the VM clock with the host after snapshot revert. The snapshot
+	// preserves the clock state from creation time, so a stale clock causes
+	// TLS certificate validation failures (e.g. registry certs appear "not yet valid").
+	if err := h.SyncVMClock(); err != nil {
+		logrus.Warnf("Failed to sync VM clock after snapshot revert: %v", err)
 	}
 
 	// Reseed the VM's entropy pool with host-generated random bytes.
@@ -2020,7 +2308,6 @@ func ExecuteReadOnlyResourceOperations(harness *Harness, resourceTypes []string,
 			if err == nil {
 				return fmt.Errorf("listing %s should fail but succeeded", resourceType)
 			}
-
 		}
 	}
 	return nil
@@ -2028,7 +2315,6 @@ func ExecuteReadOnlyResourceOperations(harness *Harness, resourceTypes []string,
 
 // GetVersionsFromCLI returns client, server, and agent versions from the flightctl CLI version command
 func (h *Harness) GetVersionsFromCLI() (clientVersion, serverVersion, agentVersion string, err error) {
-
 	versionOutput, err := h.CLI("version")
 	if err != nil {
 		return "", "", "", fmt.Errorf("failed to get version from CLI: %w", err)
@@ -2284,7 +2570,7 @@ func main() {
 			return
 		}
 		srcPath := filepath.Join(td, "main.go")
-		if err := os.WriteFile(srcPath, []byte(src), 0600); err != nil {
+		if err := os.WriteFile(srcPath, []byte(src), 0o600); err != nil {
 			editorBuildErr = fmt.Errorf("write src: %w", err)
 			return
 		}
@@ -2379,7 +2665,12 @@ func printAgentFilesForVM(vm vm.TestVMInterface, context string) {
 		// Regular file handling
 		stdout, err := vm.RunSSH([]string{"sudo", "cat", filePath}, nil)
 		if err != nil {
-			fmt.Printf("❌ [%s] Failed to read %s: %v\n", context, fileType, err)
+			// Missing agent state files are expected before the agent is started.
+			if strings.Contains(err.Error(), "No such file or directory") {
+				fmt.Printf("✅ [%s] %s is absent (expected before agent start)\n", context, fileType)
+			} else {
+				fmt.Printf("❌ [%s] Failed to read %s: %v\n", context, fileType, err)
+			}
 		} else {
 			content := stdout.String()
 			if content == "" {

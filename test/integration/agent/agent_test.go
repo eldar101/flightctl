@@ -20,13 +20,17 @@ import (
 	"github.com/flightctl/flightctl/api/core/v1beta1"
 	"github.com/flightctl/flightctl/internal/agent/device/certmanager/provider"
 	"github.com/flightctl/flightctl/internal/crypto/signer"
+	"github.com/flightctl/flightctl/internal/domain"
 	"github.com/flightctl/flightctl/internal/kvstore"
 	"github.com/flightctl/flightctl/internal/org"
 	"github.com/flightctl/flightctl/pkg/certmanager"
 	fccrypto "github.com/flightctl/flightctl/pkg/crypto"
 	"github.com/flightctl/flightctl/pkg/k8sclient"
+	flightlog "github.com/flightctl/flightctl/pkg/log"
 	"github.com/flightctl/flightctl/test/harness"
+	"github.com/flightctl/flightctl/test/integration/integrationstack"
 	testutil "github.com/flightctl/flightctl/test/util"
+	"github.com/flightctl/flightctl/test/util/testdb"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/samber/lo"
@@ -48,7 +52,11 @@ const (
 )
 
 var (
-	suiteCtx context.Context
+	suiteCtx      context.Context
+	redisHost     string
+	redisPort     uint
+	redisPassword domain.SecureString
+	redisCleanup  func()
 )
 
 func TestAgent(t *testing.T) {
@@ -58,6 +66,18 @@ func TestAgent(t *testing.T) {
 
 var _ = BeforeSuite(func() {
 	suiteCtx = testutil.InitSuiteTracerForGinkgo("Agent Suite")
+	Expect(integrationstack.EnsureRunning(suiteCtx)).To(Succeed())
+
+	var err error
+	redisHost, redisPort, redisPassword, redisCleanup, err = testdb.CreateTestRedis(
+		suiteCtx, flightlog.InitLogs())
+	Expect(err).NotTo(HaveOccurred())
+})
+
+var _ = AfterSuite(func() {
+	if redisCleanup != nil {
+		redisCleanup()
+	}
 })
 
 var _ = Describe("Device Agent behavior", func() {
@@ -75,7 +95,7 @@ var _ = Describe("Device Agent behavior", func() {
 			fmt.Fprintf(os.Stderr, "Error in test harness go routine: %v\n", err)
 			GinkgoWriter.Printf("Error in go routine: %v\n", err)
 			GinkgoRecover()
-		})
+		}, harness.WithRedis(redisHost, redisPort, redisPassword))
 		// check for test harness creation errors
 		Expect(err).ToNot(HaveOccurred())
 	})
@@ -241,7 +261,7 @@ var _ = Describe("Device Agent behavior", func() {
 				// Update rendered once via the service so the rendered bus is notified (agent will see new version).
 				cfg, err := createMinimalRenderedConfig("config-v1")
 				Expect(err).ToNot(HaveOccurred())
-				st := h.ServiceHandler.UpdateRenderedDevice(h.Context, orgID, deviceName, cfg, "", "hash1")
+				st := h.ServiceHandler.UpdateRenderedDevice(h.Context, orgID, deviceName, cfg, "", "hash1", nil)
 				Expect(st.Code).To(BeEquivalentTo(200))
 				renderedDev, getErr := (*h.Store).Device().GetRendered(h.Context, orgID, deviceName, nil, "")
 				Expect(getErr).ToNot(HaveOccurred())
@@ -499,6 +519,89 @@ var _ = Describe("Device Agent behavior", func() {
 			})
 		})
 
+	})
+
+	Context("decommissioning", func() {
+		It("should delete all files in data directory during decommissioning", func() {
+			// Enroll the device first
+			dev := enrollAndWaitForDevice(h, testutil.TestEnrollmentApproval())
+			deviceName := lo.FromPtr(dev.Metadata.Name)
+
+			// Create test files in the data directory to verify they get deleted
+			dataDir := filepath.Join(h.TestDirPath, "var", "lib", "flightctl")
+			testFiles := []string{
+				filepath.Join(dataDir, "test-file-1.txt"),
+				filepath.Join(dataDir, "subdir", "test-file-2.txt"),
+				filepath.Join(dataDir, "another-dir", "nested", "test-file-3.txt"),
+			}
+
+			for _, testFile := range testFiles {
+				Expect(os.MkdirAll(filepath.Dir(testFile), 0o755)).To(Succeed())
+				Expect(os.WriteFile(testFile, []byte("test content"), 0o600)).To(Succeed())
+				GinkgoWriter.Printf("Created test file: %s\n", testFile)
+			}
+
+			// Verify files exist before decommissioning
+			for _, testFile := range testFiles {
+				_, err := os.Stat(testFile)
+				Expect(err).ToNot(HaveOccurred(), "Test file should exist before decommissioning")
+			}
+
+			// Ensure device is not already decommissioning (race condition in CI)
+			Eventually(func() bool {
+				currentDev, status := h.ServiceHandler.GetDevice(h.AuthenticatedContext(h.Context), org.DefaultID, deviceName)
+				// Fail fast on server errors (404, 500, etc) instead of retrying and masking them
+				Expect(status.Code).To(Equal(int32(200)), "GetDevice should return 200 OK")
+				return currentDev.Spec == nil || currentDev.Spec.Decommissioning == nil
+			}, TIMEOUT, POLLING).Should(BeTrue(), "Device should not already be in decommissioning state")
+
+			// Trigger decommissioning with Unenroll target
+			GinkgoWriter.Printf("Triggering decommissioning for device: %s\n", deviceName)
+			decommissionRequest := v1beta1.DeviceDecommission{
+				Target: v1beta1.DeviceDecommissionTargetTypeUnenroll,
+			}
+			_, status := h.ServiceHandler.DecommissionDevice(h.AuthenticatedContext(h.Context), org.DefaultID, deviceName, decommissionRequest)
+			if status.Code != http.StatusOK {
+				GinkgoWriter.Printf("DecommissionDevice failed with status %d: %v\n", status.Code, status)
+			}
+			Expect(status.Code).To(BeEquivalentTo(http.StatusOK), "DecommissionDevice should return 200 OK")
+
+			// Wait for decommissioning to complete - check that files are deleted
+			Eventually(func() bool {
+				// Check if any of the test files still exist
+				for _, testFile := range testFiles {
+					_, err := os.Stat(testFile)
+					if err == nil {
+						// File still exists
+						GinkgoWriter.Printf("File still exists: %s\n", testFile)
+						return false
+					}
+					if !os.IsNotExist(err) {
+						// Some other error occurred (not "file doesn't exist")
+						GinkgoWriter.Printf("Error checking file %s: %v\n", testFile, err)
+						return false
+					}
+					// File doesn't exist - this is what we want
+				}
+				GinkgoWriter.Println("All test files have been deleted")
+				return true
+			}, TIMEOUT, POLLING).Should(BeTrue(), "All files in data directory should be deleted during decommissioning")
+
+			// Verify the data directory itself still exists but is empty (or only contains subdirs that are empty)
+			entries, err := os.ReadDir(dataDir)
+			Expect(err).ToNot(HaveOccurred(), "Data directory must exist after decommissioning")
+
+			// Directory should be empty or only contain empty subdirectories
+			for _, entry := range entries {
+				if entry.IsDir() {
+					subEntries, subErr := os.ReadDir(filepath.Join(dataDir, entry.Name()))
+					Expect(subErr).ToNot(HaveOccurred())
+					Expect(subEntries).To(BeEmpty(), "Subdirectory should be empty after decommissioning")
+				} else {
+					Fail(fmt.Sprintf("Found unexpected file after decommissioning: %s", entry.Name()))
+				}
+			}
+		})
 	})
 })
 
