@@ -23,6 +23,7 @@ import (
 	quadletinfra "github.com/flightctl/flightctl/test/e2e/infra/quadlet"
 	"github.com/flightctl/flightctl/test/e2e/infra/setup"
 	"github.com/flightctl/flightctl/test/harness/e2e"
+	"github.com/flightctl/flightctl/test/login"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/sirupsen/logrus"
@@ -39,6 +40,9 @@ const (
 	keycloakOAuth2ClientID       = "flightctl-oauth2-client"
 	defaultOrganizationName      = "default"
 	defaultAdminRole             = "flightctl-admin"
+	staticOIDCProviderName       = "oidc"
+	openshiftProviderName        = "openshift"
+	aapProviderName              = "aap"
 	openshiftDefaultUsername     = "kubeadmin"
 	pamDefaultUsername           = "admin"
 	pamDefaultPassword           = "flightctl-e2e"
@@ -340,10 +344,11 @@ func openshiftBrowserScenario() browserLoginScenario {
 	}
 
 	return browserLoginScenario{
-		name:       "openshift",
-		providerUI: "openshift",
-		username:   username,
-		password:   password,
+		name:         openshiftProviderName,
+		providerName: openshiftProviderName,
+		providerUI:   openshiftProviderName,
+		username:     username,
+		password:     password,
 	}
 }
 
@@ -363,20 +368,22 @@ func pamBrowserScenario() browserLoginScenario {
 	}
 
 	return browserLoginScenario{
-		name:       "pam",
-		providerUI: "pam",
-		username:   username,
-		password:   password,
+		name:         "pam",
+		providerName: staticOIDCProviderName,
+		providerUI:   "pam",
+		username:     username,
+		password:     password,
 	}
 }
 
 // aapBrowserScenario returns the browser-login inputs for the AAP provider flow.
 func aapBrowserScenario() browserLoginScenario {
 	return browserLoginScenario{
-		name:       "aap",
-		providerUI: "aap",
-		username:   strings.TrimSpace(os.Getenv("AAP_USERNAME")),
-		password:   strings.TrimSpace(os.Getenv("AAP_PASSWORD")),
+		name:         aapProviderName,
+		providerName: aapProviderName,
+		providerUI:   aapProviderName,
+		username:     strings.TrimSpace(os.Getenv("AAP_USERNAME")),
+		password:     strings.TrimSpace(os.Getenv("AAP_PASSWORD")),
 	}
 }
 
@@ -657,6 +664,9 @@ func providerShownInLogin(harness *e2e.Harness, apiEndpoint, providerName string
 
 // writeAndApplyAuthProviderManifest writes a provider manifest to disk and applies it through the harness.
 func writeAndApplyAuthProviderManifest(harness *e2e.Harness, providerPath, providerYAML string) (string, error) {
+	if harness == nil {
+		return "", fmt.Errorf("worker harness is required")
+	}
 	if strings.TrimSpace(providerPath) == "" {
 		return "", fmt.Errorf("provider manifest path is required")
 	}
@@ -666,8 +676,8 @@ func writeAndApplyAuthProviderManifest(harness *e2e.Harness, providerPath, provi
 	if err := os.WriteFile(providerPath, []byte(providerYAML), 0600); err != nil {
 		return "", fmt.Errorf("write authprovider manifest %q: %w", providerPath, err)
 	}
-	if harness == nil {
-		return "", fmt.Errorf("worker harness is required")
+	if err := restoreAdminLoginForResourceManagement(harness); err != nil {
+		return "", err
 	}
 	return harness.ApplyResource(providerPath)
 }
@@ -680,7 +690,20 @@ func deleteAuthProviderByName(harness *e2e.Harness, providerName string) (string
 	if strings.TrimSpace(providerName) == "" {
 		return "", fmt.Errorf("provider name is required")
 	}
+	if err := restoreAdminLoginForResourceManagement(harness); err != nil {
+		return "", err
+	}
 	return harness.ManageResource("delete", "authprovider", providerName)
+}
+
+func restoreAdminLoginForResourceManagement(harness *e2e.Harness) error {
+	if harness == nil {
+		return fmt.Errorf("worker harness is required")
+	}
+	if _, err := login.LoginToAPIWithToken(harness); err != nil {
+		return fmt.Errorf("restore admin login for authprovider resource management: %w", err)
+	}
+	return nil
 }
 
 // runLoginWithCypressHarness runs the suite-local Cypress harness for browser-based provider login.
@@ -719,6 +742,9 @@ func runLoginWithCypressHarness(ctx context.Context, harness *e2e.Harness, apiEn
 		logrus.Infof("[authprovider] cypress login output:\n%s", string(out))
 	}
 	if err != nil {
+		if len(out) > 0 {
+			return fmt.Errorf("run cypress login helper %q for %s: %w\n%s", scriptPath, scenario.name, err, string(out))
+		}
 		return fmt.Errorf("run cypress login helper %q for %s: %w", scriptPath, scenario.name, err)
 	}
 	return nil
