@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/flightctl/flightctl/internal/client"
+	"github.com/flightctl/flightctl/test/e2e/infra"
 	"github.com/flightctl/flightctl/test/e2e/infra/auxiliary"
 	"github.com/flightctl/flightctl/test/e2e/infra/setup"
 	"github.com/flightctl/flightctl/test/harness/e2e"
@@ -23,6 +24,7 @@ import (
 const (
 	keycloakAuthProviderName = "keycloak-e2e"
 	authProviderApplyTimeout = 15 * time.Second
+	loginRateLimitExceeded   = "Login rate limit exceeded"
 )
 
 func TestAuthprovider(t *testing.T) {
@@ -32,6 +34,7 @@ func TestAuthprovider(t *testing.T) {
 
 var auxSvcs *auxiliary.Services
 var originalClientConfig *clientConfigSnapshot
+var adminClientConfig *clientConfigSnapshot
 
 var _ = BeforeSuite(func() {
 	Expect(setup.EnsureDefaultProviders(nil)).To(Succeed())
@@ -53,8 +56,10 @@ var _ = BeforeSuite(func() {
 	Expect(err).ToNot(HaveOccurred(), "failed to capture original client config")
 
 	// Bootstrap: login as admin (k8s or PAM) and apply AuthProvider CR
-	_, err = login.LoginToAPIWithToken(harness)
+	err = bootstrapLoginWithAuthRateRetry(harness)
 	Expect(err).ToNot(HaveOccurred(), "bootstrap login failed")
+	adminClientConfig, err = captureClientConfigSnapshot()
+	Expect(err).ToNot(HaveOccurred(), "failed to capture admin client config")
 
 	authProviderYAML := buildOIDCAuthProviderYAML(
 		keycloakAuthProviderName,
@@ -92,7 +97,7 @@ var _ = BeforeEach(func() {
 	ctx := util.StartSpecTracerForGinkgo(suiteCtx)
 	harness.SetTestContext(ctx)
 
-	_, err := login.LoginToAPIWithToken(harness)
+	err := restoreAdminClientConfig(harness)
 	Expect(err).ToNot(HaveOccurred(), "restore admin login before spec")
 })
 
@@ -111,9 +116,8 @@ var _ = AfterSuite(func() {
 	harness := e2e.GetWorkerHarness()
 
 	// Restore admin authentication before cleanup
-	_, err := login.LoginToAPIWithToken(harness)
-	adminLoginRestored := err == nil
-	if !adminLoginRestored {
+	err := restoreAdminClientConfig(harness)
+	if err != nil {
 		logrus.Warnf("Failed to restore admin login: %v", err)
 	} else {
 		// Clean up the Keycloak AuthProvider CR to prevent interfering with subsequent test suites
@@ -135,6 +139,48 @@ var _ = AfterSuite(func() {
 		auxSvcs.Cleanup(ctx)
 	}
 })
+
+// bootstrapLoginWithAuthRateRetry logs in as admin and retries once after resetting the API auth rate limiter.
+func bootstrapLoginWithAuthRateRetry(harness *e2e.Harness) error {
+	_, err := login.LoginToAPIWithToken(harness)
+	if !isLoginRateLimitError(err) {
+		return err
+	}
+	logrus.Infof("[authprovider] bootstrap login hit API auth rate limit; restarting API once before retry")
+	if resetErr := restartAPIForAuthRateLimitReset(); resetErr != nil {
+		return fmt.Errorf("reset auth rate limit after bootstrap login failure: %w; original error: %v", resetErr, err)
+	}
+	_, err = login.LoginToAPIWithToken(harness)
+	return err
+}
+
+// restoreAdminClientConfig restores the suite's saved admin login config and refreshes the harness client.
+func restoreAdminClientConfig(harness *e2e.Harness) error {
+	if adminClientConfig == nil {
+		return fmt.Errorf("admin client config snapshot is nil")
+	}
+	return restoreClientConfigSnapshot(harness, adminClientConfig)
+}
+
+// isLoginRateLimitError reports whether a login flow failed due to the API auth validation limiter.
+func isLoginRateLimitError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), loginRateLimitExceeded)
+}
+
+// restartAPIForAuthRateLimitReset restarts the API service to clear the in-memory auth rate limiter.
+func restartAPIForAuthRateLimitReset() error {
+	providers := setup.GetDefaultProviders()
+	if providers == nil || providers.Lifecycle == nil {
+		return fmt.Errorf("lifecycle provider is required to reset auth rate limit")
+	}
+	if err := providers.Lifecycle.Restart(infra.ServiceAPI); err != nil {
+		return fmt.Errorf("restart API for auth rate limit reset: %w", err)
+	}
+	if err := providers.Lifecycle.WaitForReady(infra.ServiceAPI, loginFlowTimeout); err != nil {
+		return fmt.Errorf("wait for API after auth rate limit reset: %w", err)
+	}
+	return nil
+}
 
 // clientConfigSnapshot stores the original local client config so the suite can restore it after bootstrap login.
 type clientConfigSnapshot struct {
