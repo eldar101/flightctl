@@ -7,8 +7,20 @@ import (
 	"sort"
 	"testing"
 
+	"github.com/flightctl/flightctl/test/scripts/pkg/e2etestutils"
 	"github.com/stretchr/testify/require"
 )
+
+// Convenience aliases so test code stays readable.
+var (
+	medianFloat     = e2etestutils.MedianFloat
+	defaultDuration = e2etestutils.DefaultDuration
+	separateTimings = e2etestutils.SeparateTimings
+	effectiveWeight = e2etestutils.EffectiveWeight
+)
+
+type suiteReport = e2etestutils.SuiteReport
+type specReport = e2etestutils.SpecReport
 
 func TestMedianFloat(t *testing.T) {
 	tests := []struct {
@@ -135,7 +147,7 @@ func TestSeparateTimings(t *testing.T) {
 func specNames(specs []specInfo) []string {
 	names := make([]string, len(specs))
 	for i, s := range specs {
-		names[i] = s.name
+		names[i] = s.Name
 	}
 	return names
 }
@@ -205,9 +217,9 @@ func TestLptAssign(t *testing.T) {
 		{
 			name: "When there is one node it should assign all specs to node 1",
 			specs: []specInfo{
-				{name: "Suite Spec A", suite: "Suite"},
-				{name: "Suite Spec B", suite: "Suite"},
-				{name: "Suite Spec C", suite: "Suite"},
+				{Name: "Suite Spec A", Suite: "Suite"},
+				{Name: "Suite Spec B", Suite: "Suite"},
+				{Name: "Suite Spec C", Suite: "Suite"},
 			},
 			specTimings:  map[string]specTiming{"Suite Spec A": {Avg: 10.0}, "Suite Spec B": {Avg: 20.0}, "Suite Spec C": {Avg: 30.0}},
 			suiteTimings: noSuiteTimings,
@@ -220,9 +232,9 @@ func TestLptAssign(t *testing.T) {
 		{
 			name: "When two nodes and specs can be split evenly it should produce zero spread",
 			specs: []specInfo{
-				{name: "Suite Spec A", suite: "Suite"},
-				{name: "Suite Spec B", suite: "Suite"},
-				{name: "Suite Spec C", suite: "Suite"},
+				{Name: "Suite Spec A", Suite: "Suite"},
+				{Name: "Suite Spec B", Suite: "Suite"},
+				{Name: "Suite Spec C", Suite: "Suite"},
 			},
 			specTimings: map[string]specTiming{
 				"Suite Spec A": {Avg: 90.0}, "Suite Spec B": {Avg: 60.0}, "Suite Spec C": {Avg: 30.0},
@@ -243,8 +255,8 @@ func TestLptAssign(t *testing.T) {
 		{
 			name: "When a spec has no timing entry it should use the default duration",
 			specs: []specInfo{
-				{name: "Suite Known Spec", suite: "Suite"},
-				{name: "Suite Unknown Spec", suite: "Suite"},
+				{Name: "Suite Known Spec", Suite: "Suite"},
+				{Name: "Suite Unknown Spec", Suite: "Suite"},
 			},
 			specTimings:  map[string]specTiming{"Suite Known Spec": {Avg: 100.0}},
 			suiteTimings: noSuiteTimings,
@@ -260,7 +272,7 @@ func TestLptAssign(t *testing.T) {
 		},
 		{
 			name:         "When there is only one spec and many nodes it should assign it to exactly one node",
-			specs:        []specInfo{{name: "Suite Lone Spec", suite: "Suite"}},
+			specs:        []specInfo{{Name: "Suite Lone Spec", Suite: "Suite"}},
 			specTimings:  map[string]specTiming{"Suite Lone Spec": {Avg: 45.0}},
 			suiteTimings: noSuiteTimings,
 			nNodes:       4,
@@ -272,8 +284,8 @@ func TestLptAssign(t *testing.T) {
 		{
 			name: "When there are more nodes than specs some nodes should be empty",
 			specs: []specInfo{
-				{name: "Suite Spec A", suite: "Suite"},
-				{name: "Suite Spec B", suite: "Suite"},
+				{Name: "Suite Spec A", Suite: "Suite"},
+				{Name: "Suite Spec B", Suite: "Suite"},
 			},
 			specTimings:  map[string]specTiming{"Suite Spec A": {Avg: 10.0}, "Suite Spec B": {Avg: 20.0}},
 			suiteTimings: noSuiteTimings,
@@ -287,9 +299,9 @@ func TestLptAssign(t *testing.T) {
 		{
 			name: "When suite BeforeSuite overhead is set it should be added once per suite per node",
 			specs: []specInfo{
-				{name: "Agent Suite spec 1", suite: "Agent Suite"},
-				{name: "Agent Suite spec 2", suite: "Agent Suite"},
-				{name: "CLI Suite spec 1", suite: "CLI Suite"},
+				{Name: "Agent Suite spec 1", Suite: "Agent Suite"},
+				{Name: "Agent Suite spec 2", Suite: "Agent Suite"},
+				{Name: "CLI Suite spec 1", Suite: "CLI Suite"},
 			},
 			specTimings: map[string]specTiming{
 				"Agent Suite spec 1": {Avg: 100.0},
@@ -327,11 +339,47 @@ func TestLptAssign(t *testing.T) {
 				require.Equal(t, 3, specCount(a))
 			},
 		},
+		{
+			name: "When specs belong to an ordered group they should stay on the same node",
+			specs: []specInfo{
+				{Name: "Ordered spec 1", Suite: "Package Mode", OrderedGroup: "Package Mode"},
+				{Name: "Ordered spec 2", Suite: "Package Mode", OrderedGroup: "Package Mode"},
+				{Name: "Fast spec", Suite: "Other Suite"},
+			},
+			specTimings: map[string]specTiming{
+				"Ordered spec 1": {Avg: 120.0},
+				"Ordered spec 2": {Avg: 110.0},
+				"Fast spec":      {Avg: 10.0},
+			},
+			suiteTimings: noSuiteTimings,
+			nNodes:       2,
+			defDuration:  60.0,
+			checkFn: func(t *testing.T, a map[string][]string) {
+				orderedNodeCount := 0
+				for _, specs := range a {
+					hasFirst := false
+					hasSecond := false
+					for _, spec := range specs {
+						if spec == "Ordered spec 1" {
+							hasFirst = true
+						}
+						if spec == "Ordered spec 2" {
+							hasSecond = true
+						}
+					}
+					if hasFirst || hasSecond {
+						orderedNodeCount++
+						require.True(t, hasFirst && hasSecond, "ordered specs must stay together on the same node")
+					}
+				}
+				require.Equal(t, 1, orderedNodeCount, "ordered group should be assigned to exactly one node")
+			},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assignments := lptAssign(tt.specs, tt.specTimings, tt.suiteTimings, tt.nNodes, tt.defDuration, 0)
+			assignments, _ := e2etestutils.LPTAssign(tt.specs, tt.specTimings, tt.suiteTimings, tt.nNodes, tt.defDuration, 0)
 
 			// Common invariants for every case.
 			require.Len(t, assignments, tt.nNodes, "number of nodes in result must equal nNodes")
@@ -359,6 +407,13 @@ func writeDiscoveryJSON(t *testing.T, dir string, suites []suiteReport) string {
 	require.NoError(t, err)
 	path := filepath.Join(dir, "discovery.json")
 	require.NoError(t, os.WriteFile(path, data, 0o644))
+	return path
+}
+
+func writeGoSourceFile(t *testing.T, dir, name, contents string) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	require.NoError(t, os.WriteFile(path, []byte(contents), 0o644))
 	return path
 }
 
@@ -423,6 +478,14 @@ func TestLoadDiscovery(t *testing.T) {
 			expectNames: []string{"Suite Other", "Suite Same Name"},
 		},
 		{
+			name: "When discovery marks specs as ordered it should keep the suite as their ordered group",
+			suites: []suiteReport{{SuiteDescription: "Package Mode", SpecReports: []specReport{
+				{LeafNodeType: "It", LeafNodeText: "first", ContainerHierarchyTexts: []string{"Ordered block"}, IsInOrderedContainer: true},
+				{LeafNodeType: "It", LeafNodeText: "second", ContainerHierarchyTexts: []string{"Ordered block"}, IsInOrderedContainer: true},
+			}}},
+			expectNames: []string{"Ordered block first", "Ordered block second"},
+		},
+		{
 			name:      "When discovery JSON is invalid it should return an error",
 			expectErr: true,
 		},
@@ -469,10 +532,84 @@ func TestLoadDiscovery(t *testing.T) {
 		require.Len(t, specs, 2)
 		byName := map[string]specInfo{}
 		for _, s := range specs {
-			byName[s.name] = s
+			byName[s.Name] = s
 		}
-		require.Equal(t, "Agent Suite", byName["Agent should boot"].suite)
-		require.Equal(t, "CLI Suite", byName["should login"].suite)
+		require.Equal(t, "Agent Suite", byName["Agent should boot"].Suite)
+		require.Equal(t, "CLI Suite", byName["should login"].Suite)
+	})
+
+	t.Run("When a spec is in an ordered container it should carry an ordered group", func(t *testing.T) {
+		suites := []suiteReport{
+			{SuiteDescription: "Package Mode", SpecReports: []specReport{
+				{LeafNodeType: "It", LeafNodeText: "first", ContainerHierarchyTexts: []string{"Ordered block"}, IsInOrderedContainer: true},
+				{LeafNodeType: "It", LeafNodeText: "plain", ContainerHierarchyTexts: []string{"Regular block"}},
+			}},
+		}
+		path := writeDiscoveryJSON(t, t.TempDir(), suites)
+		specs, err := loadDiscovery(path)
+		require.NoError(t, err)
+		require.Len(t, specs, 2)
+		byName := map[string]specInfo{}
+		for _, s := range specs {
+			byName[s.Name] = s
+		}
+		require.Equal(t, "Package Mode", byName["Ordered block first"].OrderedGroup)
+		require.Empty(t, byName["Regular block plain"].OrderedGroup)
+	})
+
+	t.Run("When discovery omits the ordered flag for a top-level ordered describe it should infer the ordered group from source", func(t *testing.T) {
+		dir := t.TempDir()
+		sourcePath := writeGoSourceFile(t, dir, "ordered_suite_test.go", `package sample
+
+import . "github.com/onsi/ginkgo/v2"
+
+var _ = Describe("Package-mode device scenarios", Ordered, func() {
+	It("first", func() {})
+	It("second", func() {})
+})
+`)
+		suites := []suiteReport{
+			{SuiteDescription: "Package Mode E2E Suite", SpecReports: []specReport{
+				{
+					LeafNodeType:            "It",
+					LeafNodeText:            "first",
+					ContainerHierarchyTexts: []string{"Package-mode device scenarios"},
+					ContainerHierarchyLocations: []e2etestutils.CodeLocation{{
+						FileName:   sourcePath,
+						LineNumber: 4,
+					}},
+				},
+				{
+					LeafNodeType:            "It",
+					LeafNodeText:            "second",
+					ContainerHierarchyTexts: []string{"Package-mode device scenarios"},
+					ContainerHierarchyLocations: []e2etestutils.CodeLocation{{
+						FileName:   sourcePath,
+						LineNumber: 4,
+					}},
+				},
+				{
+					LeafNodeType:            "It",
+					LeafNodeText:            "plain",
+					ContainerHierarchyTexts: []string{"Regular block"},
+					ContainerHierarchyLocations: []e2etestutils.CodeLocation{{
+						FileName:   sourcePath,
+						LineNumber: 6,
+					}},
+				},
+			}},
+		}
+		path := writeDiscoveryJSON(t, dir, suites)
+		specs, err := loadDiscovery(path)
+		require.NoError(t, err)
+		require.Len(t, specs, 3)
+		byName := map[string]specInfo{}
+		for _, spec := range specs {
+			byName[spec.Name] = spec
+		}
+		require.Equal(t, "Package Mode E2E Suite", byName["Package-mode device scenarios first"].OrderedGroup)
+		require.Equal(t, "Package Mode E2E Suite", byName["Package-mode device scenarios second"].OrderedGroup)
+		require.Empty(t, byName["Regular block plain"].OrderedGroup)
 	})
 }
 

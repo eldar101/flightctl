@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -149,9 +150,17 @@ func formatTLSErrorForAuth(errorInfo TLSErrorInfo) string {
 		"  2. Skip certificate verification (not recommended)\n" + examplesInsecure
 }
 
+type credentialsFile struct {
+	Token    string `json:"token"`
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+// LoginOptions holds the options for the login command.
 type LoginOptions struct {
 	GlobalOptions
 	AccessToken        string
+	CredentialsFile    string
 	Provider           string
 	InsecureSkipVerify bool
 	CAFile             string
@@ -167,10 +176,12 @@ type LoginOptions struct {
 	clientConfig       *client.Config
 }
 
+// DefaultLoginOptions returns a LoginOptions with default values.
 func DefaultLoginOptions() *LoginOptions {
 	return &LoginOptions{
 		GlobalOptions:      DefaultGlobalOptions(),
 		AccessToken:        "",
+		CredentialsFile:    "",
 		Provider:           "",
 		InsecureSkipVerify: false,
 		CAFile:             "",
@@ -225,6 +236,7 @@ func (o *LoginOptions) Bind(fs *pflag.FlagSet) {
 	o.GlobalOptions.Bind(fs)
 
 	fs.StringVarP(&o.AccessToken, "token", "t", o.AccessToken, "Bearer token for authentication to the API server")
+	fs.StringVarP(&o.CredentialsFile, "credentials-file", "", o.CredentialsFile, "Path to a JSON file containing credentials (token, username, password). Takes precedence over flags and environment variables")
 	fs.StringVarP(&o.Provider, "provider", "", o.Provider, "Name of the authentication provider to use")
 	fs.StringVarP(&o.CAFile, "certificate-authority", "", o.CAFile, "Path to a cert file for the certificate authority")
 	fs.StringVarP(&o.AuthCAFile, "auth-certificate-authority", "", o.AuthCAFile, "Path to a cert file for the auth certificate authority")
@@ -241,6 +253,11 @@ func (o *LoginOptions) Complete(cmd *cobra.Command, args []string) error {
 	if err := o.GlobalOptions.Complete(cmd, args); err != nil {
 		return err
 	}
+
+	if err := o.resolveCredentials(); err != nil {
+		return err
+	}
+
 	defaultConfigPath, err := client.DefaultFlightctlClientConfigPath()
 	if err != nil {
 		return fmt.Errorf("could not get user config directory: %w", err)
@@ -255,6 +272,56 @@ func (o *LoginOptions) Complete(cmd *cobra.Command, args []string) error {
 			trimmedURL = "https://" + trimmedURL
 		}
 		args[0] = trimmedURL
+	}
+
+	return nil
+}
+
+func (o *LoginOptions) resolveCredentials() error {
+	if o.AccessToken == "" {
+		if v := os.Getenv("FLIGHTCTL_TOKEN"); v != "" {
+			o.AccessToken = v
+		}
+	}
+	if o.Username == "" {
+		if v := os.Getenv("FLIGHTCTL_USERNAME"); v != "" {
+			o.Username = v
+		}
+	}
+	if o.Password == "" {
+		if v := os.Getenv("FLIGHTCTL_PASSWORD"); v != "" {
+			o.Password = v
+		}
+	}
+
+	if o.CredentialsFile != "" {
+		fi, err := os.Stat(o.CredentialsFile)
+		if err != nil {
+			return fmt.Errorf("reading credentials file %s: %w", o.CredentialsFile, err)
+		}
+		if !fi.Mode().IsRegular() {
+			return fmt.Errorf("credentials file %s is not a regular file", o.CredentialsFile)
+		}
+		if fi.Mode().Perm()&0o077 != 0 {
+			return fmt.Errorf("credentials file %s has too broad permissions %04o, expected 0600 or stricter", o.CredentialsFile, fi.Mode().Perm())
+		}
+		data, err := os.ReadFile(o.CredentialsFile)
+		if err != nil {
+			return fmt.Errorf("reading credentials file %s: %w", o.CredentialsFile, err)
+		}
+		var creds credentialsFile
+		if err := json.Unmarshal(data, &creds); err != nil {
+			return fmt.Errorf("parsing credentials file %s: %w", o.CredentialsFile, err)
+		}
+		if creds.Token != "" {
+			o.AccessToken = creds.Token
+		}
+		if creds.Username != "" {
+			o.Username = creds.Username
+		}
+		if creds.Password != "" {
+			o.Password = creds.Password
+		}
 	}
 
 	return nil
@@ -589,6 +656,13 @@ func (o *LoginOptions) Run(ctx context.Context, args []string) error {
 	}
 	o.clientConfig.ImageBuilderService = imageBuilderService
 
+	// Set remote access service URL (flightctl-remote-access) based on the main API server
+	remoteAccessService, err := deriveRemoteAccessService(o.clientConfig.Service)
+	if err != nil {
+		return fmt.Errorf("deriving remote access service: %w", err)
+	}
+	o.clientConfig.RemoteAccessService = remoteAccessService
+
 	if err := o.clientConfig.Persist(o.ConfigFilePath); err != nil {
 		return fmt.Errorf("persisting client config: %w", err)
 	}
@@ -848,6 +922,43 @@ func deriveImageBuilderService(mainService client.Service) (*client.Service, err
 
 	return &client.Service{
 		Server:                   imageBuilderURL,
+		TLSServerName:            mainService.TLSServerName,
+		CertificateAuthority:     mainService.CertificateAuthority,
+		CertificateAuthorityData: mainService.CertificateAuthorityData,
+		InsecureSkipVerify:       mainService.InsecureSkipVerify,
+	}, nil
+}
+
+// deriveRemoteAccessService derives the flightctl-remote-access HTTP service URL from the main API service URL.
+// For route mode (api.{domain} with standard ports): replaces "api." prefix with "remote-access.".
+// For nodePort mode (port 3443): uses the same hostname on port 3444.
+// For all other cases: uses the gateway path /_/remote-access on the same host.
+func deriveRemoteAccessService(mainService client.Service) (*client.Service, error) {
+	const defaultRemoteAccessPort = 3444
+
+	parsedURL, err := url.Parse(mainService.Server)
+	if err != nil {
+		return nil, fmt.Errorf("parsing main service URL %q: %w", mainService.Server, err)
+	}
+
+	hostname := parsedURL.Hostname()
+	port := parsedURL.Port()
+
+	var remoteAccessURL string
+	switch {
+	case (port == "" || port == "443" || port == "80") && strings.HasPrefix(hostname, "api."):
+		// Route mode: replace "api." with "remote-access." in the hostname
+		remoteAccessURL = parsedURL.Scheme + "://" + strings.Replace(hostname, "api.", "remote-access.", 1)
+	case port == "3443":
+		// NodePort mode: same hostname, remote access service port
+		remoteAccessURL = fmt.Sprintf("%s://%s:%d", parsedURL.Scheme, hostname, defaultRemoteAccessPort)
+	default:
+		// Gateway/other: use the /_/remote-access path on the same host
+		remoteAccessURL = fmt.Sprintf("%s://%s/_/remote-access", parsedURL.Scheme, parsedURL.Host)
+	}
+
+	return &client.Service{
+		Server:                   remoteAccessURL,
 		TLSServerName:            mainService.TLSServerName,
 		CertificateAuthority:     mainService.CertificateAuthority,
 		CertificateAuthorityData: mainService.CertificateAuthorityData,

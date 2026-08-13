@@ -3,11 +3,19 @@ package domain
 import (
 	v1alpha1 "github.com/flightctl/flightctl/api/core/v1alpha1"
 	v1beta1 "github.com/flightctl/flightctl/api/core/v1beta1"
+	apiversioning "github.com/flightctl/flightctl/api/versioning"
 )
 
 // ========== API Group ==========
 
 const APIGroup = v1beta1.APIGroup
+
+// ========== API Versioning ==========
+
+const (
+	QualifiedV1Alpha1 = apiversioning.QualifiedV1Alpha1
+	QualifiedV1Beta1  = apiversioning.QualifiedV1Beta1
+)
 
 // ========== CertificateSigningRequest ==========
 
@@ -27,15 +35,18 @@ const (
 
 // Device annotation keys
 const (
-	DeviceAnnotationConsole                 = v1beta1.DeviceAnnotationConsole
-	DeviceAnnotationRenderedVersion         = v1beta1.DeviceAnnotationRenderedVersion
-	DeviceAnnotationAwaitingReconnect       = v1beta1.DeviceAnnotationAwaitingReconnect
-	DeviceAnnotationConflictPaused          = v1beta1.DeviceAnnotationConflictPaused
-	DeviceAnnotationTemplateVersion         = v1beta1.DeviceAnnotationTemplateVersion
-	DeviceAnnotationRenderedTemplateVersion = v1beta1.DeviceAnnotationRenderedTemplateVersion
-	DeviceAnnotationRenderedSpecHash        = v1beta1.DeviceAnnotationRenderedSpecHash
-	DeviceAnnotationSelectedForRollout      = v1beta1.DeviceAnnotationSelectedForRollout
-	DeviceAnnotationLastRolloutError        = v1beta1.DeviceAnnotationLastRolloutError
+	DeviceAnnotationConsole                   = v1beta1.DeviceAnnotationConsole
+	DeviceAnnotationRemoteSession             = v1beta1.DeviceAnnotationRemoteSession
+	DeviceAnnotationRenderedVersion           = v1beta1.DeviceAnnotationRenderedVersion
+	DeviceAnnotationAwaitingReconnect         = v1beta1.DeviceAnnotationAwaitingReconnect
+	DeviceAnnotationConflictPaused            = v1beta1.DeviceAnnotationConflictPaused
+	DeviceAnnotationTemplateVersion           = v1beta1.DeviceAnnotationTemplateVersion
+	DeviceAnnotationRenderedTemplateVersion   = v1beta1.DeviceAnnotationRenderedTemplateVersion
+	DeviceAnnotationRenderedSpecHash          = v1beta1.DeviceAnnotationRenderedSpecHash
+	DeviceAnnotationSelectedForRollout        = v1beta1.DeviceAnnotationSelectedForRollout
+	DeviceAnnotationLastRolloutError          = v1beta1.DeviceAnnotationLastRolloutError
+	DeviceAnnotationApplicationLifecycle      = v1beta1.DeviceAnnotationApplicationLifecycle
+	DeviceAnnotationFleetApplicationLifecycle = v1beta1.DeviceAnnotationFleetApplicationLifecycle
 )
 
 const DeviceDisconnectedTimeout = v1beta1.DeviceDisconnectedTimeout
@@ -66,6 +77,7 @@ const (
 	FleetAnnotationRolloutApprovalMethod       = v1beta1.FleetAnnotationRolloutApprovalMethod
 	FleetAnnotationLastBatchCompletionReport   = v1beta1.FleetAnnotationLastBatchCompletionReport
 	FleetAnnotationDeviceSelectionConfigDigest = v1beta1.FleetAnnotationDeviceSelectionConfigDigest
+	FleetAnnotationApplicationLifecycle        = v1beta1.FleetAnnotationApplicationLifecycle
 )
 
 // ========== Event ==========
@@ -148,9 +160,10 @@ const (
 // ========== System ==========
 
 const (
-	SystemKind           = v1beta1.SystemKind
-	SystemComponentDB    = v1beta1.SystemComponentDB
-	SystemComponentQueue = v1beta1.SystemComponentQueue
+	SystemKind                = v1beta1.SystemKind
+	SystemComponentDB         = v1beta1.SystemComponentDB
+	SystemComponentQueue      = v1beta1.SystemComponentQueue
+	SystemComponentEncryption = v1beta1.SystemComponentEncryption
 )
 
 // ========== Roles ==========

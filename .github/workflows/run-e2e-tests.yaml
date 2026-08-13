@@ -71,6 +71,9 @@ jobs:
         uses: ./.github/actions/setup-dependencies
         with:
           setup_kvm: yes
+          # Custom image (flightctl-ci-ubuntu-24) already has apt packages, KVM,
+          # crun, protoc, and oras. Skipping avoids apt upgrades every job.
+          skip_package_install: 'true'
 
       - name: Compute base domain
         id: base-domain
@@ -105,6 +108,10 @@ jobs:
           OS_ID: ${{ inputs.os_id }}
         run: |
           set -euo pipefail
+          # Keep runtime detection aligned with test/harness/containers/docker_host.go.
+          . ./test/scripts/detect_container_runtime.sh
+          configure_testcontainers_docker_host
+
           echo "Downloaded test artifacts:"
           tree test-artifacts
 
@@ -115,7 +122,8 @@ jobs:
             exit 1
           fi
           mv "test-artifacts/agent-images-bundle-${OS_ID}.tar" bin/agent-artifacts/
-          echo "Agent bundle: bin/agent-artifacts/agent-images-bundle-${OS_ID}.tar"
+          BUNDLE="bin/agent-artifacts/agent-images-bundle-${OS_ID}.tar"
+          echo "Agent bundle: ${BUNDLE}"
 
           # Stage qcow2
           mkdir -p bin/output/qcow2
@@ -123,8 +131,21 @@ jobs:
             echo "ERROR: QCOW2 image not found"
             exit 1
           fi
-          mv "test-artifacts/disk.qcow2" bin/output/qcow2/
+          mv "test-artifacts/disk.qcow2" bin/output/qcow2/disk.qcow2
           echo "✓ QCOW2 image: bin/output/qcow2/disk.qcow2"
+
+          PACKAGE_REF="quay.io/flightctl/flightctl-device:package"
+          CONTAINER_RUNTIME="$(detect_testcontainers_runtime)"
+          echo "Detected testcontainers runtime: ${CONTAINER_RUNTIME} (DOCKER_HOST=${DOCKER_HOST:-unset})"
+          if [[ "${CONTAINER_RUNTIME}" == "podman" ]]; then
+            echo "Loading package-mode image into Podman image storage"
+            export CONTAINER_HOST="${DOCKER_HOST}"
+            podman load -i "${BUNDLE}"
+            podman image exists "${PACKAGE_REF}"
+          else
+            echo "Loading package-mode image into Docker daemon"
+            skopeo copy "docker-archive:${BUNDLE}:${PACKAGE_REF}" "docker-daemon:${PACKAGE_REF}"
+          fi
 
           # Cleanup
           rm -rf test-artifacts
@@ -186,10 +207,12 @@ jobs:
           GINKGO_LABEL_FILTER: ${{ inputs.ginkgo_label_filter }}
           GINKGO_TOTAL_NODES: ${{ inputs.ginkgo_total_nodes }}
           GINKGO_NODE: ${{ matrix.ginkgo_node }}
+          GINKGO_KEEP_GOING: "true"
           DISCOVERY_PATH: discovery.json
           ASSIGNMENTS_PATH: assignments.json
           RUNNER_DEBUG: ${{ runner.debug }}
         run: |
+          set -euo pipefail
           if [[ "${RUNNER_DEBUG}" == "1" ]]; then
             echo "Debug mode enabled"
             export DEBUG_VM_CONSOLE=1

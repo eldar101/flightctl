@@ -47,12 +47,23 @@ flightctl is the CLI for controlling the Flight Control service.
 Summary: Flight Control management agent
 
 Requires: flightctl-selinux = %{version}
-Requires: greenboot
+Recommends: flightctl-greenboot
 Requires: jq
 Requires: sudo
 
 %description agent
 The flightctl-agent package provides the management agent for the Flight Control fleet management service.
+
+# greenboot sub-package
+%package greenboot
+Summary: Greenboot integration for the Flight Control agent
+Requires: greenboot
+Requires: flightctl-agent = %{version}
+
+%description greenboot
+The flightctl-greenboot package provides greenboot health checks, bootc timer
+masking, and greenboot configuration for the Flight Control agent on
+image-mode (bootc) systems.
 
 # selinux sub-package
 %package selinux
@@ -77,6 +88,7 @@ The flightctl-selinux package provides the SELinux policy modules required by th
 %package services
 Summary: Flight Control services
 Requires: bash
+Requires: openssl
 Requires: podman
 Requires: python3-pyyaml
 BuildRequires: systemd-rpm-macros
@@ -286,7 +298,7 @@ fi
         fi;
         echo "${commit:-unknown}";
     )" \
-    %{?disable_fips} %make_build build-cli build-agent build-restore build-standalone
+    %{?disable_fips} %make_build build-cli build-agent build-backup build-restore build-standalone build-mirror-images
 
     # SELinux modules build
     %make_build --directory packaging/selinux
@@ -300,7 +312,9 @@ fi
     mkdir -p %{buildroot}/usr/bin
     mkdir -p %{buildroot}/etc/flightctl
     cp bin/flightctl %{buildroot}/usr/bin
+    cp bin/flightctl-backup %{buildroot}/usr/bin
     cp bin/flightctl-restore %{buildroot}/usr/bin
+    cp bin/flightctl-mirror-images %{buildroot}/usr/bin
     mkdir -p %{buildroot}/usr/lib/systemd/system
     mkdir -p %{buildroot}/usr/lib/tmpfiles.d
     mkdir -p %{buildroot}/usr/lib/flightctl/custom-info.d
@@ -347,6 +361,10 @@ fi
         install -Dv -m0644 "${LICENSE_FILE}" "%{buildroot}%{_datadir}/licenses/%{NAME}/${LICENSE_FILE}"
         echo "%%license %{_datadir}/licenses/%{NAME}/${LICENSE_FILE}" >> licenses.list
     done
+    # Own intermediate directories so RPM removes them on uninstall
+    find "%{buildroot}%{_datadir}/licenses/%{NAME}" -mindepth 1 -type d | sort -r | while read DIR; do
+        echo "%%dir ${DIR#%{buildroot}}" >> licenses.list
+    done
     touch licenses.list
 
     # flightctl-services sub-package steps
@@ -386,9 +404,10 @@ fi
     # Copy services must gather script
     cp packaging/must-gather/flightctl-services-must-gather %{buildroot}%{_bindir}
 
-    # Copy generate-certificates.sh script
+    # Copy certificate and encryption key generation scripts
     mkdir -p %{buildroot}%{_datadir}/flightctl
     install -m 0755 deploy/helm/flightctl/scripts/generate-certificates.sh %{buildroot}%{_datadir}/flightctl/generate-certificates.sh
+    install -m 0755 deploy/helm/flightctl/scripts/generate-encryption-key.sh %{buildroot}%{_datadir}/flightctl/generate-encryption-key.sh
 
     # Copy sos report flightctl plugin
     mkdir -p %{buildroot}/usr/share/sosreport
@@ -432,6 +451,7 @@ fi
 %if %{fips_enabled}
     bin/fips-validator binary %{buildroot}%{_bindir}/flightctl
     bin/fips-validator binary %{buildroot}%{_bindir}/flightctl-agent
+    bin/fips-validator binary %{buildroot}%{_bindir}/flightctl-backup
     bin/fips-validator binary %{buildroot}%{_bindir}/flightctl-restore
     GOLANG_FIPS=1 OPENSSL_FORCE_FIPS_MODE=1 LD_DEBUG=symbols bin/flightctl version |& grep OPENSSL
 %endif
@@ -458,8 +478,11 @@ fi
 # No %%files section for the main package, so it won't be built
 
 %files cli -f licenses.list
+    %dir %{_datadir}/licenses/%{NAME}
     %{_bindir}/flightctl
+    %{_bindir}/flightctl-backup
     %{_bindir}/flightctl-restore
+    %{_bindir}/flightctl-mirror-images
     %{_datadir}/bash-completion/completions/flightctl-completion.bash
     %{_datadir}/fish/vendor_completions.d/flightctl-completion.fish
     %{_datadir}/zsh/site-functions/_flightctl-completion
@@ -473,6 +496,11 @@ fi
     /usr/lib/systemd/system/flightctl-agent.service
     /usr/lib/tmpfiles.d/flightctl.conf
     /usr/lib/tmpfiles.d/centos-buildinfo.conf
+    /usr/share/sosreport/flightctl.py
+    %{_sysusersdir}/flightctl.conf
+    /etc/sudoers.d/*
+
+%files greenboot
     /usr/share/flightctl/functions/greenboot.sh
     /usr/lib/greenboot/check/required.d/20_check_flightctl_agent.sh
     /usr/lib/greenboot/red.d/40_flightctl_agent_pre_rollback.sh
@@ -480,24 +508,8 @@ fi
     /usr/libexec/flightctl/mask-bootc-timer.sh
     /usr/lib/systemd/system/flightctl-configure-greenboot.service
     /usr/lib/systemd/system/flightctl-mask-bootc-timer.service
-    /usr/share/sosreport/flightctl.py
-    %{_sysusersdir}/flightctl.conf
-    /etc/sudoers.d/*
 
 %post agent
-# Enable greenboot-healthcheck if present (not enabled by default in greenboot-rs 0.16.x).
-# Must be unconditional: greenboot's own %%systemd_post preset removes greenboot-success.target
-# (renamed from greenboot-set-success.target) due to a CentOS preset mismatch. Re-running
-# `systemctl enable` recreates it via the Also= directive.
-# See: https://github.com/fedora-iot/greenboot-rs/issues/171
-# See: https://github.com/openshift/microshift/pull/5530
-systemctl enable --quiet greenboot-healthcheck 2>/dev/null || :
-# Enable the greenboot configuration service (runs before greenboot-healthcheck.service)
-# This ensures only flightctl health checks can trigger OS rollback
-systemctl enable flightctl-configure-greenboot.service >/dev/null 2>&1 || :
-# Mask bootc auto-update timer on first boot (bootc/composefs); also run from %post below.
-systemctl enable flightctl-mask-bootc-timer.service >/dev/null 2>&1 || :
-
 # Ensure /var/lib/flightctl exists immediately for environments where systemd-tmpfiles succeeds or via fallback
 # Try systemd-tmpfiles first, fall back to manual creation if it fails
 /usr/bin/systemd-tmpfiles --create /usr/lib/tmpfiles.d/flightctl.conf || {
@@ -528,18 +540,38 @@ mkdir -p ~flightctl/.config/{containers/systemd,systemd/user}
 mkdir -p ~flightctl/.local
 chown -R flightctl:flightctl ~flightctl/{.config,.local}
 
+%post greenboot
+# Enable greenboot-healthcheck if present (not enabled by default in greenboot-rs 0.16.x).
+# Must be unconditional: greenboot's own %%systemd_post preset removes greenboot-success.target
+# (renamed from greenboot-set-success.target) due to a CentOS preset mismatch. Re-running
+# `systemctl enable` recreates it via the Also= directive.
+# See: https://github.com/fedora-iot/greenboot-rs/issues/171
+# See: https://github.com/openshift/microshift/pull/5530
+systemctl enable --quiet greenboot-healthcheck 2>/dev/null || :
+# Enable the greenboot configuration service (runs before greenboot-healthcheck.service)
+# This ensures only flightctl health checks can trigger OS rollback
+systemctl enable flightctl-configure-greenboot.service >/dev/null 2>&1 || :
+# Mask bootc auto-update timer on first boot (bootc/composefs); the script
+# is also run directly below for immediate effect during RPM install.
+systemctl enable flightctl-mask-bootc-timer.service >/dev/null 2>&1 || :
 # Disable bootc automatic updates on bootc systems (flightctl manages updates).
 # mask-bootc-timer.sh applies the mask; flightctl-mask-bootc-timer.service re-runs on
 # boot when image-build %post changes do not persist on bootc/composefs disks.
 /usr/libexec/flightctl/mask-bootc-timer.sh 2>/dev/null || true
 
 %postun agent
+if [ "$1" -eq 0 ]; then
+    loginctl disable-linger flightctl || :
+fi
+
+%preun greenboot
+%systemd_preun flightctl-configure-greenboot.service flightctl-mask-bootc-timer.service
+
+%postun greenboot
 # Restore bootc automatic-update timer only on full removal (not upgrade)
 if [ "$1" -eq 0 ]; then
-    systemctl disable flightctl-mask-bootc-timer.service 2>/dev/null || true
     systemctl unmask bootc-fetch-apply-updates.timer 2>/dev/null || true
     systemctl start bootc-fetch-apply-updates.timer 2>/dev/null || true
-    loginctl disable-linger flightctl || :
 fi
 
 %files selinux
@@ -549,12 +581,14 @@ fi
     %defattr(0644,root,root,-)
     # Files mounted to system config
     %dir %{_sysconfdir}/flightctl
+    %dir %{_sysconfdir}/flightctl/encryption
     %dir %{_sysconfdir}/flightctl/pki
     %dir %{_sysconfdir}/flightctl/pki/flightctl-api
     %dir %{_sysconfdir}/flightctl/pki/flightctl-alertmanager-proxy
     %dir %{_sysconfdir}/flightctl/pki/flightctl-pam-issuer
     %dir %{_sysconfdir}/flightctl/pki/flightctl-gateway
     %dir %{_sysconfdir}/flightctl/pki/flightctl-imagebuilder-api
+    %dir %{_sysconfdir}/flightctl/pki/flightctl-remote-access
     %dir %{_sysconfdir}/flightctl/pki/flightctl-telemetry-gateway
     %dir %{_sysconfdir}/flightctl/pki/db
     %dir %{_sysconfdir}/flightctl/flightctl-alert-exporter
@@ -566,6 +600,7 @@ fi
     %dir %{_sysconfdir}/flightctl/flightctl-gateway
     %dir %{_sysconfdir}/flightctl/flightctl-imagebuilder-api
     %dir %{_sysconfdir}/flightctl/flightctl-imagebuilder-worker
+    %dir %{_sysconfdir}/flightctl/flightctl-remote-access
     %dir %{_sysconfdir}/flightctl/flightctl-pam-issuer
     %dir %{_sysconfdir}/flightctl/flightctl-periodic
     %dir %{_sysconfdir}/flightctl/flightctl-ui
@@ -595,6 +630,7 @@ fi
     %dir %attr(0755,root,root) %{_datadir}/flightctl/flightctl-db-migrate
     %dir %attr(0755,root,root) %{_datadir}/flightctl/flightctl-imagebuilder-api
     %dir %attr(0755,root,root) %{_datadir}/flightctl/flightctl-imagebuilder-worker
+    %dir %attr(0755,root,root) %{_datadir}/flightctl/flightctl-remote-access
     %dir %attr(0755,root,root) %{_datadir}/flightctl/flightctl-telemetry-gateway
     %dir %attr(0755,root,root) %{_var}/tmp/flightctl-builds
     %dir %attr(0755,root,root) %{_var}/tmp/flightctl-exports
@@ -621,6 +657,8 @@ fi
     %{_datadir}/flightctl/flightctl-db-migrate/config.yaml.template
     %{_datadir}/flightctl/flightctl-imagebuilder-api/config.yaml.template
     %{_datadir}/flightctl/flightctl-imagebuilder-worker/config.yaml.template
+    %{_datadir}/flightctl/flightctl-remote-access/config.yaml.template
+    %{_datadir}/flightctl/flightctl-remote-access/env.template
     %{_datadir}/flightctl/flightctl-telemetry-gateway/config.yaml.template
 
     # Quadlet files (excluding observability components which are in separate packages)
@@ -639,9 +677,11 @@ fi
     %{_datadir}/containers/systemd/flightctl-ui*.container
     %{_datadir}/containers/systemd/flightctl-ui-certs.volume
     %{_datadir}/containers/systemd/flightctl-imagebuilder*.container
+    %{_datadir}/containers/systemd/flightctl-remote-access.container
     %{_datadir}/containers/systemd/flightctl-alertmanager.volume
     %{_datadir}/containers/systemd/flightctl-telemetry-gateway.container
     %{_datadir}/containers/systemd/flightctl.network
+    %{_datadir}/containers/systemd/flightctl-listeners.volume
 
     # Handle permissions for scripts setting host config
     %attr(0755,root,root) %{_datadir}/flightctl/init_db.sh
@@ -650,6 +690,7 @@ fi
     %attr(0755,root,root) %{_datadir}/flightctl/secrets.sh
     %attr(0755,root,root) %{_datadir}/flightctl/yaml_helpers.py
     %attr(0755,root,root) %{_datadir}/flightctl/generate-certificates.sh
+    %attr(0755,root,root) %{_datadir}/flightctl/generate-encryption-key.sh
 
     # flightctl-services pre upgrade checks
     %dir %{_libexecdir}/flightctl
@@ -771,7 +812,36 @@ fi
 # On upgrade: mark services for restart after transaction completes
 %systemd_postun_with_restart %{flightctl_target}
 
+# On full removal: delete temporary build/export storage that may contain
+# leftover subdirectories from interrupted jobs (non-empty dirs RPM won't remove).
+if [ "$1" -eq 0 ]; then
+    rm -rf %{_var}/tmp/flightctl-builds || true
+    rm -rf %{_var}/tmp/flightctl-exports || true
+fi
+
 # If contexts were managed via policy, no cleanup is needed here.
+
+%posttrans services
+# Reload systemd after all file operations (install + old-file removal) are
+# complete.  The daemon-reload in %%post runs before the old package's files
+# are deleted, so quadlet files removed in this version are still visible to
+# systemd at that point.  A second reload here picks up those removals.
+/usr/bin/systemctl daemon-reload >/dev/null 2>&1 || :
+
+# Clean up stale systemd units from quadlet files removed in previous
+# versions.  Each unit may still be in systemd's active state from the
+# prior version; stop + reset-failed clears it so it no longer appears
+# in "systemctl list-units".
+# This block can be removed once all deployments have upgraded past this fix.
+#   flightctl-cli-artifacts-init      — removed in EDM-3783 (shipped in 1.0.0–1.1.2)
+#   flightctl-alertmanager-proxy-init — removed in EDM-2304 (shipped in 0.10.0)
+for unit in \
+    flightctl-cli-artifacts-init.service \
+    flightctl-alertmanager-proxy-init.service \
+; do
+    /usr/bin/systemctl stop "$unit" 2>/dev/null || :
+    /usr/bin/systemctl reset-failed "$unit" 2>/dev/null || :
+done
 
 %changelog
 * Wed Nov 26 2025 Dakota Crowder <dcrowder@redhat.com> - 1.0-1

@@ -8,7 +8,12 @@
 // the provider (e.g. from setup.GetDefaultProviders() or the harness).
 package infra
 
-import "io"
+import (
+	"context"
+	"io"
+
+	internalconfig "github.com/flightctl/flightctl/internal/config"
+)
 
 // ServiceName is a type-safe identifier for flightctl services.
 type ServiceName string
@@ -28,6 +33,7 @@ const (
 	ServiceImageBuilderAPI    ServiceName = "imagebuilder-api"
 	ServiceImageBuilderWorker ServiceName = "imagebuilder-worker"
 	ServiceAlertExporter      ServiceName = "alert-exporter"
+	ServicePrometheus         ServiceName = "prometheus"
 )
 
 // InfraProvider abstracts infrastructure access for different deployment environments.
@@ -103,6 +109,36 @@ type InfraProvider interface {
 	// has no such pod. Quadlet reads db.type from service-config.yaml (deploy/podman/service-config.yaml);
 	// db.type=external uses an external Postgres instance instead of the flightctl-db container.
 	BuiltinDatabaseWorkloadAvailable() bool
+
+	// ServiceExists reports whether the deployment-specific resource for a logical service is present.
+	// For K8s: checks the Service object exists. For Quadlet: checks the systemd unit is active.
+	ServiceExists(ctx context.Context, service ServiceName) (bool, error)
+
+	// SetEncryptionKey writes a named encryption key so it is available to the given service.
+	// For K8s: patches the flightctl-encryption-key Secret to add/update the key entry, then
+	// triggers a rollout restart of the service's deployment so the new Secret is mounted.
+	// For Quadlet: writes the key file directly to the host filesystem at the encryption key directory.
+	// keyFileName is the base name of the key file (e.g. "key-rotated-key").
+	// keyBytes is the raw key material to store.
+	SetEncryptionKey(service ServiceName, keyFileName string, keyBytes []byte) error
+
+	// ResetEncryptionKeys removes all non-default encryption key files, leaving only the
+	// original "key" file (the deployment default). Used by test recovery to undo key rotation.
+	// For K8s: replaces the flightctl-encryption-key Secret's data with only the "key" entry.
+	// For Quadlet: removes all key-* files from the encryption key directory.
+	ResetEncryptionKeys() error
+
+	// GetEncryptionConfig reads the current encryption block from the service's config.
+	// Returns the parsed EncryptionConfig. If the service config has no encryption block
+	// (e.g. Quadlet with defaults baked in), returns a synthesized default config with
+	// activeKeyID=default and path=EncryptionKeyDir/key.
+	// For K8s: reads ConfigMap config.yaml. For Quadlet: reads the service config file.
+	GetEncryptionConfig(service ServiceName) (*internalconfig.EncryptionConfig, error)
+
+	// SetEncryptionConfig writes the given encryption block into the service's config,
+	// merging it with any existing top-level keys so unrelated settings are preserved.
+	// For K8s: updates ConfigMap data["config.yaml"]. For Quadlet: writes per-service config.
+	SetEncryptionConfig(service ServiceName, enc *internalconfig.EncryptionConfig) error
 }
 
 // DeploymentServiceNames maps deployment/service names (same in K8s and Quadlet) to ServiceName.

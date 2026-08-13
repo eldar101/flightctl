@@ -4,12 +4,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"net"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
 	"reflect"
 	"regexp"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/flightctl/flightctl/internal/agent/client"
@@ -30,6 +33,18 @@ const (
 	DefaultSpecFetchInterval = util.Duration(60 * time.Second)
 	// DefaultStatusUpdateInterval is the default interval between two status updates
 	DefaultStatusUpdateInterval = util.Duration(60 * time.Second)
+	// DefaultEnrollmentVerifyInterval is the default initial interval between checks for
+	// enrollment approval while the agent waits to be enrolled.
+	DefaultEnrollmentVerifyInterval = util.Duration(10 * time.Second)
+	// DefaultEnrollmentVerifyCap is the default maximum interval the enrollment-verify
+	// backoff can grow to (see agent.go's enrollment backoff). Matches the pre-config
+	// hardcoded Cap of 1m.
+	DefaultEnrollmentVerifyCap = util.Duration(1 * time.Minute)
+	// DefaultEnrollmentVerifySteps is the default number of enrollment-verify backoff
+	// steps attempted before the agent gives up waiting for enrollment approval and
+	// lets systemd restart it (see agent.go's enrollment backoff). Matches the
+	// pre-config hardcoded Steps of 6.
+	DefaultEnrollmentVerifySteps = 6
 	// DefaultSystemInfoTimeout is the default timeout for collecting system info
 	DefaultSystemInfoTimeout = util.Duration(2 * time.Minute)
 	// MaxSystemInfoTimeout is the maximum timeout for collecting system info
@@ -53,6 +68,8 @@ const (
 	DefaultCertsDirName = "certs"
 	// DefaultManagementEndpoint is the default address of the device management server
 	DefaultManagementEndpoint = "https://localhost:7443"
+	// DefaultRemoteAccessEndpoint is the default address of the flightctl-remote-access gRPC server
+	DefaultRemoteAccessEndpoint = "https://localhost:7444"
 	// name of the CA bundle file
 	CacertFile = "ca.crt"
 	// GeneratedCertFile is the name of the cert file which is generated as the result of enrollment
@@ -91,6 +108,16 @@ type Config struct {
 	SpecFetchInterval util.Duration `json:"spec-fetch-interval,omitempty"`
 	// StatusUpdateInterval is the interval between two status updates
 	StatusUpdateInterval util.Duration `json:"status-update-interval,omitempty"`
+	// EnrollmentVerifyInterval is the initial interval between checks for enrollment
+	// approval. Retries back off from this value (see agent.go's enrollment backoff).
+	EnrollmentVerifyInterval util.Duration `json:"enrollment-verify-interval,omitempty"`
+	// EnrollmentVerifyCap is the maximum interval the enrollment-verify backoff can
+	// grow to (see agent.go's enrollment backoff).
+	EnrollmentVerifyCap util.Duration `json:"enrollment-verify-cap,omitempty"`
+	// EnrollmentVerifySteps is the number of enrollment-verify backoff steps
+	// attempted before the agent gives up waiting for enrollment approval and lets
+	// systemd restart it (see agent.go's enrollment backoff).
+	EnrollmentVerifySteps int `json:"enrollment-verify-steps,omitempty"`
 
 	// TPM holds all TPM-related configuration
 	TPM TPM `json:"tpm,omitempty"`
@@ -156,6 +183,10 @@ type Config struct {
 	// ImagePruning holds all image/artifact pruning-related configuration
 	ImagePruning ImagePruning `json:"image-pruning,omitempty"`
 
+	// Warnings collects non-fatal issues encountered during config loading
+	// (e.g., skipped drop-ins) so they can be surfaced in device status.
+	Warnings []string `json:"-"`
+
 	readWriter fileio.ReadWriter
 }
 
@@ -193,21 +224,24 @@ var DefaultSystemInfo = append([]string{
 
 func NewDefault() *Config {
 	c := &Config{
-		ConfigDir:            DefaultConfigDir,
-		DataDir:              DefaultDataDir,
-		StatusUpdateInterval: DefaultStatusUpdateInterval,
-		SpecFetchInterval:    DefaultSpecFetchInterval,
-		readWriter:           fileio.NewReadWriter(fileio.NewReader(), fileio.NewWriter()),
-		LogLevel:             logrus.InfoLevel.String(),
-		DefaultLabels:        make(map[string]string),
-		LabelFromSystemInfo:  make(map[string]string),
-		ServiceConfig:        config.NewServiceConfig(),
-		SystemInfo:           DefaultSystemInfo,
-		SystemInfoTimeout:    DefaultSystemInfoTimeout,
-		PullTimeout:          DefaultPullTimeout,
-		PullRetrySteps:       DefaultPullRetrySteps,
-		MetricsEnabled:       DefaultMetricsEnabled,
-		ProfilingEnabled:     DefaultProfilingEnabled,
+		ConfigDir:                DefaultConfigDir,
+		DataDir:                  DefaultDataDir,
+		StatusUpdateInterval:     DefaultStatusUpdateInterval,
+		SpecFetchInterval:        DefaultSpecFetchInterval,
+		EnrollmentVerifyInterval: DefaultEnrollmentVerifyInterval,
+		EnrollmentVerifyCap:      DefaultEnrollmentVerifyCap,
+		EnrollmentVerifySteps:    DefaultEnrollmentVerifySteps,
+		readWriter:               fileio.NewReadWriter(fileio.NewReader(), fileio.NewWriter()),
+		LogLevel:                 logrus.InfoLevel.String(),
+		DefaultLabels:            make(map[string]string),
+		LabelFromSystemInfo:      make(map[string]string),
+		ServiceConfig:            config.NewServiceConfig(),
+		SystemInfo:               DefaultSystemInfo,
+		SystemInfoTimeout:        DefaultSystemInfoTimeout,
+		PullTimeout:              DefaultPullTimeout,
+		PullRetrySteps:           DefaultPullRetrySteps,
+		MetricsEnabled:           DefaultMetricsEnabled,
+		ProfilingEnabled:         DefaultProfilingEnabled,
 		TPM: TPM{
 			Enabled:         false,
 			AuthEnabled:     false,
@@ -295,7 +329,60 @@ func (cfg *Config) Complete() error {
 		cfg.ManagementService.Config = *cfg.EnrollmentService.Config.DeepCopy()
 		cfg.ManagementService.Config.AuthInfo = baseclient.AuthInfo{}
 	}
+	// If the remote-access service hasn't been specified, derive it from the enrollment service,
+	// keeping the same TLS config.
+	emptyRemoteAccessService := config.RemoteAccessService{}
+	if cfg.RemoteAccessService.Equal(&emptyRemoteAccessService) {
+		remoteAccessServer, err := deriveRemoteAccessServer(cfg.EnrollmentService.Config.Service.Server)
+		if err != nil {
+			return fmt.Errorf("deriving remote-access service endpoint: %w", err)
+		}
+		cfg.RemoteAccessService.Config = *cfg.EnrollmentService.Config.DeepCopy()
+		cfg.RemoteAccessService.Config.AuthInfo = baseclient.AuthInfo{}
+		cfg.RemoteAccessService.Config.Service.Server = remoteAccessServer
+	}
 	return nil
+}
+
+// deriveRemoteAccessServer derives the flightctl-remote-access gRPC URL from the enrollment
+// service URL.
+//
+// When the hostname doesn't have the agent-api prefix (Podman/Quadlet, where agent-api and
+// remote-access share one hostname on distinct hardcoded ports), the port always becomes the
+// remote-access gRPC port (7444).
+//
+// When the hostname has the agent-api prefix (Kubernetes Route/Gateway deployments), it's
+// swapped for agent-remote-access and the port is left as-is, since both hostnames are routed
+// purely by hostname/SNI through the very same external listener/port — except in nodePort
+// mode, where the enrollment port is the well-known agent NodePort (7443) and
+// flightctl-remote-access-agent is a distinct NodePort service on 7444.
+func deriveRemoteAccessServer(enrollmentServer string) (string, error) {
+	const nodePortAgentPort = "7443"
+	const remoteAccessAgentPort = "7444"
+
+	u, err := url.Parse(enrollmentServer)
+	if err != nil {
+		return "", fmt.Errorf("parsing enrollment server URL %q: %w", enrollmentServer, err)
+	}
+	u.Path = ""
+
+	hostname := u.Hostname()
+	if !strings.HasPrefix(hostname, "agent-api.") {
+		u.Host = net.JoinHostPort(hostname, remoteAccessAgentPort)
+		return u.String(), nil
+	}
+
+	hostname = "agent-remote-access." + strings.TrimPrefix(hostname, "agent-api.")
+	port := u.Port()
+	if port == nodePortAgentPort {
+		port = remoteAccessAgentPort
+	}
+	if port == "" {
+		u.Host = hostname
+		return u.String(), nil
+	}
+	u.Host = net.JoinHostPort(hostname, port)
+	return u.String(), nil
 }
 
 // Validate checks that the required fields are set and ensures that the paths exist.
@@ -362,8 +449,10 @@ func (cfg *Config) ParseConfigFile(cfgFile string) error {
 	if err := yaml.Unmarshal(contents, cfg); err != nil {
 		return fmt.Errorf("unmarshalling config file: %w", err)
 	}
-	cfg.EnrollmentService.Config.SetBaseDir(filepath.Dir(cfgFile))
-	cfg.ManagementService.Config.SetBaseDir(filepath.Dir(cfgFile))
+	baseDir := filepath.Dir(cfgFile)
+	cfg.EnrollmentService.Config.SetBaseDir(baseDir)
+	cfg.ManagementService.Config.SetBaseDir(baseDir)
+	cfg.RemoteAccessService.Config.SetBaseDir(baseDir)
 	return nil
 }
 
@@ -404,6 +493,15 @@ func (cfg *Config) validateSyncIntervals() error {
 	if cfg.StatusUpdateInterval < MinSyncInterval {
 		return fmt.Errorf("minimum status update interval is %s have %s", MinSyncInterval, cfg.StatusUpdateInterval)
 	}
+	if cfg.EnrollmentVerifyInterval < MinSyncInterval {
+		return fmt.Errorf("minimum enrollment verify interval is %s have %s", MinSyncInterval, cfg.EnrollmentVerifyInterval)
+	}
+	if cfg.EnrollmentVerifyCap < MinSyncInterval {
+		return fmt.Errorf("minimum enrollment verify cap is %s have %s", MinSyncInterval, cfg.EnrollmentVerifyCap)
+	}
+	if cfg.EnrollmentVerifySteps < 1 {
+		return fmt.Errorf("minimum enrollment verify steps is 1 have %d", cfg.EnrollmentVerifySteps)
+	}
 	return nil
 }
 
@@ -432,16 +530,24 @@ func (cfg *Config) LoadWithOverrides(configFile string) error {
 	}
 	sort.Strings(yamlFiles)
 
-	// Apply drop-ins in order (later files override earlier ones)
+	// Apply drop-ins in order (later files override earlier ones).
+	// Invalid drop-ins are skipped with a warning so the agent can still
+	// start and perform spec rollback if needed.
 	for _, filename := range yamlFiles {
 		overrideCfg := &Config{}
 		overridePath := filepath.Join(confSubdir, filename)
 		contents, err := cfg.readWriter.ReadFile(overridePath)
 		if err != nil {
-			return fmt.Errorf("reading override config %s: %w", overridePath, err)
+			msg := fmt.Sprintf("Skipping unreadable override config %s: %v", overridePath, err)
+			logrus.Warn(msg)
+			cfg.Warnings = append(cfg.Warnings, msg)
+			continue
 		}
 		if err := yaml.Unmarshal(contents, overrideCfg); err != nil {
-			return fmt.Errorf("unmarshalling override config %s: %w", overridePath, err)
+			msg := fmt.Sprintf("Skipping invalid override config %s: %v", overridePath, err)
+			logrus.Warn(msg)
+			cfg.Warnings = append(cfg.Warnings, msg)
+			continue
 		}
 		mergeConfigs(cfg, overrideCfg)
 	}

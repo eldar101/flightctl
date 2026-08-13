@@ -41,8 +41,10 @@ const (
 type ApplicationProviderType string
 
 const (
-	ImageApplicationProviderType  ApplicationProviderType = "image"
-	InlineApplicationProviderType ApplicationProviderType = "inline"
+	UnknownApplicationProviderType        ApplicationProviderType = ""
+	ImageApplicationProviderType          ApplicationProviderType = "image"
+	CatalogItemRefApplicationProviderType ApplicationProviderType = "catalogItemRef"
+	InlineApplicationProviderType         ApplicationProviderType = "inline"
 )
 
 type ApplicationVolumeProviderType string
@@ -124,30 +126,113 @@ func (c ConfigProviderSpec) Type() (ConfigProviderType, error) {
 }
 
 // Type returns the provider type (image or inline) for compose applications.
-func (c ComposeApplication) Type() (ApplicationProviderType, error) {
+func (c ComposeApplication) Type() ApplicationProviderType {
 	return getApplicationProviderType(c.union)
 }
 
 // Type returns the provider type (image or inline) for quadlet applications.
-func (q QuadletApplication) Type() (ApplicationProviderType, error) {
+func (q QuadletApplication) Type() ApplicationProviderType {
 	return getApplicationProviderType(q.union)
 }
 
-func getApplicationProviderType(union json.RawMessage) (ApplicationProviderType, error) {
-	var data map[ApplicationProviderType]interface{}
+func (h HelmApplication) Type() ApplicationProviderType {
+	return getApplicationProviderType(h.union)
+}
+
+func (c ContainerApplication) Type() ApplicationProviderType {
+	return getApplicationProviderType(c.union)
+}
+
+// Type returns the provider type (image or inline) for vm applications.
+func (v VmApplication) Type() ApplicationProviderType {
+	return getApplicationProviderType(v.union)
+}
+
+func getApplicationProviderType(union json.RawMessage) ApplicationProviderType {
+	var data map[ApplicationProviderType]any
 	if err := json.Unmarshal(union, &data); err != nil {
-		return "", err
+		return UnknownApplicationProviderType
 	}
 
 	if _, exists := data[ImageApplicationProviderType]; exists {
-		return ImageApplicationProviderType, nil
+		return ImageApplicationProviderType
+	}
+
+	if _, exists := data[CatalogItemRefApplicationProviderType]; exists {
+		return CatalogItemRefApplicationProviderType
 	}
 
 	if _, exists := data[InlineApplicationProviderType]; exists {
-		return InlineApplicationProviderType, nil
+		return InlineApplicationProviderType
 	}
 
-	return "", fmt.Errorf("unable to determine application provider type: %+v", data)
+	return UnknownApplicationProviderType
+}
+
+// getLifecycleFields returns the desiredState/restartGeneration pointers declared on the
+// application's concrete underlying type (ContainerApplication, ComposeApplication, etc.).
+// These fields are readOnly in the API: never settable by apply, and only ever non-nil once
+// the device render task has overlaid the device-controller/applicationLifecycle annotation
+// onto the application (see domain.OverlayApplicationLifecycle).
+func (a ApplicationProviderSpec) getLifecycleFields() (*ApplicationDesiredState, *int) {
+	appType, err := a.GetAppType()
+	if err != nil {
+		return nil, nil
+	}
+	switch appType {
+	case AppTypeContainer:
+		app, err := a.AsContainerApplication()
+		if err != nil {
+			return nil, nil
+		}
+		return app.DesiredState, app.RestartGeneration
+	case AppTypeHelm:
+		app, err := a.AsHelmApplication()
+		if err != nil {
+			return nil, nil
+		}
+		return app.DesiredState, app.RestartGeneration
+	case AppTypeCompose:
+		app, err := a.AsComposeApplication()
+		if err != nil {
+			return nil, nil
+		}
+		return app.DesiredState, app.RestartGeneration
+	case AppTypeQuadlet:
+		app, err := a.AsQuadletApplication()
+		if err != nil {
+			return nil, nil
+		}
+		return app.DesiredState, app.RestartGeneration
+	case AppTypeVm:
+		app, err := a.AsVmApplication()
+		if err != nil {
+			return nil, nil
+		}
+		return app.DesiredState, app.RestartGeneration
+	default:
+		return nil, nil
+	}
+}
+
+// GetDesiredState returns the desired lifecycle state for the application.
+// Returns ApplicationDesiredStateRunning if the field is absent or nil.
+func (a ApplicationProviderSpec) GetDesiredState() ApplicationDesiredState {
+	desiredState, _ := a.getLifecycleFields()
+	if desiredState == nil {
+		return ApplicationDesiredStateRunning
+	}
+	return *desiredState
+}
+
+// GetRestartGeneration returns the restartGeneration counter for the application.
+// Returns 0 if the field is absent or nil.
+func (a ApplicationProviderSpec) GetRestartGeneration() int {
+	_, restartGeneration := a.getLifecycleFields()
+	if restartGeneration == nil {
+		return 0
+	}
+	return *restartGeneration
 }
 
 // GetAppType returns the application type from the discriminator.
@@ -186,6 +271,12 @@ func (a ApplicationProviderSpec) GetName() (*string, error) {
 		return app.Name, nil
 	case AppTypeQuadlet:
 		app, err := a.AsQuadletApplication()
+		if err != nil {
+			return nil, err
+		}
+		return app.Name, nil
+	case AppTypeVm:
+		app, err := a.AsVmApplication()
 		if err != nil {
 			return nil, err
 		}
@@ -282,9 +373,13 @@ func GetGoTemplateFuncMap() template.FuncMap {
 // 1. The user-provided template uses the yaml/json API format (e.g., lower case)
 // 2. The map contains only the device fields we allow access to
 func ExecuteGoTemplateOnDevice(t *template.Template, dev *Device) (string, error) {
+	var name string
+	if dev.Metadata.Name != nil {
+		name = *dev.Metadata.Name
+	}
 	devMap := map[string]interface{}{
 		"metadata": map[string]interface{}{
-			"name":   dev.Metadata.Name,
+			"name":   name,
 			"labels": dev.Metadata.Labels,
 		},
 	}

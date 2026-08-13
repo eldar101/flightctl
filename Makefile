@@ -8,26 +8,6 @@ export BUILDKIT_PROGRESS=plain
 REGISTRY       ?= localhost
 REGISTRY_OWNER ?= flightctl
 REGISTRY_OWNER_TESTS ?= flightctl-tests
-GITHUB_ACTIONS ?= false
-
-# --- Cache Configuration ---
-# Always use caching with localhost defaults for local builds
-# In CI, REGISTRY and REGISTRY_OWNER will be overridden
-CACHE_FLAGS_TEMPLATE := --cache-from=$(REGISTRY)/$(REGISTRY_OWNER)/%
-
-# Function to generate cache flags for a specific image
-# Only returns cache flags if GITHUB_ACTIONS is true
- ifeq ($(GITHUB_ACTIONS),true)
- define CACHE_FLAGS_FOR_IMAGE
- $(subst %,$(1),$(CACHE_FLAGS_TEMPLATE))
- endef
- else
- define CACHE_FLAGS_FOR_IMAGE
-
- endef
- endif
-
-
 
 ROOT_DIR := $(or ${ROOT_DIR},$(shell dirname $(realpath $(firstword $(MAKEFILE_LIST)))))
 GOBASE=$(ROOT_DIR)
@@ -121,6 +101,7 @@ help:
 	@echo "    clean-cluster:   kill the kind cluster only"
 	@echo "    clean-quadlets:  clean up all systemd services and quadlet files"
 	@echo "    rpm/deb:         generate rpm or debian packages"
+	@echo "    verify-rpm-install: verify package-mode and image-mode RPM install paths (requires podman, bin/rpm)"
 	@echo ""
 	@echo "CI/CD Targets:"
 	@echo "    login:           login to container registry (requires REGISTRY_USER env var)"
@@ -132,17 +113,12 @@ help:
 	@echo "    REGISTRY_OWNER:  registry owner/organization (default: flightctl)"
 	@echo "    REGISTRY_OWNER_TESTS:  test registry owner/organization (default: flightctl-tests)"
 	@echo "    REGISTRY_USER:   registry username for login"
-	@echo "    GITHUB_ACTIONS:  set to 'true' to enable container build caching"
-	@echo ""
-	@echo "Caching Strategy:"
-	@echo "    Uses GitHub Actions cache (type=gha) for CI builds"
-	@echo "    Cache flags only added when GITHUB_ACTIONS=true"
 
 .PHONY: publish
 publish: build-containers
 	hack/publish_containers.sh
 
-generate:
+generate: generate-mirror-embed
 	go generate -v $(shell go list ./... | grep -v -e api/grpc)
 
 generate-proto:
@@ -157,6 +133,7 @@ build: bin build-cli build-pam-issuer
 		./cmd/flightctl-agent \
 		./cmd/flightctl-api \
 		./cmd/flightctl-periodic \
+		./cmd/flightctl-remote-access \
 		./cmd/flightctl-worker \
 		./cmd/flightctl-alert-exporter \
 		./cmd/flightctl-alertmanager-proxy \
@@ -184,6 +161,11 @@ build-api: bin
 
 build-pam-issuer: bin
 	$(GOENV) GOOS=linux GOARCH=$(GOARCH) CGO_ENABLED=1 CGO_CFLAGS="$$CGO_CFLAGS -D_GNU_SOURCE" CGO_LDFLAGS="-ldl" go build -tags linux -buildvcs=false $(GO_BUILD_FLAGS) -o $(GOBIN) ./cmd/flightctl-pam-issuer
+
+DEV_VM_SRC := $(wildcard $(ROOT_DIR)/test/cmd/dev-vm/*.go)
+
+bin/flightctl-dev-vm: bin $(DEV_VM_SRC)
+	$(GOENV) GOOS=$(GOOS) GOARCH=$(GOARCH) CGO_ENABLED=1 go build -buildvcs=false -o $@ ./test/cmd/dev-vm/
 
 build-db-migrate: bin
 	$(GOENV) GOOS=$(GOOS) GOARCH=$(GOARCH) go build -buildvcs=false $(GO_BUILD_FLAGS) -o $(GOBIN) ./cmd/flightctl-db-migrate
@@ -218,29 +200,51 @@ build-imagebuilder-api: bin
 build-imagebuilder-worker: bin
 	$(GOENV) GOOS=$(GOOS) GOARCH=$(GOARCH) go build -buildvcs=false $(GO_BUILD_FLAGS) -o $(GOBIN) ./cmd/flightctl-imagebuilder-worker
 
+build-remote-access: bin
+	$(GOENV) GOOS=$(GOOS) GOARCH=$(GOARCH) go build -buildvcs=false $(GO_BUILD_FLAGS) -o $(GOBIN) ./cmd/flightctl-remote-access
+
 build-devicesimulator: bin
 	$(GOENV) GOOS=$(GOOS) GOARCH=$(GOARCH) go build -buildvcs=false $(GO_BUILD_FLAGS) -o $(GOBIN) ./cmd/devicesimulator
 
 build-standalone: bin
 	$(GOENV) GOOS=$(GOOS) GOARCH=$(GOARCH) go build -buildvcs=false $(GO_BUILD_FLAGS) -o $(GOBIN) ./cmd/flightctl-standalone
 
-# Container builds - Environment-aware caching
+MIRROR_EMBED_SOURCES := deploy/helm/helm-chart-opts.yaml \
+	deploy/helm/flightctl/Chart.yaml \
+	packaging/images/el9/images.yaml \
+	packaging/images/el10/images.yaml \
+	packaging/images/rhel9/images.yaml \
+	packaging/images/rhel10/images.yaml \
+	packaging/rpm/flightctl.spec
+
+MIRROR_EMBED_OUT := scripts/air-gap/mirror-images/embedded_data_generated.go
+
+$(MIRROR_EMBED_OUT): $(MIRROR_EMBED_SOURCES)
+	@echo "  GEN     $(MIRROR_EMBED_OUT)"
+	go run ./scripts/air-gap/generate-embed/ $(MIRROR_EMBED_SOURCES) > $(MIRROR_EMBED_OUT).tmp && mv $(MIRROR_EMBED_OUT).tmp $(MIRROR_EMBED_OUT)
+
+generate-mirror-embed: $(MIRROR_EMBED_OUT)
+
+build-mirror-images: generate-mirror-embed bin
+	$(GOENV) GOOS=$(GOOS) GOARCH=$(GOARCH) go build -buildvcs=false $(GO_BUILD_FLAGS) -o $(GOBIN)/flightctl-mirror-images ./scripts/air-gap/mirror-images
+
+# Container builds
 flightctl-api-container: packaging/images/$(OS)/Containerfile.api go.mod go.sum $(GO_FILES)
-	podman build $(call CACHE_FLAGS_FOR_IMAGE,flightctl-api) \
+	podman build \
 		--build-arg SOURCE_GIT_TAG=${SOURCE_GIT_TAG} \
 		--build-arg SOURCE_GIT_TREE_STATE=${SOURCE_GIT_TREE_STATE} \
 		--build-arg SOURCE_GIT_COMMIT=${SOURCE_GIT_COMMIT} \
 		-f packaging/images/$(OS)/Containerfile.api -t flightctl-api-$(OS):latest -t quay.io/flightctl/flightctl-api-$(OS):$(SOURCE_GIT_TAG) .
 
 flightctl-pam-issuer-container: packaging/images/$(OS)/Containerfile.pam-issuer go.mod go.sum $(GO_FILES)
-	podman build $(call CACHE_FLAGS_FOR_IMAGE,flightctl-pam-issuer) \
+	podman build \
 		--build-arg SOURCE_GIT_TAG=${SOURCE_GIT_TAG} \
 		--build-arg SOURCE_GIT_TREE_STATE=${SOURCE_GIT_TREE_STATE} \
 		--build-arg SOURCE_GIT_COMMIT=${SOURCE_GIT_COMMIT} \
 		-f packaging/images/$(OS)/Containerfile.pam-issuer -t flightctl-pam-issuer-$(OS):latest -t quay.io/flightctl/flightctl-pam-issuer-$(OS):$(SOURCE_GIT_TAG) .
 
 flightctl-db-setup-container: packaging/images/$(OS)/Containerfile.db-setup deploy/scripts/setup_database_users.sh deploy/scripts/setup_database_users.sql
-	podman build $(call CACHE_FLAGS_FOR_IMAGE,flightctl-db-setup) \
+	podman build \
 		--build-arg SOURCE_GIT_TAG=${SOURCE_GIT_TAG} \
 		--build-arg SOURCE_GIT_TREE_STATE=${SOURCE_GIT_TREE_STATE} \
 		--build-arg SOURCE_GIT_COMMIT=${SOURCE_GIT_COMMIT} \
@@ -248,69 +252,76 @@ flightctl-db-setup-container: packaging/images/$(OS)/Containerfile.db-setup depl
 		-t flightctl-db-setup-$(OS):latest -t quay.io/flightctl/flightctl-db-setup-$(OS):$(SOURCE_GIT_TAG) .
 
 flightctl-worker-container: packaging/images/$(OS)/Containerfile.worker go.mod go.sum $(GO_FILES)
-	podman build $(call CACHE_FLAGS_FOR_IMAGE,flightctl-worker) \
+	podman build \
 		--build-arg SOURCE_GIT_TAG=${SOURCE_GIT_TAG} \
 		--build-arg SOURCE_GIT_TREE_STATE=${SOURCE_GIT_TREE_STATE} \
 		--build-arg SOURCE_GIT_COMMIT=${SOURCE_GIT_COMMIT} \
 		-f packaging/images/$(OS)/Containerfile.worker -t flightctl-worker-$(OS):latest -t quay.io/flightctl/flightctl-worker-$(OS):$(SOURCE_GIT_TAG) .
 
 flightctl-periodic-container: packaging/images/$(OS)/Containerfile.periodic go.mod go.sum $(GO_FILES)
-	podman build $(call CACHE_FLAGS_FOR_IMAGE,flightctl-periodic) \
+	podman build \
 		--build-arg SOURCE_GIT_TAG=${SOURCE_GIT_TAG} \
 		--build-arg SOURCE_GIT_TREE_STATE=${SOURCE_GIT_TREE_STATE} \
 		--build-arg SOURCE_GIT_COMMIT=${SOURCE_GIT_COMMIT} \
 		-f packaging/images/$(OS)/Containerfile.periodic -t flightctl-periodic-$(OS):latest -t quay.io/flightctl/flightctl-periodic-$(OS):$(SOURCE_GIT_TAG) .
 
 flightctl-alert-exporter-container: packaging/images/$(OS)/Containerfile.alert-exporter go.mod go.sum $(GO_FILES)
-	podman build $(call CACHE_FLAGS_FOR_IMAGE,flightctl-alert-exporter) \
+	podman build \
 		--build-arg SOURCE_GIT_TAG=${SOURCE_GIT_TAG} \
 		--build-arg SOURCE_GIT_TREE_STATE=${SOURCE_GIT_TREE_STATE} \
 		--build-arg SOURCE_GIT_COMMIT=${SOURCE_GIT_COMMIT} \
 		-f packaging/images/$(OS)/Containerfile.alert-exporter -t flightctl-alert-exporter-$(OS):latest -t quay.io/flightctl/flightctl-alert-exporter-$(OS):$(SOURCE_GIT_TAG) .
 
 flightctl-alertmanager-proxy-container: packaging/images/$(OS)/Containerfile.alertmanager-proxy go.mod go.sum $(GO_FILES)
-	podman build $(call CACHE_FLAGS_FOR_IMAGE,flightctl-alertmanager-proxy) \
+	podman build \
 		--build-arg SOURCE_GIT_TAG=${SOURCE_GIT_TAG} \
 		--build-arg SOURCE_GIT_TREE_STATE=${SOURCE_GIT_TREE_STATE} \
 		--build-arg SOURCE_GIT_COMMIT=${SOURCE_GIT_COMMIT} \
 		-f packaging/images/$(OS)/Containerfile.alertmanager-proxy -t flightctl-alertmanager-proxy-$(OS):latest -t quay.io/flightctl/flightctl-alertmanager-proxy-$(OS):$(SOURCE_GIT_TAG) .
 
 flightctl-multiarch-cli-container: packaging/images/$(OS)/Containerfile.cli-artifacts go.mod go.sum $(GO_FILES)
-	podman build $(call CACHE_FLAGS_FOR_IMAGE,flightctl-cli-artifacts) \
+	podman build \
 		--build-arg SOURCE_GIT_TAG=${SOURCE_GIT_TAG} \
 		--build-arg SOURCE_GIT_TREE_STATE=${SOURCE_GIT_TREE_STATE} \
 		--build-arg SOURCE_GIT_COMMIT=${SOURCE_GIT_COMMIT} \
 		-f packaging/images/$(OS)/Containerfile.cli-artifacts -t flightctl-cli-artifacts-$(OS):latest -t quay.io/flightctl/flightctl-cli-artifacts-$(OS):$(SOURCE_GIT_TAG) .
 
 flightctl-userinfo-proxy-container: packaging/images/$(OS)/Containerfile.userinfo-proxy go.mod go.sum $(GO_FILES)
-	podman build $(call CACHE_FLAGS_FOR_IMAGE,flightctl-userinfo-proxy) \
+	podman build \
 		--build-arg SOURCE_GIT_TAG=${SOURCE_GIT_TAG} \
 		--build-arg SOURCE_GIT_TREE_STATE=${SOURCE_GIT_TREE_STATE} \
 		--build-arg SOURCE_GIT_COMMIT=${SOURCE_GIT_COMMIT} \
 		-f packaging/images/$(OS)/Containerfile.userinfo-proxy -t flightctl-userinfo-proxy-$(OS):latest -t quay.io/flightctl/flightctl-userinfo-proxy-$(OS):$(SOURCE_GIT_TAG) .
 
 flightctl-telemetry-gateway-container: packaging/images/$(OS)/Containerfile.telemetry-gateway go.mod go.sum $(GO_FILES)
-	podman build $(call CACHE_FLAGS_FOR_IMAGE,flightctl-telemetry-gateway) \
+	podman build \
 		--build-arg SOURCE_GIT_TAG=${SOURCE_GIT_TAG} \
 		--build-arg SOURCE_GIT_TREE_STATE=${SOURCE_GIT_TREE_STATE} \
 		--build-arg SOURCE_GIT_COMMIT=${SOURCE_GIT_COMMIT} \
 		-f packaging/images/$(OS)/Containerfile.telemetry-gateway -t flightctl-telemetry-gateway-$(OS):latest -t quay.io/flightctl/flightctl-telemetry-gateway-$(OS):$(SOURCE_GIT_TAG) .
 
 flightctl-imagebuilder-api-container: packaging/images/$(OS)/Containerfile.imagebuilder-api go.mod go.sum $(GO_FILES)
-	podman build $(call CACHE_FLAGS_FOR_IMAGE,flightctl-imagebuilder-api) \
+	podman build \
 		--build-arg SOURCE_GIT_TAG=${SOURCE_GIT_TAG} \
 		--build-arg SOURCE_GIT_TREE_STATE=${SOURCE_GIT_TREE_STATE} \
 		--build-arg SOURCE_GIT_COMMIT=${SOURCE_GIT_COMMIT} \
 		-f packaging/images/$(OS)/Containerfile.imagebuilder-api -t flightctl-imagebuilder-api-$(OS):latest -t quay.io/flightctl/flightctl-imagebuilder-api-$(OS):$(SOURCE_GIT_TAG) .
 
 flightctl-imagebuilder-worker-container: packaging/images/$(OS)/Containerfile.imagebuilder-worker go.mod go.sum $(GO_FILES)
-	podman build $(call CACHE_FLAGS_FOR_IMAGE,flightctl-imagebuilder-worker) \
+	podman build \
 		--build-arg SOURCE_GIT_TAG=${SOURCE_GIT_TAG} \
 		--build-arg SOURCE_GIT_TREE_STATE=${SOURCE_GIT_TREE_STATE} \
 		--build-arg SOURCE_GIT_COMMIT=${SOURCE_GIT_COMMIT} \
 		-f packaging/images/$(OS)/Containerfile.imagebuilder-worker -t flightctl-imagebuilder-worker-$(OS):latest -t quay.io/flightctl/flightctl-imagebuilder-worker-$(OS):$(SOURCE_GIT_TAG) .
 
-.PHONY: flightctl-api-container flightctl-pam-issuer-container flightctl-db-setup-container flightctl-worker-container flightctl-periodic-container flightctl-alert-exporter-container flightctl-alertmanager-proxy-container flightctl-multiarch-cli-container flightctl-userinfo-proxy-container flightctl-telemetry-gateway-container flightctl-imagebuilder-api-container flightctl-imagebuilder-worker-container
+flightctl-remote-access-container: packaging/images/$(OS)/Containerfile.remote-access go.mod go.sum $(GO_FILES)
+	podman build \
+		--build-arg SOURCE_GIT_TAG=${SOURCE_GIT_TAG} \
+		--build-arg SOURCE_GIT_TREE_STATE=${SOURCE_GIT_TREE_STATE} \
+		--build-arg SOURCE_GIT_COMMIT=${SOURCE_GIT_COMMIT} \
+		-f packaging/images/$(OS)/Containerfile.remote-access -t flightctl-remote-access-$(OS):latest -t quay.io/flightctl/flightctl-remote-access-$(OS):$(SOURCE_GIT_TAG) .
+
+.PHONY: flightctl-api-container flightctl-pam-issuer-container flightctl-db-setup-container flightctl-worker-container flightctl-periodic-container flightctl-alert-exporter-container flightctl-alertmanager-proxy-container flightctl-multiarch-cli-container flightctl-userinfo-proxy-container flightctl-telemetry-gateway-container flightctl-imagebuilder-api-container flightctl-imagebuilder-worker-container flightctl-remote-access-container
 
 # --- Registry Operations ---
 # The login target expects REGISTRY_USER via environment variable and
@@ -338,6 +349,8 @@ push-containers: login
 	podman push flightctl-userinfo-proxy:latest
 	podman push flightctl-telemetry-gateway:latest
 	podman push flightctl-imagebuilder-api:latest
+	podman push flightctl-imagebuilder-worker:latest
+	podman push flightctl-remote-access:latest
 
 # A convenience target to run the full CI process.
 ci-build: build-containers push-containers
@@ -350,7 +363,7 @@ rebuild-containers: clean-containers build-containers
 clean-containers:
 	- podman images --filter "reference=flightctl-*-$(OS):latest" --format "{{.Repository}}:{{.Tag}}" | xargs -r podman rmi || true
 
-build-containers: flightctl-api-container flightctl-pam-issuer-container flightctl-db-setup-container flightctl-worker-container flightctl-periodic-container flightctl-alert-exporter-container flightctl-alertmanager-proxy-container flightctl-multiarch-cli-container flightctl-userinfo-proxy-container flightctl-telemetry-gateway-container flightctl-imagebuilder-api-container flightctl-imagebuilder-worker-container
+build-containers: flightctl-api-container flightctl-pam-issuer-container flightctl-db-setup-container flightctl-worker-container flightctl-periodic-container flightctl-alert-exporter-container flightctl-alertmanager-proxy-container flightctl-multiarch-cli-container flightctl-userinfo-proxy-container flightctl-telemetry-gateway-container flightctl-imagebuilder-api-container flightctl-imagebuilder-worker-container flightctl-remote-access-container
 
 bundle-containers:
 	test/scripts/agent-images/scripts/bundle.sh \
@@ -379,7 +392,7 @@ bin/.rpm: $(shell find $(ROOT_DIR)/ -name "*.go" -not -path "$(ROOT_DIR)/packagi
 
 rpm: bin/.rpm
 
-.PHONY: rpm build build-api build-pam-issuer build-periodic build-worker build-alert-exporter build-alertmanager-proxy build-userinfo-proxy build-standalone build-imagebuilder-api build-imagebuilder-worker
+.PHONY: rpm build build-api build-pam-issuer build-periodic build-worker build-alert-exporter build-alertmanager-proxy build-userinfo-proxy build-standalone build-imagebuilder-api build-imagebuilder-worker build-remote-access generate-mirror-embed build-mirror-images
 
 # cross-building for deb pkg
 bin/amd64:
@@ -428,7 +441,7 @@ clean-quadlets:
 	sudo deploy/scripts/clean_quadlets.sh
 
 
-.PHONY: tools flightctl-api-container flightctl-pam-issuer-container flightctl-db-setup-container flightctl-worker-container flightctl-periodic-container flightctl-alert-exporter-container flightctl-userinfo-proxy-container flightctl-telemetry-gateway-container
+.PHONY: tools flightctl-api-container flightctl-pam-issuer-container flightctl-db-setup-container flightctl-worker-container flightctl-periodic-container flightctl-alert-exporter-container flightctl-userinfo-proxy-container flightctl-telemetry-gateway-container flightctl-remote-access-container
 
 # Use custom golangci-lint container with libvirt support
 LINT_IMAGE := flightctl-lint:latest
@@ -438,6 +451,11 @@ LINT_CONTAINER := podman run --rm --security-opt label=disable \
 	-v go-build-cache:/root/.cache/go-build \
 	-v go-mod-cache:/go/pkg/mod \
 	-w /app --user 0 $(LINT_IMAGE)
+# lint-fix runs as the host user so that auto-fixed files are not root-owned.
+# Cache volumes are omitted because /root/.cache is inaccessible to non-root.
+LINT_FIX_CONTAINER := podman run --rm --security-opt label=disable \
+	-v $(GOBASE):/app \
+	-w /app --user $$(id -u):$$(id -g) $(LINT_IMAGE)
 
 .PHONY: tools
 tools:
@@ -450,6 +468,10 @@ tools:
 .PHONY: lint
 lint: .output/stamps/lint-image
 	$(LINT_CONTAINER) golangci-lint run -v
+
+.PHONY: lint-fix
+lint-fix: .output/stamps/lint-image
+	$(LINT_FIX_CONTAINER) golangci-lint run -v --fix
 
 .PHONY: rpmlint
 rpmlint: check-rpmlint
@@ -464,6 +486,10 @@ rpmlint-ci:
 .PHONY: check-rpmlint
 check-rpmlint:
 	@command -v rpmlint > /dev/null || (echo "rpmlint not found. Install with: sudo apt-get install rpmlint (Ubuntu/Debian) or sudo dnf install rpmlint (Fedora/RHEL)" && exit 1)
+
+.PHONY: verify-rpm-install
+verify-rpm-install: bin/.rpm
+	go test -v -count=1 -timeout 15m ./test/packaging/...
 
 .output/stamps/lint-openapi: api/core/v1beta1/openapi.yaml api/core/v1alpha1/openapi.yaml api/imagebuilder/v1alpha1/openapi.yaml .spectral.yaml
 	@mkdir -p .output/stamps

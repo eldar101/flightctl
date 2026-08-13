@@ -31,7 +31,7 @@ spec:
       {{- include "flightctl.migrationWaitInitContainer" (dict "context" . "timeout" 600) | nindent 6 }}
       containers:
         - name: alert-exporter
-          image: "{{ include "flightctl.ensureOsQualifiedImage" .Values.alertExporter.image.image }}:{{ default .Chart.AppVersion .Values.alertExporter.image.tag }}"
+          image: "{{ include "flightctl.ensureOsQualifiedImage" (dict "root" . "imageName" .Values.alertExporter.image.image) }}:{{ default .Chart.AppVersion .Values.alertExporter.image.tag }}"
           imagePullPolicy: "{{ default .Values.global.imagePullPolicy .Values.alertExporter.image.pullPolicy }}"
           ports:
             - containerPort: 8081
@@ -81,6 +81,9 @@ spec:
             - mountPath: /root/.flightctl
               name: flightctl-alert-exporter-config
               readOnly: true
+            - mountPath: /root/.flightctl/encryption
+              name: flightctl-encryption-key
+              readOnly: true
             {{- include "flightctl.dbSslVolumeMounts" . | nindent 12 }}
           livenessProbe:
             httpGet:
@@ -103,5 +106,9 @@ spec:
         - name: flightctl-alert-exporter-config
           configMap:
             name: flightctl-alert-exporter-config
+        - name: flightctl-encryption-key
+          secret:
+            secretName: flightctl-encryption-key
+            defaultMode: 0400
         {{- include "flightctl.dbSslVolumes" . | nindent 8 }}
 {{- end }}

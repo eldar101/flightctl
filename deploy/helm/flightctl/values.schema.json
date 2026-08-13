@@ -48,7 +48,7 @@
         },
         "storageClassName": {
           "type": "string",
-          "description": "Storage class name for PVCs. Empty to use default."
+          "description": "Storage class name for PVCs. Empty to use default. Note: for a component that also sets volumeName or selector.matchLabels for static PV binding, leaving this empty makes the chart render storageClassName: \"\" for that PVC instead of omitting the field."
         },
         "imagePullSecretName": {
           "type": "string",
@@ -302,6 +302,18 @@
               "type": ["object", "null"],
               "description": "Additional labels for DB PVCs.",
               "additionalProperties": { "type": "string" }
+            },
+            "volumeName": { "type": "string", "description": "Name of a specific pre-provisioned PersistentVolume to bind this PVC to. Only takes effect when the PVC is first created — changing this on an already-bound PVC will make `helm upgrade` fail, because Kubernetes forbids mutating volumeName after creation. Leave empty for normal (dynamic or best-fit static) binding. Note: the target PV's capacity must be >= `storage.size` above, or binding will fail. Setting this (or selector.matchLabels below) also makes the chart render storageClassName: \"\" on this PVC when global.storageClassName is left empty, so a cluster-default StorageClass can't get injected and mismatch the target PV." },
+            "selector": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "matchLabels": {
+                  "type": "object",
+                  "additionalProperties": { "type": "string" },
+                  "description": "Label selector for binding this PVC to a pre-provisioned PersistentVolume by matching labels on the PV. Same immutability caveat as volumeName applies. Leave empty to disable label-based selection."
+                }
+              }
             }
           }
         },
@@ -374,6 +386,18 @@
           "type": ["object", "null"],
           "description": "Additional labels for Alert Manager PVCs.",
           "additionalProperties": { "type": "string" }
+        },
+        "volumeName": { "type": "string", "description": "Name of a specific pre-provisioned PersistentVolume to bind this PVC to. Only takes effect when the PVC is first created — changing this on an already-bound PVC will make `helm upgrade` fail, because Kubernetes forbids mutating volumeName after creation. Leave empty for normal (dynamic or best-fit static) binding. Note: the target PV's capacity must be >= the fixed `2Gi` this PVC requests, or binding will fail. Setting this (or selector.matchLabels below) also makes the chart render storageClassName: \"\" on this PVC when global.storageClassName is left empty, so a cluster-default StorageClass can't get injected and mismatch the target PV." },
+        "selector": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "matchLabels": {
+              "type": "object",
+              "additionalProperties": { "type": "string" },
+              "description": "Label selector for binding this PVC to a pre-provisioned PersistentVolume by matching labels on the PV. Same immutability caveat as volumeName applies. Leave empty to disable label-based selection."
+            }
+          }
         }
       }
     },
@@ -471,6 +495,21 @@
         "clusterLevelSecretAccess": {
           "type": "boolean",
           "description": "Allow worker to access cluster-level secrets for embedding in device configs"
+        },
+        "vmRender": {
+          "type": "object",
+          "description": "VM application render options passed to vm-to-quadlet",
+          "additionalProperties": false,
+          "properties": {
+            "launcherImage": {
+              "type": "string",
+              "description": "virt-launcher image used when converting VmApplications to Quadlet units (leave empty to use the worker default)"
+            },
+            "passtWorkarounds": {
+              "type": "boolean",
+              "description": "Enable passt networking workarounds for older virt-launcher images"
+            }
+          }
         }
       }
     },
@@ -523,6 +562,77 @@
                   }
                 }
               }
+            },
+            "dependencySync": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "schedule": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "interval": { "type": "string", "description": "Interval for the dependency-sync-git and dependency-sync-http tasks" }
+                  }
+                }
+              }
+            },
+            "repositoryTester": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "schedule": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "interval": { "type": "string", "description": "Interval for the repository-tester task, which probes Repository resources and sets their Accessible condition" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "remoteAccess": {
+      "type": "object",
+      "description": "Remote access service configuration",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean", "description": "Enable remote access service" },
+        "logLevel": { "type": "string", "description": "Log level for the remote access service" },
+        "image": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "image": { "type": "string", "description": "Remote access container image" },
+            "tag": { "type": "string", "description": "Remote access image tag" },
+            "pullPolicy": { "type": "string", "description": "Image pull policy for remote access container" }
+          }
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "resources": {
+          "type": "object",
+          "description": "Resource requests and limits for the remote access container",
+          "additionalProperties": false,
+          "properties": {
+            "requests": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "cpu": { "type": "string" },
+                "memory": { "type": "string" }
+              }
+            },
+            "limits": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "cpu": { "type": "string" },
+                "memory": { "type": "string" }
+              }
             }
           }
         }
@@ -564,6 +674,15 @@
             "pullPolicy": { "type": "string", "description": "Image pull policy for Alertmanager proxy container" }
           }
         }
+      }
+    },
+    "ubiMinimal": {
+      "type": "object",
+      "description": "UBI minimal image used by init containers (e.g. alertmanager-proxy, test pods)",
+      "additionalProperties": false,
+      "properties": {
+        "image": { "type": "string", "description": "UBI minimal container image" },
+        "tag": { "type": "string", "description": "UBI minimal image tag" }
       }
     },
     "imageBuilderApi": {
@@ -617,6 +736,10 @@
           "type": "object",
           "description": "Builder images (podman, bootc-image-builder, syft) and skip-TLS options",
           "properties": {
+            "pullSecretName": {
+              "type": "string",
+              "description": "Secret name containing registry credentials (auth.json) for pulling builder service images. The secret must have a key named auth.json in podman/Docker auth format."
+            },
             "podman": {
               "type": "object",
               "properties": {
@@ -791,6 +914,30 @@
         }
       }
     },
+    "encryption": {
+      "type": "object",
+      "description": "Encryption-at-rest key configuration for key rotation support",
+      "additionalProperties": false,
+      "properties": {
+        "activeKeyID": {
+          "type": "string",
+          "description": "Key ID used for new encryptions. Must match one of the IDs in the keys list."
+        },
+        "keys": {
+          "type": "array",
+          "description": "List of available encryption keys. Old keys remain available for decryption during rotation.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "file"],
+            "properties": {
+              "id": { "type": "string", "description": "Logical key identifier" },
+              "file": { "type": "string", "description": "Filename within the flightctl-encryption-key Secret" }
+            }
+          }
+        }
+      }
+    },
     "upgradeHooks": {
       "type": "object",
       "description": "Upgrade hooks configuration",
@@ -883,6 +1030,33 @@
           "properties": {
             "endpoint": { "type": "string" },
             "insecure": { "type": "boolean" }
+          }
+        },
+        "profiling": {
+          "type": "object",
+          "description": "Optional pprof and/or Pyroscope profiling for long-running services",
+          "additionalProperties": false,
+          "properties": {
+            "pprof": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "port": { "type": "integer", "description": "Optional loopback pprof port override for a single process" }
+              }
+            },
+            "pyroscope": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "serverAddress": { "type": "string" },
+                "applicationName": { "type": "string" },
+                "basicAuthUser": { "type": "string" },
+                "basicAuthPassword": { "type": "string" },
+                "tenantID": { "type": "string" }
+              }
+            }
           }
         }
       }

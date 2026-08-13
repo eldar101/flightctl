@@ -26,17 +26,16 @@ import (
 	"github.com/flightctl/flightctl/internal/config"
 	"github.com/flightctl/flightctl/internal/crypto"
 	"github.com/flightctl/flightctl/internal/org"
-	"github.com/flightctl/flightctl/internal/store"
 	"github.com/flightctl/flightctl/internal/store/model"
 	"github.com/flightctl/flightctl/internal/util"
 	flightlog "github.com/flightctl/flightctl/pkg/log"
 	"github.com/flightctl/flightctl/pkg/queues"
-	"github.com/flightctl/flightctl/test/util/testdb"
 	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/onsi/gomega/types"
 	"github.com/sirupsen/logrus"
+	"gorm.io/gorm"
 )
 
 const (
@@ -200,6 +199,26 @@ func (t *testProvider) Publish(ctx context.Context, payload []byte) error {
 	return nil
 }
 
+// RunOcCommand executes an oc CLI command with the given arguments and returns
+// its trimmed stdout. Returns an error if oc is not on PATH, the command fails,
+// or execution exceeds 30 seconds.
+func RunOcCommand(args ...string) (string, error) {
+	if !BinaryExistsOnPath("oc") {
+		return "", fmt.Errorf("oc not found on PATH")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	out, err := exec.CommandContext(ctx, "oc", args...).CombinedOutput()
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return "", fmt.Errorf("oc %s timed out after 30s", strings.Join(args, " "))
+		}
+		return "", fmt.Errorf("oc %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
 // IsAcmInstalled checks if ACM is installed and if it is running.
 // returns: isAcmInstalled, isAcmRunning, error
 func IsAcmInstalled() (bool, bool, error) {
@@ -225,7 +244,7 @@ func IsAcmInstalled() (bool, bool, error) {
 }
 
 // NewTestApiServer creates a new test server and returns the server and the listener listening on localhost's next available port.
-func NewTestApiServer(log logrus.FieldLogger, cfg *config.Config, store store.Store, ca *crypto.CAClient, serverCerts *crypto.TLSCertificateConfig, queuesProvider queues.Provider) (*apiserver.Server, net.Listener, error) {
+func NewTestApiServer(log logrus.FieldLogger, cfg *config.Config, db *gorm.DB, ca *crypto.CAClient, serverCerts *crypto.TLSCertificateConfig, queuesProvider queues.Provider) (*apiserver.Server, net.Listener, error) {
 
 	// create a listener using the next available port
 	tlsConfig, _, err := crypto.TLSConfigForServer(ca.GetCABundleX509(), serverCerts)
@@ -239,11 +258,11 @@ func NewTestApiServer(log logrus.FieldLogger, cfg *config.Config, store store.St
 		return nil, nil, fmt.Errorf("NewTLSListener: error creating TLS certs: %w", err)
 	}
 
-	return apiserver.New(log, cfg, store, ca, listener, queuesProvider, nil), listener, nil
+	return apiserver.New(log, cfg, db, ca, listener, queuesProvider, nil), listener, nil
 }
 
 // NewTestAgentServer creates a new test server and returns the server and the listener listening on localhost's next available port.
-func NewTestAgentServer(ctx context.Context, log logrus.FieldLogger, cfg *config.Config, store store.Store, ca *crypto.CAClient, serverCerts *crypto.TLSCertificateConfig, queuesProvider queues.Provider) (*agentserver.AgentServer, net.Listener, error) {
+func NewTestAgentServer(ctx context.Context, log logrus.FieldLogger, cfg *config.Config, db *gorm.DB, ca *crypto.CAClient, serverCerts *crypto.TLSCertificateConfig, queuesProvider queues.Provider) (*agentserver.AgentServer, net.Listener, error) {
 	// create a listener using the next available port
 	_, tlsConfig, err := crypto.TLSConfigForServer(ca.GetCABundleX509(), serverCerts)
 	if err != nil {
@@ -256,43 +275,12 @@ func NewTestAgentServer(ctx context.Context, log logrus.FieldLogger, cfg *config
 		return nil, nil, fmt.Errorf("NewTestAgentServer: error creating TLS certs: %w", err)
 	}
 
-	agentServer, err := agentserver.New(ctx, log, cfg, store, ca, listener, queuesProvider, tlsConfig)
+	agentServer, err := agentserver.New(ctx, log, cfg, db, ca, listener, queuesProvider, tlsConfig)
 	if err != nil {
 		_ = listener.Close()
 		return nil, nil, fmt.Errorf("NewTestAgentServer: error creating agent server: %w", err)
 	}
 	return agentServer, listener, nil
-}
-
-// NewTestStore creates a new test store and returns the store and the database name.
-func NewTestStore(ctx context.Context, cfg config.Config, log *logrus.Logger) (store.Store, string, error) {
-	// cfg.Database.Name = ""
-	dbTemp, err := store.InitDB(&cfg, log)
-	if err != nil {
-		return nil, "", fmt.Errorf("NewTestStore: error initializing test DB: %w", err)
-	}
-	defer testdb.CloseDB(dbTemp)
-
-	randomDBName := fmt.Sprintf("_%s", strings.ReplaceAll(uuid.New().String(), "-", "_"))
-	log.Infof("DB name: %s", randomDBName)
-	dbTemp = dbTemp.WithContext(ctx).Exec(fmt.Sprintf("CREATE DATABASE %s;", randomDBName))
-	if dbTemp.Error != nil {
-		return nil, "", fmt.Errorf("NewTestStore: creating test db %s: %w", randomDBName, dbTemp.Error)
-	}
-
-	cfg.Database.Name = randomDBName
-	db, err := store.InitDB(&cfg, log)
-	if err != nil {
-		return nil, "", fmt.Errorf("NewTestStore: initializing test db %s: %w", randomDBName, err)
-	}
-
-	dbStore := store.NewStore(db, log.WithField("pkg", "store"))
-	err = dbStore.RunMigrations(ctx)
-	if err != nil {
-		return nil, "", fmt.Errorf("NewTestStore: performing migrations: %w", err)
-	}
-
-	return dbStore, randomDBName, nil
 }
 
 // NewTestCerts creates new test certificates in the service certstore and returns the CA, server certificate, and enrollment certificate.

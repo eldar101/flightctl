@@ -40,6 +40,7 @@ type manager struct {
 	deviceName       string
 	deviceReadWriter fileio.ReadWriter
 	osClient         os.Client
+	osMode           v1beta1.OsModeType
 	publisher        Publisher
 	watcher          Watcher
 	cache            *cache
@@ -61,6 +62,7 @@ func NewManager(
 	policyManager policy.Manager,
 	deviceReadWriter fileio.ReadWriter,
 	osClient os.Client,
+	osMode v1beta1.OsModeType,
 	pollConfig poll.Config,
 	deviceNotFoundHandler func() error,
 	auditLogger audit.Logger,
@@ -83,6 +85,7 @@ func NewManager(
 		deviceName:       deviceName,
 		deviceReadWriter: deviceReadWriter,
 		osClient:         osClient,
+		osMode:           osMode,
 		cache:            cache,
 		policyManager:    policyManager,
 		auditLogger:      auditLogger,
@@ -123,8 +126,9 @@ func (s *manager) Ensure() error {
 	// Check and recreate missing spec files.
 	// Distinguishes between first startup (bootstrap) and recovery from corruption.
 
-	// Determine if this is first startup by checking if ALL files are missing
+	// Single pass to determine allMissing and anyMissing
 	allMissing := true
+	anyMissing := false
 	for _, specType := range []Type{Current, Desired, Rollback} {
 		exists, err := s.exists(specType)
 		if err != nil {
@@ -132,36 +136,38 @@ func (s *manager) Ensure() error {
 		}
 		if exists {
 			allMissing = false
-			break
+		} else {
+			anyMissing = true
 		}
 	}
 
-	// Create missing files with appropriate reason
-	for _, specType := range []Type{Current, Desired, Rollback} {
-		exists, err := s.exists(specType)
-		if err != nil {
-			return err
+	// If any file is missing, reset ALL files to version "0".
+	// This ensures the agent never tries to reason about partial state.
+	if anyMissing {
+		if !allMissing {
+			s.log.Warnf("Spec file missing, resetting all specs to empty...")
 		}
-
-		if !exists {
+		for _, specType := range []Type{Current, Desired, Rollback} {
 			var reason audit.Reason
 			if allMissing {
-				// First startup - all files created during bootstrap
 				reason = audit.ReasonBootstrap
 				s.log.Infof("First startup: creating %s spec file", specType)
 			} else {
-				// File corruption recovery - use appropriate reason
 				if specType == Rollback {
 					reason = audit.ReasonInitialization
 				} else {
 					reason = audit.ReasonRecovery
 				}
-				s.log.Warnf("Spec file does not exist %s. Resetting state to empty...", specType)
 			}
 
 			if err := s.write(context.TODO(), specType, newVersionedDevice("0"), reason); err != nil {
 				return err
 			}
+		}
+
+		// Reset publisher version so the next poll fetches the latest spec.
+		if !allMissing {
+			s.publisher.ResetVersion("0")
 		}
 	}
 
@@ -526,12 +532,15 @@ func (s *manager) isNewDesiredVersion(desired *v1beta1.Device) bool {
 	return s.lastConsumedDevice == nil || s.lastConsumedDevice.Version() != desired.Version()
 }
 
-func (s *manager) IsOSUpdate() bool {
+func (s *manager) ShouldApplyOSImageUpdate() bool {
+	if s.osMode == v1beta1.OsModePackage {
+		return false
+	}
 	return s.cache.getOSVersion(Current) != s.cache.getOSVersion(Desired)
 }
 
-func (s *manager) IsOSUpdatePending(ctx context.Context) (bool, error) {
-	if !s.IsOSUpdate() {
+func (s *manager) ShouldApplyOSImageUpdatePending(ctx context.Context) (bool, error) {
+	if !s.ShouldApplyOSImageUpdate() {
 		return false, nil
 	}
 

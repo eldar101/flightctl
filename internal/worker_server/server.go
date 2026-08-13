@@ -4,27 +4,46 @@ import (
 	"context"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/flightctl/flightctl/internal/config"
+	"github.com/flightctl/flightctl/internal/instrumentation/encryption"
 	"github.com/flightctl/flightctl/internal/instrumentation/metrics/worker"
 	"github.com/flightctl/flightctl/internal/kvstore"
 	"github.com/flightctl/flightctl/internal/org/cache"
 	"github.com/flightctl/flightctl/internal/rendered"
-	"github.com/flightctl/flightctl/internal/service"
-	"github.com/flightctl/flightctl/internal/store"
+	canaryservice "github.com/flightctl/flightctl/internal/service/canary"
+	catalogservice "github.com/flightctl/flightctl/internal/service/catalog"
+	dependencyrefservice "github.com/flightctl/flightctl/internal/service/dependencyref"
+	deviceservice "github.com/flightctl/flightctl/internal/service/device"
+	eventservice "github.com/flightctl/flightctl/internal/service/event"
+	"github.com/flightctl/flightctl/internal/service/events"
+	fleetservice "github.com/flightctl/flightctl/internal/service/fleet"
+	repositoryservice "github.com/flightctl/flightctl/internal/service/repository"
+	templateversionservice "github.com/flightctl/flightctl/internal/service/templateversion"
+	canarystore "github.com/flightctl/flightctl/internal/store/canary"
+	catalogstore "github.com/flightctl/flightctl/internal/store/catalog"
+	checkpointstore "github.com/flightctl/flightctl/internal/store/checkpoint"
+	dependencyrefstore "github.com/flightctl/flightctl/internal/store/dependencyref"
+	devicestore "github.com/flightctl/flightctl/internal/store/device"
+	eventstore "github.com/flightctl/flightctl/internal/store/event"
+	fleetstore "github.com/flightctl/flightctl/internal/store/fleet"
+	repositorystore "github.com/flightctl/flightctl/internal/store/repository"
+	templateversionstore "github.com/flightctl/flightctl/internal/store/templateversion"
 	"github.com/flightctl/flightctl/internal/tasks"
 	"github.com/flightctl/flightctl/internal/worker_client"
 	"github.com/flightctl/flightctl/pkg/k8sclient"
 	"github.com/flightctl/flightctl/pkg/queues"
 	"github.com/sirupsen/logrus"
+	"gorm.io/gorm"
 )
 
 type Server struct {
 	cfg            *config.Config
 	log            logrus.FieldLogger
-	store          store.Store
+	db             *gorm.DB
 	queuesProvider queues.Provider
 	k8sClient      k8sclient.K8SClient
 	workerMetrics  *worker.WorkerCollector
@@ -34,7 +53,7 @@ type Server struct {
 func New(
 	cfg *config.Config,
 	log logrus.FieldLogger,
-	store store.Store,
+	db *gorm.DB,
 	queuesProvider queues.Provider,
 	k8sClient k8sclient.K8SClient,
 	workerMetrics *worker.WorkerCollector,
@@ -42,7 +61,7 @@ func New(
 	return &Server{
 		cfg:            cfg,
 		log:            log,
-		store:          store,
+		db:             db,
 		queuesProvider: queuesProvider,
 		k8sClient:      k8sClient,
 		workerMetrics:  workerMetrics,
@@ -74,22 +93,65 @@ func (s *Server) Run(ctx context.Context) error {
 	orgCache.Start()
 	defer orgCache.Stop()
 
-	serviceHandler := service.WrapWithTracing(
-		service.NewServiceHandler(s.store, workerClient, kvStore, nil, s.log, "", "", []string{}, false))
+	deviceStore := devicestore.NewDeviceStore(s.db, s.log.WithField("pkg", "device-store"))
+	fleetStore := fleetstore.NewFleetStore(s.db, s.log.WithField("pkg", "fleet-store"))
+	templateVersionStore := templateversionstore.NewTemplateVersionStore(s.db, s.log.WithField("pkg", "templateversion-store"))
+	dependencyRefStore := dependencyrefstore.NewDependencyRefStore(s.db, s.log.WithField("pkg", "dependencyref-store"))
+	repositoryStore := repositorystore.NewRepositoryStore(s.db, s.log.WithField("pkg", "repository-store"))
+	eventStore := eventstore.NewEventStore(s.db, s.log.WithField("pkg", "event-store"))
+	checkpointStore := checkpointstore.NewCheckpointStore(s.db, s.log.WithField("pkg", "checkpoint-store"))
+	canaryStore := canarystore.NewCanaryStore(s.db, s.log.WithField("pkg", "canary-store"))
+	canarySvc := canaryservice.WrapWithTracing(canaryservice.NewServiceHandler(canaryStore))
+	catStore := catalogstore.NewCatalogStore(s.db, s.log.WithField("pkg", "catalog-store"))
 
-	if err = tasks.LaunchConsumers(ctx, s.queuesProvider, serviceHandler, s.k8sClient, kvStore, s.cfg, 1, 1, s.workerMetrics); err != nil {
+	eventsSvc := events.NewServiceHandler(eventStore, workerClient, s.log)
+
+	fleetSvc := fleetservice.WrapWithTracing(fleetservice.NewServiceHandler(fleetStore, catStore, eventsSvc, s.log))
+	templateVersionSvc := templateversionservice.WrapWithTracing(templateversionservice.NewServiceHandler(templateVersionStore, kvStore, eventsSvc, s.log))
+	deviceSvc := deviceservice.WrapWithTracing(deviceservice.NewDeviceServiceHandler(deviceStore, catStore, fleetStore, eventsSvc, kvStore, "", s.log))
+	dependencyrefSvc := dependencyrefservice.WrapWithTracing(dependencyrefservice.NewServiceHandler(dependencyRefStore, s.log))
+	repositorySvc := repositoryservice.WrapWithTracing(repositoryservice.NewServiceHandler(repositoryStore, eventsSvc, s.log))
+	catalogSvc := catalogservice.WrapWithTracing(catalogservice.NewServiceHandler(catStore, deviceStore, fleetStore, eventsSvc, s.log))
+	eventSvc := eventservice.WrapWithTracing(eventservice.NewServiceHandler(eventStore, eventsSvc))
+
+	encryptionMigrator := tasks.NewEncryptionMigrator(
+		ctx,
+		s.db,
+		encryption.GlobalManager(),
+		checkpointStore,
+		tasks.NewPostgresEncryptionMigrationLocker(s.db),
+		canarySvc,
+		eventSvc,
+		s.log.WithField("pkg", "encryption-migration"),
+	)
+
+	if err = tasks.LaunchConsumers(ctx, s.queuesProvider, fleetSvc, templateVersionSvc, deviceSvc, dependencyrefSvc, repositorySvc, catalogSvc, eventSvc, s.k8sClient, kvStore, s.cfg, 1, 1, s.workerMetrics, encryptionMigrator, publisher); err != nil {
 		s.log.WithError(err).Error("failed to launch consumers")
 		return err
 	}
+	enqueueCtx, cancelEnqueue := context.WithCancel(ctx)
+	var enqueueWG sync.WaitGroup
+	enqueueWG.Add(1)
+	go func() {
+		defer enqueueWG.Done()
+		if err := tasks.EnqueueEncryptionMigrationIfNeeded(enqueueCtx, publisher, encryptionMigrator, s.log); err != nil {
+			// Migration is best-effort at startup; do not block fleet/device workers.
+			s.log.WithError(err).Error("failed to enqueue encryption migration on worker start; continuing")
+		}
+	}()
 	sigShutdown := make(chan os.Signal, 1)
 	signal.Notify(sigShutdown, os.Interrupt, syscall.SIGHUP, syscall.SIGTERM, syscall.SIGQUIT)
 	go func() {
 		<-sigShutdown
 		s.log.Println("Shutdown signal received")
+		cancelEnqueue()
+		enqueueWG.Wait()
 		s.queuesProvider.Stop()
 		kvStore.Close()
 	}()
 	s.queuesProvider.Wait()
+	cancelEnqueue()
+	enqueueWG.Wait()
 
 	return nil
 }

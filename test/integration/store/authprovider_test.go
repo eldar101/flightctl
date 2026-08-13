@@ -7,7 +7,10 @@ import (
 	api "github.com/flightctl/flightctl/api/core/v1beta1"
 	"github.com/flightctl/flightctl/internal/config"
 	"github.com/flightctl/flightctl/internal/flterrors"
+	"github.com/flightctl/flightctl/internal/instrumentation/encryption"
 	"github.com/flightctl/flightctl/internal/store"
+	authproviderstore "github.com/flightctl/flightctl/internal/store/authprovider"
+	organizationstore "github.com/flightctl/flightctl/internal/store/organization"
 	"github.com/flightctl/flightctl/internal/store/selector"
 	flightlog "github.com/flightctl/flightctl/pkg/log"
 	testutil "github.com/flightctl/flightctl/test/util"
@@ -22,16 +25,16 @@ import (
 
 var _ = Describe("AuthProviderStore", func() {
 	var (
-		log       *logrus.Logger
-		ctx       context.Context
-		orgId     uuid.UUID
-		storeInst store.Store
-		authStore store.AuthProvider
-		cfg       *config.Config
-		dbName    string
-		db        *gorm.DB
-		called    bool
-		callback  store.EventCallback
+		log               *logrus.Logger
+		ctx               context.Context
+		orgId             uuid.UUID
+		organizationStore organizationstore.Store
+		authStore         authproviderstore.Store
+		cfg               *config.Config
+		dbName            string
+		db                *gorm.DB
+		called            bool
+		callback          store.EventCallback
 	)
 
 	BeforeEach(func() {
@@ -40,20 +43,19 @@ var _ = Describe("AuthProviderStore", func() {
 		var err error
 		cfg, dbName, db, err = testdb.CreateTestDB(ctx, log, "", store.InitDB)
 		Expect(err).NotTo(HaveOccurred())
-		storeInst = store.NewStore(db, log.WithField("pkg", "store"))
-		authStore = storeInst.AuthProvider()
+		authStore = authproviderstore.NewAuthProviderStore(db, log.WithField("pkg", "authprovider-store"))
+		organizationStore = organizationstore.NewOrganizationStore(db)
 		called = false
 		callback = store.EventCallback(func(ctx context.Context, resourceKind api.ResourceKind, orgId uuid.UUID, name string, oldResource, newResource interface{}, created bool, err error) {
 			called = true
 		})
 
 		orgId = uuid.New()
-		err = testutil.CreateTestOrganization(ctx, storeInst, orgId)
+		err = testutil.CreateTestOrganization(ctx, organizationStore, orgId)
 		Expect(err).ToNot(HaveOccurred())
 	})
 
 	AfterEach(func() {
-		_ = storeInst.Close()
 		Expect(testdb.DeleteTestDB(ctx, log, cfg, db, dbName)).To(Succeed())
 	})
 
@@ -131,6 +133,24 @@ var _ = Describe("AuthProviderStore", func() {
 			Expect(err).ToNot(HaveOccurred())
 			Expect(result).ToNot(BeNil())
 			Expect(*result.Metadata.Name).To(Equal("get-test-provider"))
+		})
+
+		It("should store clientSecret encrypted at rest", func() {
+			provider := createTestAuthProvider("encrypted-provider")
+			_, err := authStore.Create(ctx, orgId, &provider, callback)
+			Expect(err).ToNot(HaveOccurred())
+
+			result, err := authStore.Get(ctx, orgId, "encrypted-provider")
+			Expect(err).ToNot(HaveOccurred())
+
+			oidcSpec, err := result.Spec.AsOIDCProviderSpec()
+			Expect(err).ToNot(HaveOccurred())
+			Expect(oidcSpec.ClientSecret).ToNot(Equal("test-client-secret"),
+				"clientSecret should not be stored as plaintext")
+			plaintext, wasEncrypted, err := encryption.Decrypt(ctx, encryption.Ciphertext(oidcSpec.ClientSecret))
+			Expect(err).ToNot(HaveOccurred())
+			Expect(wasEncrypted).To(BeTrue(), "clientSecret should be encrypted")
+			Expect(string(plaintext)).To(Equal("test-client-secret"))
 		})
 
 		It("GetAuthProvider - not found error", func() {
@@ -316,7 +336,7 @@ var _ = Describe("AuthProviderStore", func() {
 
 			// Create providers in another org
 			otherOrgId := uuid.New()
-			err := testutil.CreateTestOrganization(ctx, storeInst, otherOrgId)
+			err := testutil.CreateTestOrganization(ctx, organizationStore, otherOrgId)
 			Expect(err).ToNot(HaveOccurred())
 
 			for i := 0; i < 3; i++ {

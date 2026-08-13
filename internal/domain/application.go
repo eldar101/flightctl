@@ -12,13 +12,17 @@ type ContainerApplication = v1beta1.ContainerApplication
 type HelmApplication = v1beta1.HelmApplication
 type ImageApplicationProviderSpec = v1beta1.ImageApplicationProviderSpec
 type InlineApplicationProviderSpec = v1beta1.InlineApplicationProviderSpec
+type CatalogItemRefApplicationProviderSpec = v1beta1.CatalogItemRefApplicationProviderSpec
+type CatalogItemRefSpec = v1beta1.CatalogItemRefSpec
+type CatalogItemRefSource = v1beta1.CatalogItemRefSource
 
 // ApplicationProviderType discriminator type
 type ApplicationProviderType = v1beta1.ApplicationProviderType
 
 const (
-	ImageApplicationProviderType  = v1beta1.ImageApplicationProviderType
-	InlineApplicationProviderType = v1beta1.InlineApplicationProviderType
+	ImageApplicationProviderType          = v1beta1.ImageApplicationProviderType
+	InlineApplicationProviderType         = v1beta1.InlineApplicationProviderType
+	CatalogItemRefApplicationProviderType = v1beta1.CatalogItemRefApplicationProviderType
 )
 
 // ========== Application Content ==========
@@ -68,6 +72,8 @@ const (
 	ApplicationStatusPreparing = v1beta1.ApplicationStatusPreparing
 	ApplicationStatusRunning   = v1beta1.ApplicationStatusRunning
 	ApplicationStatusStarting  = v1beta1.ApplicationStatusStarting
+	ApplicationStatusStopped   = v1beta1.ApplicationStatusStopped
+	ApplicationStatusStopping  = v1beta1.ApplicationStatusStopping
 	ApplicationStatusUnknown   = v1beta1.ApplicationStatusUnknown
 )
 
@@ -88,6 +94,20 @@ const (
 	AppTypeContainer = v1beta1.AppTypeContainer
 	AppTypeHelm      = v1beta1.AppTypeHelm
 	AppTypeQuadlet   = v1beta1.AppTypeQuadlet
+	AppTypeVm        = v1beta1.AppTypeVm
+)
+
+// ========== VM Application Types ==========
+
+type VmApplication = v1beta1.VmApplication
+
+// ========== Application Lifecycle ==========
+
+type ApplicationDesiredState = v1beta1.ApplicationDesiredState
+
+const (
+	ApplicationDesiredStateRunning = v1beta1.ApplicationDesiredStateRunning
+	ApplicationDesiredStateStopped = v1beta1.ApplicationDesiredStateStopped
 )
 
 // ========== Image Pull Policy ==========

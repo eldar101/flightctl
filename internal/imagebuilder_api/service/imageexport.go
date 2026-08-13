@@ -11,7 +11,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 
 	"github.com/flightctl/flightctl/internal/config"
@@ -19,10 +18,12 @@ import (
 	"github.com/flightctl/flightctl/internal/flterrors"
 	"github.com/flightctl/flightctl/internal/imagebuilder_api/domain"
 	"github.com/flightctl/flightctl/internal/imagebuilder_api/store"
+	"github.com/flightctl/flightctl/internal/instrumentation/encryption"
 	"github.com/flightctl/flightctl/internal/kvstore"
-	internalservice "github.com/flightctl/flightctl/internal/service"
 	"github.com/flightctl/flightctl/internal/service/common"
+	"github.com/flightctl/flightctl/internal/service/events"
 	mainstore "github.com/flightctl/flightctl/internal/store"
+	repositorystore "github.com/flightctl/flightctl/internal/store/repository"
 	"github.com/flightctl/flightctl/internal/store/selector"
 	"github.com/flightctl/flightctl/internal/util"
 	"github.com/flightctl/flightctl/internal/util/validation"
@@ -86,8 +87,8 @@ type ImageExportDownload struct {
 type imageExportService struct {
 	imageExportStore store.ImageExportStore
 	imageBuildStore  store.ImageBuildStore
-	repositoryStore  mainstore.Repository
-	eventHandler     *internalservice.EventHandler
+	repositoryStore  repositorystore.Store
+	eventSvc         events.Service
 	queueProducer    queues.QueueProducer
 	kvStore          kvstore.KVStore
 	cfg              *config.ImageBuilderServiceConfig
@@ -95,12 +96,12 @@ type imageExportService struct {
 }
 
 // NewImageExportService creates a new ImageExportService
-func NewImageExportService(imageExportStore store.ImageExportStore, imageBuildStore store.ImageBuildStore, repositoryStore mainstore.Repository, eventHandler *internalservice.EventHandler, queueProducer queues.QueueProducer, kvStore kvstore.KVStore, cfg *config.ImageBuilderServiceConfig, log logrus.FieldLogger) ImageExportService {
+func NewImageExportService(imageExportStore store.ImageExportStore, imageBuildStore store.ImageBuildStore, repositoryStore repositorystore.Store, eventSvc events.Service, queueProducer queues.QueueProducer, kvStore kvstore.KVStore, cfg *config.ImageBuilderServiceConfig, log logrus.FieldLogger) ImageExportService {
 	return &imageExportService{
 		imageExportStore: imageExportStore,
 		imageBuildStore:  imageBuildStore,
 		repositoryStore:  repositoryStore,
-		eventHandler:     eventHandler,
+		eventSvc:         eventSvc,
 		queueProducer:    queueProducer,
 		kvStore:          kvStore,
 		cfg:              cfg,
@@ -146,10 +147,10 @@ func (s *imageExportService) Create(ctx context.Context, orgId uuid.UUID, imageE
 
 	// Create event separately (no transaction)
 	var event *coredomain.Event
-	if result != nil && s.eventHandler != nil {
+	if result != nil && s.eventSvc != nil {
 		event = common.GetResourceCreatedOrUpdatedSuccessEvent(ctx, true, coredomain.ResourceKind(string(domain.ResourceKindImageExport)), lo.FromPtr(result.Metadata.Name), nil, s.log, nil)
 		if event != nil {
-			s.eventHandler.CreateEvent(ctx, orgId, event)
+			s.eventSvc.CreateEvent(ctx, orgId, event)
 		}
 	}
 
@@ -374,7 +375,7 @@ func (s *imageExportService) UpdateStatus(ctx context.Context, orgId uuid.UUID, 
 
 	// Create event for status update
 	var event *coredomain.Event
-	if result != nil && result.Metadata.Name != nil && s.eventHandler != nil {
+	if result != nil && result.Metadata.Name != nil && s.eventSvc != nil {
 		// Create a simple status update event since status is not in UpdatedFields enum
 		event = coredomain.GetBaseEvent(
 			ctx,
@@ -385,7 +386,7 @@ func (s *imageExportService) UpdateStatus(ctx context.Context, orgId uuid.UUID, 
 			nil,
 		)
 		if event != nil {
-			s.eventHandler.CreateEvent(ctx, orgId, event)
+			s.eventSvc.CreateEvent(ctx, orgId, event)
 		}
 	}
 
@@ -470,7 +471,7 @@ func (s *imageExportService) Download(ctx context.Context, orgId uuid.UUID, name
 	}
 
 	// Setup repository reference and authentication
-	repoRef, scheme, registryHostname, err := s.setupRepositoryReference(ctx, &ociSpec, imageBuild.Spec.Destination.ImageName, log)
+	repoRef, redirectClient, scheme, registryHostname, err := s.setupRepositoryReference(ctx, &ociSpec, imageBuild.Spec.Destination.ImageName, log)
 	if err != nil {
 		return nil, err
 	}
@@ -507,27 +508,22 @@ func (s *imageExportService) Download(ctx context.Context, orgId uuid.UUID, name
 	blobURLStr := blobURL.String()
 	log.WithFields(logrus.Fields{"blobURL": blobURLStr, "layerDigest": layerDigestStr}).Debug("Constructed blob URL")
 
-	// Create HTTP client with TLS configuration
-	httpClient, err := s.createHTTPClient(&ociSpec)
-	if err != nil {
-		log.WithError(err).Error("Failed to create HTTP client")
-		return nil, fmt.Errorf("failed to create HTTP client: %w", err)
-	}
-
-	// Make GET request to fetch blob
+	// Make GET request to fetch blob. repoRef.Client is the oras auth.Client already
+	// configured with TLS and credentials; its Do() handles Basic/Bearer challenge-response
+	// transparently. CheckRedirect is set to ErrUseLastResponse so handleBlobResponse
+	// can follow presigned-URL redirects without forwarding registry auth headers.
+	// Hint the scope so auth.Client requests repository:pull in the Bearer token, matching
+	// how oras fetches blobs internally — registries that omit scope= from their challenge
+	// would otherwise issue an unscoped token that most registries reject.
+	blobCtx := auth.AppendRepositoryScope(ctx, repoRef.Reference, auth.ActionPull)
 	log.WithFields(logrus.Fields{"blobURL": blobURLStr, "method": "GET"}).Debug("Making GET request to fetch blob")
-	getReq, err := http.NewRequestWithContext(ctx, "GET", blobURLStr, nil)
+	getReq, err := http.NewRequestWithContext(blobCtx, "GET", blobURLStr, nil)
 	if err != nil {
 		log.WithError(err).WithField("blobURL", blobURLStr).Error("Failed to create GET request")
 		return nil, fmt.Errorf("failed to create GET request: %w", err)
 	}
 
-	// Add authentication if available
-	if err := s.addAuthenticationToRequest(ctx, getReq, httpClient, scheme, registryHostname, imageBuild.Spec.Destination.ImageName, &ociSpec, log); err != nil {
-		return nil, err
-	}
-
-	getResp, err := httpClient.Do(getReq)
+	getResp, err := repoRef.Client.Do(getReq)
 	if err != nil {
 		log.WithError(err).WithField("blobURL", blobURLStr).Error("Failed to make GET request to external service")
 		return nil, fmt.Errorf("%w: failed to make GET request: %w", ErrExternalServiceUnavailable, err)
@@ -535,7 +531,9 @@ func (s *imageExportService) Download(ctx context.Context, orgId uuid.UUID, name
 
 	log.WithFields(logrus.Fields{"blobURL": blobURLStr, "statusCode": getResp.StatusCode}).Debug("Received GET response")
 
-	download, err := s.handleBlobResponse(ctx, getResp, httpClient, blobURLStr, log)
+	// For redirect following (presigned URLs), use the plain http.Client — no auth
+	// headers should be forwarded to redirect targets (e.g. S3/GCS presigned URLs).
+	download, err := s.handleBlobResponse(ctx, getResp, redirectClient, blobURLStr, log)
 	if err != nil {
 		return nil, err
 	}
@@ -544,8 +542,10 @@ func (s *imageExportService) Download(ctx context.Context, orgId uuid.UUID, name
 	return download, nil
 }
 
-// setupRepositoryReference creates a repository reference and configures authentication
-func (s *imageExportService) setupRepositoryReference(ctx context.Context, ociSpec *coredomain.OciRepoSpec, imageName string, log logrus.FieldLogger) (*remote.Repository, string, string, error) {
+// setupRepositoryReference creates a repository reference and configures authentication.
+// It returns the oras repository, the inner plain http.Client (for redirect following),
+// the URL scheme, and the registry hostname.
+func (s *imageExportService) setupRepositoryReference(ctx context.Context, ociSpec *coredomain.OciRepoSpec, imageName string, log logrus.FieldLogger) (*remote.Repository, *http.Client, string, string, error) {
 	scheme := "https"
 	if ociSpec.Scheme != nil {
 		scheme = string(*ociSpec.Scheme)
@@ -561,7 +561,7 @@ func (s *imageExportService) setupRepositoryReference(ctx context.Context, ociSp
 	repoRef, err := remote.NewRepository(destRef)
 	if err != nil {
 		log.WithError(err).WithField("destRef", destRef).Error("Failed to create repository reference")
-		return nil, "", "", fmt.Errorf("failed to create repository reference: %w", err)
+		return nil, nil, "", "", fmt.Errorf("failed to create repository reference: %w", err)
 	}
 
 	// Configure auth client with TLS settings and credentials
@@ -569,18 +569,34 @@ func (s *imageExportService) setupRepositoryReference(ctx context.Context, ociSp
 
 	tlsConfig, err := createTLSConfig(ociSpec)
 	if err != nil {
-		return nil, "", "", fmt.Errorf("failed to create TLS config for repository: %w", err)
+		return nil, nil, "", "", fmt.Errorf("failed to create TLS config for repository: %w", err)
 	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.TLSClientConfig = tlsConfig
-	authClient.Client = &http.Client{Transport: transport}
+	// Stop at redirects: auth.Client.Do will see the 3xx and return it, so
+	// handleBlobResponse can follow presigned-URL redirects without forwarding
+	// registry auth headers to the redirect target (e.g. S3/GCS).
+	innerClient := &http.Client{
+		Transport: transport,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	authClient.Client = innerClient
 
 	if ociSpec.OciAuth != nil {
 		dockerAuth, err := ociSpec.OciAuth.AsDockerAuth()
 		if err == nil && dockerAuth.Username != "" && dockerAuth.Password != "" {
+			decryptedPassword, ok, decErr := encryption.Decrypt(ctx, encryption.Ciphertext(dockerAuth.Password))
+			if decErr != nil {
+				return nil, nil, "", "", fmt.Errorf("failed to decrypt OCI password: %w", decErr)
+			}
+			if !ok {
+				log.WithField("registryHostname", registryHostname).Warn("OCI registry password is stored as plaintext; expected an encrypted value")
+			}
 			authClient.Credential = auth.StaticCredential(registryHostname, auth.Credential{
 				Username: dockerAuth.Username,
-				Password: dockerAuth.Password,
+				Password: string(decryptedPassword),
 			})
 			log.WithFields(logrus.Fields{"registryHostname": registryHostname, "username": dockerAuth.Username}).Debug("Configured authentication for repository")
 		}
@@ -595,7 +611,7 @@ func (s *imageExportService) setupRepositoryReference(ctx context.Context, ociSp
 		log.Debug("Using PlainHTTP for HTTP registry")
 	}
 
-	return repoRef, scheme, registryHostname, nil
+	return repoRef, innerClient, scheme, registryHostname, nil
 }
 
 // fetchAndParseManifest fetches and parses the OCI manifest
@@ -672,51 +688,6 @@ func createTLSConfig(ociSpec *coredomain.OciRepoSpec) (*tls.Config, error) {
 		tlsConfig.RootCAs = rootCAs
 	}
 	return tlsConfig, nil
-}
-
-// createHTTPClient creates an HTTP client with TLS configuration
-func (s *imageExportService) createHTTPClient(ociSpec *coredomain.OciRepoSpec) (*http.Client, error) {
-	tlsConfig, err := createTLSConfig(ociSpec)
-	if err != nil {
-		return nil, fmt.Errorf("createHTTPClient: %w", err)
-	}
-
-	return &http.Client{
-		// No client-level timeout - we're streaming potentially large files (GB-sized)
-		// Connection timeouts are handled at the transport level
-		Transport: &http.Transport{
-			TLSClientConfig:       tlsConfig,
-			ResponseHeaderTimeout: 30 * time.Second, // Timeout for response headers only, not body
-		},
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}, nil
-}
-
-// addAuthenticationToRequest adds authentication headers to the request if needed
-func (s *imageExportService) addAuthenticationToRequest(ctx context.Context, req *http.Request, client *http.Client, scheme, registryHostname, repoName string, ociSpec *coredomain.OciRepoSpec, log logrus.FieldLogger) error {
-	if ociSpec.OciAuth == nil {
-		return nil
-	}
-
-	dockerAuth, err := ociSpec.OciAuth.AsDockerAuth()
-	if err != nil || dockerAuth.Username == "" || dockerAuth.Password == "" {
-		return nil
-	}
-
-	log.WithFields(logrus.Fields{"registryHostname": registryHostname, "repoName": repoName}).Debug("Getting registry token for authentication")
-	token, err := s.getRegistryToken(ctx, client, scheme, registryHostname, repoName, dockerAuth.Username, dockerAuth.Password)
-	if err != nil {
-		log.WithError(err).WithField("registryHostname", registryHostname).Error("Failed to get registry token from external service")
-		return fmt.Errorf("%w: failed to get registry token: %w", ErrExternalServiceUnavailable, err)
-	}
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-		log.WithField("hasToken", true).Debug("Added bearer token to GET request")
-	}
-
-	return nil
 }
 
 // handleBlobResponse handles the HTTP response from the blob endpoint
@@ -801,87 +772,6 @@ func (s *imageExportService) handleBlobResponse(ctx context.Context, resp *http.
 	return nil, fmt.Errorf("%w: unexpected status code from blob endpoint: %d", ErrExternalServiceUnavailable, resp.StatusCode)
 }
 
-// getRegistryToken gets a bearer token for registry authentication
-func (s *imageExportService) getRegistryToken(ctx context.Context, client *http.Client, scheme, registryHostname, repoName, username, password string) (string, error) {
-	// First, try to access /v2/ to get Www-Authenticate header
-	v2URL := fmt.Sprintf("%s://%s/v2/", scheme, registryHostname)
-	req, err := http.NewRequestWithContext(ctx, "GET", v2URL, nil)
-	if err != nil {
-		return "", fmt.Errorf("failed to create request: %w", err)
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("failed to connect to registry: %w", err)
-	}
-	defer resp.Body.Close()
-
-	// If already authenticated, return empty token (will use basic auth)
-	if resp.StatusCode == http.StatusOK {
-		return "", nil
-	}
-
-	// Parse Www-Authenticate header
-	wwwAuth := resp.Header.Get("Www-Authenticate")
-	if wwwAuth == "" {
-		return "", fmt.Errorf("missing Www-Authenticate header")
-	}
-
-	realm, service, err := parseWwwAuthenticate(wwwAuth)
-	if err != nil {
-		return "", fmt.Errorf("failed to parse Www-Authenticate header: %w", err)
-	}
-
-	// Get token from auth endpoint
-	authURL, err := url.Parse(realm)
-	if err != nil {
-		return "", fmt.Errorf("failed to parse auth realm URL: %w", err)
-	}
-
-	query := authURL.Query()
-	if service != "" {
-		query.Set("service", service)
-	}
-	// Set scope for the specific repository
-	scope := fmt.Sprintf("repository:%s:pull", repoName)
-	query.Set("scope", scope)
-	authURL.RawQuery = query.Encode()
-
-	tokenReq, err := http.NewRequestWithContext(ctx, "GET", authURL.String(), nil)
-	if err != nil {
-		return "", fmt.Errorf("failed to create token request: %w", err)
-	}
-
-	tokenReq.SetBasicAuth(username, password)
-
-	tokenResp, err := client.Do(tokenReq)
-	if err != nil {
-		return "", fmt.Errorf("%w: failed to get token: %w", ErrExternalServiceUnavailable, err)
-	}
-	defer tokenResp.Body.Close()
-
-	if tokenResp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("authentication failed: status %d", tokenResp.StatusCode)
-	}
-
-	var tokenData struct {
-		Token       string `json:"token"`
-		AccessToken string `json:"access_token"`
-	}
-	if err := json.NewDecoder(tokenResp.Body).Decode(&tokenData); err != nil {
-		return "", fmt.Errorf("failed to parse token response: %w", err)
-	}
-
-	if tokenData.Token != "" {
-		return tokenData.Token, nil
-	}
-	if tokenData.AccessToken != "" {
-		return tokenData.AccessToken, nil
-	}
-
-	return "", fmt.Errorf("empty token received")
-}
-
 // getDownloadFilename returns the suggested download filename based on the base name and export format
 func getDownloadFilename(baseName string, format domain.ExportFormatType) string {
 	ext := ".bin"
@@ -918,91 +808,6 @@ func validateImageExportForDownload(imageExport *domain.ImageExport) error {
 	}
 
 	return nil
-}
-
-// parseWwwAuthenticate parses the Www-Authenticate header to extract realm and service
-func parseWwwAuthenticate(header string) (realm, service string, err error) {
-	// Example: Bearer realm="https://quay.io/v2/auth",service="quay.io"
-	if !strings.HasPrefix(header, "Bearer ") {
-		return "", "", fmt.Errorf("unsupported authentication scheme")
-	}
-	header = strings.TrimPrefix(header, "Bearer ")
-
-	// Parse key="value" pairs, handling commas inside quoted strings
-	i := 0
-	for i < len(header) {
-		// Skip whitespace
-		for i < len(header) && (header[i] == ' ' || header[i] == '\t') {
-			i++
-		}
-		if i >= len(header) {
-			break
-		}
-
-		// Find the key (everything up to '=')
-		keyStart := i
-		for i < len(header) && header[i] != '=' {
-			i++
-		}
-		if i >= len(header) {
-			break
-		}
-		key := strings.TrimSpace(header[keyStart:i])
-		i++ // skip '='
-
-		// Skip whitespace after '='
-		for i < len(header) && (header[i] == ' ' || header[i] == '\t') {
-			i++
-		}
-		if i >= len(header) {
-			break
-		}
-
-		// Parse the value (quoted string)
-		if header[i] != '"' {
-			return "", "", fmt.Errorf("expected quoted value for key %q", key)
-		}
-		i++ // skip opening quote
-
-		// Extract value, handling escaped quotes
-		var value strings.Builder
-		for i < len(header) {
-			if header[i] == '\\' && i+1 < len(header) && header[i+1] == '"' {
-				// Escaped quote
-				value.WriteByte('"')
-				i += 2
-			} else if header[i] == '"' {
-				// End of quoted string
-				i++
-				break
-			} else {
-				value.WriteByte(header[i])
-				i++
-			}
-		}
-
-		// Store the value
-		parsedValue := value.String()
-		if key == "realm" {
-			realm = parsedValue
-		} else if key == "service" {
-			service = parsedValue
-		}
-
-		// Skip whitespace and comma separator
-		for i < len(header) && (header[i] == ' ' || header[i] == '\t') {
-			i++
-		}
-		if i < len(header) && header[i] == ',' {
-			i++ // skip comma
-		}
-	}
-
-	if realm == "" {
-		return "", "", fmt.Errorf("realm not found in Www-Authenticate header")
-	}
-
-	return realm, service, nil
 }
 
 // validate performs validation on an ImageExport resource

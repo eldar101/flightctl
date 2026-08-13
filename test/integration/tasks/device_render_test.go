@@ -3,16 +3,30 @@ package tasks_test
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"time"
 
+	v1alpha1 "github.com/flightctl/flightctl/api/core/v1alpha1"
 	api "github.com/flightctl/flightctl/api/core/v1beta1"
 	"github.com/flightctl/flightctl/internal/config"
-	"github.com/flightctl/flightctl/internal/consts"
 	"github.com/flightctl/flightctl/internal/kvstore"
 	"github.com/flightctl/flightctl/internal/rendered"
-	"github.com/flightctl/flightctl/internal/service"
+	catalogservice "github.com/flightctl/flightctl/internal/service/catalog"
+	dependencyrefservice "github.com/flightctl/flightctl/internal/service/dependencyref"
+	deviceservice "github.com/flightctl/flightctl/internal/service/device"
+	"github.com/flightctl/flightctl/internal/service/events"
+	fleetservice "github.com/flightctl/flightctl/internal/service/fleet"
+	repositoryservice "github.com/flightctl/flightctl/internal/service/repository"
+	templateversionservice "github.com/flightctl/flightctl/internal/service/templateversion"
 	"github.com/flightctl/flightctl/internal/store"
+	catalogstore "github.com/flightctl/flightctl/internal/store/catalog"
+	dependencyrefstore "github.com/flightctl/flightctl/internal/store/dependencyref"
+	devicestore "github.com/flightctl/flightctl/internal/store/device"
+	eventstore "github.com/flightctl/flightctl/internal/store/event"
+	fleetstore "github.com/flightctl/flightctl/internal/store/fleet"
 	"github.com/flightctl/flightctl/internal/store/model"
+	repositorystore "github.com/flightctl/flightctl/internal/store/repository"
+	templateversionstore "github.com/flightctl/flightctl/internal/store/templateversion"
 	"github.com/flightctl/flightctl/internal/tasks"
 	"github.com/flightctl/flightctl/internal/worker_client"
 	"github.com/flightctl/flightctl/pkg/k8sclient"
@@ -89,31 +103,34 @@ func (m *mockK8sClient) ListRoleBindingsForUser(ctx context.Context, namespace, 
 
 var _ = Describe("DeviceRender", func() {
 	var (
-		log               *logrus.Logger
-		ctx               context.Context
-		orgId             uuid.UUID
-		deviceStore       store.Device
-		fleetStore        store.Fleet
-		tvStore           store.TemplateVersion
-		repoStore         store.Repository
-		storeInst         store.Store
-		serviceHandler    service.Service
-		cfg               *config.Config
-		dbName            string
-		db                *gorm.DB
-		fleetName         string
-		deviceName        string
-		repoName          string
-		workerClient      worker_client.WorkerClient
-		mockQueueProducer *queues.MockQueueProducer
-		ctrl              *gomock.Controller
-		kvStoreInst       kvstore.KVStore
-		queuesProvider    queues.Provider
+		log                *logrus.Logger
+		ctx                context.Context
+		orgId              uuid.UUID
+		deviceStore        devicestore.Store
+		fleetStore         fleetstore.Store
+		tvStore            templateversionstore.Store
+		repoStore          repositorystore.Store
+		deviceSvc          deviceservice.Service
+		repositorySvc      repositoryservice.Service
+		catalogSvc         catalogservice.Service
+		fleetSvc           fleetservice.Service
+		templateVersionSvc templateversionservice.Service
+		dependencyrefSvc   dependencyrefservice.Service
+		cfg                *config.Config
+		dbName             string
+		db                 *gorm.DB
+		fleetName          string
+		deviceName         string
+		repoName           string
+		workerClient       worker_client.WorkerClient
+		mockQueueProducer  *queues.MockQueueProducer
+		ctrl               *gomock.Controller
+		kvStoreInst        kvstore.KVStore
+		queuesProvider     queues.Provider
 	)
 
 	BeforeEach(func() {
 		ctx = testutil.StartSpecTracerForGinkgo(suiteCtx)
-		ctx = context.WithValue(ctx, consts.InternalRequestCtxKey, true)
 		orgId = store.NullOrgId
 		log = flightlog.InitLogs()
 		fleetName = "myfleet"
@@ -122,18 +139,30 @@ var _ = Describe("DeviceRender", func() {
 		var err error
 		cfg, dbName, db, err = testdb.CreateTestDB(ctx, log, "", store.InitDB)
 		Expect(err).NotTo(HaveOccurred())
-		storeInst = store.NewStore(db, log.WithField("pkg", "store"))
-		deviceStore = storeInst.Device()
-		fleetStore = storeInst.Fleet()
-		tvStore = storeInst.TemplateVersion()
-		repoStore = storeInst.Repository()
+		deviceStore = devicestore.NewDeviceStore(db, log.WithField("pkg", "device-store"))
+		fleetStore = fleetstore.NewFleetStore(db, log.WithField("pkg", "fleet-store"))
+		tvStore = templateversionstore.NewTemplateVersionStore(db, log.WithField("pkg", "templateversion-store"))
+		repoStore = repositorystore.NewRepositoryStore(db, log.WithField("pkg", "repository-store"))
+		newDeviceStore := devicestore.NewDeviceStore(db, log.WithField("pkg", "device-store"))
+		newFleetStore := fleetstore.NewFleetStore(db, log.WithField("pkg", "fleet-store"))
+		newTvStore := templateversionstore.NewTemplateVersionStore(db, log.WithField("pkg", "templateversion-store"))
+		newRepoStore := repositorystore.NewRepositoryStore(db, log.WithField("pkg", "repository-store"))
+		newCatalogStore := catalogstore.NewCatalogStore(db, log.WithField("pkg", "catalog-store"))
+		dependencyrefStore := dependencyrefstore.NewDependencyRefStore(db, log.WithField("pkg", "dependencyref-store"))
+		eventStore := eventstore.NewEventStore(db, log.WithField("pkg", "event-store"))
 		ctrl = gomock.NewController(GinkgoT())
 		mockQueueProducer = queues.NewMockQueueProducer(ctrl)
 		mockQueueProducer.EXPECT().Enqueue(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
 		workerClient = worker_client.NewWorkerClient(mockQueueProducer, log)
 		kvStoreInst, err = kvstore.NewKVStore(ctx, log, redisHost, redisPort, redisPassword)
 		Expect(err).ToNot(HaveOccurred())
-		serviceHandler = service.NewServiceHandler(storeInst, workerClient, kvStoreInst, nil, log, "", "", []string{}, false)
+		eventsSvc := events.NewServiceHandler(eventStore, workerClient, log)
+		deviceSvc = deviceservice.NewDeviceServiceHandler(newDeviceStore, nil, newFleetStore, eventsSvc, kvStoreInst, "", log)
+		repositorySvc = repositoryservice.NewServiceHandler(newRepoStore, eventsSvc, log)
+		catalogSvc = catalogservice.NewServiceHandler(newCatalogStore, deviceStore, newFleetStore, eventsSvc, log)
+		fleetSvc = fleetservice.NewServiceHandler(newFleetStore, nil, eventsSvc, log)
+		templateVersionSvc = templateversionservice.NewServiceHandler(newTvStore, kvStoreInst, eventsSvc, log)
+		dependencyrefSvc = dependencyrefservice.NewServiceHandler(dependencyrefStore, log)
 
 		// Initialize queues provider and rendered.Bus for successful device rendering
 		// Only initialize once (singleton pattern), subsequent calls are no-ops
@@ -147,7 +176,6 @@ var _ = Describe("DeviceRender", func() {
 	})
 
 	AfterEach(func() {
-		_ = storeInst.Close()
 		Expect(testdb.DeleteTestDB(ctx, log, cfg, db, dbName)).To(Succeed())
 		ctrl.Finish()
 	})
@@ -183,7 +211,7 @@ var _ = Describe("DeviceRender", func() {
 					Reason:         api.EventReasonResourceUpdated,
 					InvolvedObject: api.ObjectReference{Kind: api.DeviceKind, Name: testDeviceName},
 				}
-				logic := tasks.NewDeviceRenderLogic(log, serviceHandler, mockK8s, kvStoreInst, nil, orgId, event)
+				logic := tasks.NewDeviceRenderLogic(log, deviceSvc, repositorySvc, nil, mockK8s, kvStoreInst, nil, orgId, event)
 				err = logic.RenderDevice(ctx)
 
 				// Should succeed - safe paths pass validation
@@ -218,7 +246,7 @@ var _ = Describe("DeviceRender", func() {
 					Reason:         api.EventReasonResourceUpdated,
 					InvolvedObject: api.ObjectReference{Kind: api.DeviceKind, Name: testDeviceName},
 				}
-				logic := tasks.NewDeviceRenderLogic(log, serviceHandler, mockK8s, kvStoreInst, nil, orgId, event)
+				logic := tasks.NewDeviceRenderLogic(log, deviceSvc, repositorySvc, nil, mockK8s, kvStoreInst, nil, orgId, event)
 				err = logic.RenderDevice(ctx)
 
 				// Should fail - derived paths under forbidden root are rejected
@@ -265,7 +293,7 @@ var _ = Describe("DeviceRender", func() {
 					Reason:         api.EventReasonResourceUpdated,
 					InvolvedObject: api.ObjectReference{Kind: api.DeviceKind, Name: testDeviceName},
 				}
-				logic := tasks.NewDeviceRenderLogic(log, serviceHandler, mockK8s, kvStoreInst, nil, orgId, event)
+				logic := tasks.NewDeviceRenderLogic(log, deviceSvc, repositorySvc, nil, mockK8s, kvStoreInst, nil, orgId, event)
 				err = logic.RenderDevice(ctx)
 
 				Expect(err).To(HaveOccurred())
@@ -354,7 +382,7 @@ var _ = Describe("DeviceRender", func() {
 					},
 				},
 			}
-			_, err = fleetStore.Create(ctx, orgId, fleet, nil)
+			_, err = fleetStore.Create(ctx, orgId, fleet)
 			Expect(err).ToNot(HaveOccurred())
 
 			// Create template version with the fleet spec
@@ -387,7 +415,7 @@ var _ = Describe("DeviceRender", func() {
 					Name: deviceName,
 				},
 			}
-			rolloutLogic := tasks.NewFleetRolloutsLogic(log, serviceHandler, orgId, event)
+			rolloutLogic := tasks.NewFleetRolloutsLogic(log, fleetSvc, templateVersionSvc, deviceSvc, dependencyrefSvc, orgId, event)
 			err = rolloutLogic.RolloutDevice(ctx)
 			Expect(err).ToNot(HaveOccurred())
 
@@ -406,7 +434,7 @@ var _ = Describe("DeviceRender", func() {
 				api.DeviceAnnotationTemplateVersion:         "1.0.0",
 				api.DeviceAnnotationRenderedTemplateVersion: "1.0.0",
 			}
-			status := serviceHandler.UpdateDeviceAnnotations(ctx, orgId, deviceName, annotations, nil)
+			status := deviceSvc.UpdateDeviceAnnotations(ctx, orgId, deviceName, annotations, nil)
 			Expect(status.Code).To(Equal(int32(200)))
 
 			// Now change the device label from "small" to "big"
@@ -418,7 +446,19 @@ var _ = Describe("DeviceRender", func() {
 				"device": "camera",
 				"size":   "big",
 			}
-			_, err = deviceStore.Update(ctx, orgId, device, nil, false, nil, nil)
+			_, _, _, err = deviceStore.Mutate(ctx, orgId, lo.FromPtr(device.Metadata.Name), nil, func(m *devicestore.DeviceMutation) error {
+				if err := m.RequireExisting(); err != nil {
+					return err
+				}
+				if device.Spec != nil {
+					m.Device.Spec = device.Spec
+				}
+				if device.Status != nil {
+					m.Device.Status = device.Status
+				}
+				store.ApplyObjectMetaUpdate(&m.Device.Metadata, &device.Metadata, nil)
+				return nil
+			})
 			Expect(err).ToNot(HaveOccurred())
 
 			// Trigger fleet rollout again to update device spec
@@ -494,7 +534,7 @@ var _ = Describe("DeviceRender", func() {
 					},
 				},
 			}
-			_, err = fleetStore.Create(ctx, orgId, fleet, nil)
+			_, err = fleetStore.Create(ctx, orgId, fleet)
 			Expect(err).ToNot(HaveOccurred())
 
 			// Create template version with the fleet spec
@@ -527,7 +567,7 @@ var _ = Describe("DeviceRender", func() {
 					Name: deviceName,
 				},
 			}
-			rolloutLogic := tasks.NewFleetRolloutsLogic(log, serviceHandler, orgId, event)
+			rolloutLogic := tasks.NewFleetRolloutsLogic(log, fleetSvc, templateVersionSvc, deviceSvc, dependencyrefSvc, orgId, event)
 			err = rolloutLogic.RolloutDevice(ctx)
 			Expect(err).ToNot(HaveOccurred())
 
@@ -536,7 +576,7 @@ var _ = Describe("DeviceRender", func() {
 				api.DeviceAnnotationTemplateVersion:         "1.0.0",
 				api.DeviceAnnotationRenderedTemplateVersion: "1.0.0",
 			}
-			status := serviceHandler.UpdateDeviceAnnotations(ctx, orgId, deviceName, annotations, nil)
+			status := deviceSvc.UpdateDeviceAnnotations(ctx, orgId, deviceName, annotations, nil)
 			Expect(status.Code).To(Equal(int32(200)))
 
 			// This test verifies the correct behavior: when template version and spec haven't changed,
@@ -585,7 +625,7 @@ var _ = Describe("DeviceRender", func() {
 				Reason:         api.EventReasonResourceUpdated,
 				InvolvedObject: api.ObjectReference{Kind: api.DeviceKind, Name: testDeviceName},
 			}
-			logic := tasks.NewDeviceRenderLogic(log, serviceHandler, &mockK8sClient{}, kvStoreInst, nil, orgId, event)
+			logic := tasks.NewDeviceRenderLogic(log, deviceSvc, repositorySvc, nil, &mockK8sClient{}, kvStoreInst, nil, orgId, event)
 			err = logic.RenderDevice(ctx)
 			Expect(err).ToNot(HaveOccurred())
 
@@ -627,7 +667,7 @@ var _ = Describe("DeviceRender", func() {
 				Reason:         api.EventReasonResourceUpdated,
 				InvolvedObject: api.ObjectReference{Kind: api.DeviceKind, Name: testDeviceName},
 			}
-			logic := tasks.NewDeviceRenderLogic(log, serviceHandler, &mockK8sClient{}, kvStoreInst, nil, orgId, event)
+			logic := tasks.NewDeviceRenderLogic(log, deviceSvc, repositorySvc, nil, &mockK8sClient{}, kvStoreInst, nil, orgId, event)
 			err = logic.RenderDevice(ctx)
 			Expect(err).ToNot(HaveOccurred())
 
@@ -673,7 +713,7 @@ var _ = Describe("DeviceRender", func() {
 				Reason:         api.EventReasonResourceUpdated,
 				InvolvedObject: api.ObjectReference{Kind: api.DeviceKind, Name: testDeviceName},
 			}
-			logic := tasks.NewDeviceRenderLogic(log, serviceHandler, &mockK8sClient{}, kvStoreInst, nil, orgId, event)
+			logic := tasks.NewDeviceRenderLogic(log, deviceSvc, repositorySvc, nil, &mockK8sClient{}, kvStoreInst, nil, orgId, event)
 			err = logic.RenderDevice(ctx)
 			Expect(err).ToNot(HaveOccurred())
 
@@ -713,7 +753,7 @@ var _ = Describe("DeviceRender", func() {
 				Reason:         api.EventReasonResourceUpdated,
 				InvolvedObject: api.ObjectReference{Kind: api.DeviceKind, Name: testDeviceName},
 			}
-			logic := tasks.NewDeviceRenderLogic(log, serviceHandler, &failingK8sClient{}, kvStoreInst, nil, orgId, event)
+			logic := tasks.NewDeviceRenderLogic(log, deviceSvc, repositorySvc, nil, &failingK8sClient{}, kvStoreInst, nil, orgId, event)
 			err = logic.RenderDevice(ctx)
 			Expect(err).To(HaveOccurred())
 
@@ -723,6 +763,317 @@ var _ = Describe("DeviceRender", func() {
 			if device.Status.DependencySync != nil && device.Status.DependencySync.ConfigRefs != nil {
 				Expect(len(*device.Status.DependencySync.ConfigRefs)).To(Equal(0))
 			}
+		})
+	})
+
+	Context("catalog item ref resolution", func() {
+		const (
+			catalogName = "test-catalog"
+			osItemName  = "rhel-edge"
+			appItemName = "my-container-app"
+			osVersion   = "9.4.0"
+			appVersion  = "2.0.0"
+			osUri       = "quay.io/redhat/rhel-edge"
+			appUri      = "quay.io/myorg/myapp"
+			osTag       = "v9.4.0"
+			appTag      = "v2.0.0"
+		)
+
+		createCatalogWithItems := func() {
+			catalog := v1alpha1.Catalog{
+				Metadata: api.ObjectMeta{
+					Name: lo.ToPtr(catalogName),
+				},
+				Spec: v1alpha1.CatalogSpec{
+					DisplayName: lo.ToPtr("Test Catalog"),
+				},
+			}
+			_, status := catalogSvc.CreateCatalog(ctx, orgId, catalog)
+			Expect(status.Code).To(BeEquivalentTo(201))
+
+			osItem := v1alpha1.CatalogItem{
+				Metadata: v1alpha1.CatalogItemMeta{
+					Name: lo.ToPtr(osItemName),
+				},
+				Spec: v1alpha1.CatalogItemSpec{
+					DisplayName: lo.ToPtr("RHEL Edge"),
+					Category:    lo.ToPtr(v1alpha1.CatalogItemCategorySystem),
+					Type:        v1alpha1.CatalogItemTypeOS,
+					Artifacts: []v1alpha1.CatalogItemArtifact{
+						{Type: v1alpha1.CatalogItemArtifactTypeContainer, Uri: osUri},
+					},
+					Versions: []v1alpha1.CatalogItemVersion{
+						{
+							Version:    osVersion,
+							References: map[v1alpha1.CatalogItemArtifactType]string{v1alpha1.CatalogItemArtifactTypeContainer: osTag},
+							Channels:   []string{"stable"},
+						},
+					},
+				},
+			}
+			_, status = catalogSvc.CreateCatalogItem(ctx, orgId, catalogName, osItem)
+			Expect(status.Code).To(BeEquivalentTo(201))
+
+			appItem := v1alpha1.CatalogItem{
+				Metadata: v1alpha1.CatalogItemMeta{
+					Name: lo.ToPtr(appItemName),
+				},
+				Spec: v1alpha1.CatalogItemSpec{
+					DisplayName: lo.ToPtr("My Container App"),
+					Category:    lo.ToPtr(v1alpha1.CatalogItemCategoryApplication),
+					Type:        v1alpha1.CatalogItemTypeContainer,
+					Artifacts: []v1alpha1.CatalogItemArtifact{
+						{Type: v1alpha1.CatalogItemArtifactTypeContainer, Uri: appUri},
+					},
+					Versions: []v1alpha1.CatalogItemVersion{
+						{
+							Version:    appVersion,
+							References: map[v1alpha1.CatalogItemArtifactType]string{v1alpha1.CatalogItemArtifactTypeContainer: appTag},
+							Channels:   []string{"stable"},
+						},
+					},
+				},
+			}
+			_, status = catalogSvc.CreateCatalogItem(ctx, orgId, catalogName, appItem)
+			Expect(status.Code).To(BeEquivalentTo(http.StatusCreated))
+		}
+
+		It("When a device OS spec has a catalog item ref it should resolve to the correct image", func() {
+			createCatalogWithItems()
+
+			testDeviceName := deviceName + "-os-catalog-ref-" + uuid.New().String()[:8]
+			device := &api.Device{
+				Metadata: api.ObjectMeta{Name: lo.ToPtr(testDeviceName)},
+				Spec: &api.DeviceSpec{
+					Os: &api.DeviceOsSpec{
+						CatalogItemRef: &api.CatalogItemRefSpec{
+							Catalog: catalogName,
+							Item:    osItemName,
+							Version: osVersion,
+						},
+					},
+				},
+			}
+			_, err := deviceStore.Create(ctx, orgId, device, nil)
+			Expect(err).ToNot(HaveOccurred())
+			defer func() { _, _ = deviceStore.Delete(ctx, orgId, testDeviceName, nil) }()
+
+			event := api.Event{
+				Reason:         api.EventReasonResourceUpdated,
+				InvolvedObject: api.ObjectReference{Kind: api.DeviceKind, Name: testDeviceName},
+			}
+			logic := tasks.NewDeviceRenderLogic(log, deviceSvc, repositorySvc, catalogSvc, &mockK8sClient{}, kvStoreInst, nil, orgId, event)
+			err = logic.RenderDevice(ctx)
+			Expect(err).ToNot(HaveOccurred())
+
+			rendered, err := deviceStore.GetRendered(ctx, orgId, testDeviceName, nil, "")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(rendered.Spec).ToNot(BeNil())
+			Expect(rendered.Spec.Os).ToNot(BeNil())
+			Expect(rendered.Spec.Os.Image).To(Equal(osUri + ":" + osTag))
+		})
+
+		It("When a device has a container application with a catalog item ref it should resolve to the correct image", func() {
+			createCatalogWithItems()
+
+			containerApp := api.ContainerApplication{
+				AppType: api.AppTypeContainer,
+				Name:    lo.ToPtr("catalog-app"),
+			}
+			err := containerApp.FromCatalogItemRefApplicationProviderSpec(api.CatalogItemRefApplicationProviderSpec{
+				CatalogItemRef: api.CatalogItemRefSpec{
+					Catalog: catalogName,
+					Item:    appItemName,
+					Version: appVersion,
+				},
+			})
+			Expect(err).ToNot(HaveOccurred())
+
+			var appSpec api.ApplicationProviderSpec
+			err = appSpec.FromContainerApplication(containerApp)
+			Expect(err).ToNot(HaveOccurred())
+
+			testDeviceName := deviceName + "-app-catalog-ref-" + uuid.New().String()[:8]
+			device := &api.Device{
+				Metadata: api.ObjectMeta{Name: lo.ToPtr(testDeviceName)},
+				Spec: &api.DeviceSpec{
+					Applications: &[]api.ApplicationProviderSpec{appSpec},
+				},
+			}
+			_, err = deviceStore.Create(ctx, orgId, device, nil)
+			Expect(err).ToNot(HaveOccurred())
+			defer func() { _, _ = deviceStore.Delete(ctx, orgId, testDeviceName, nil) }()
+
+			event := api.Event{
+				Reason:         api.EventReasonResourceUpdated,
+				InvolvedObject: api.ObjectReference{Kind: api.DeviceKind, Name: testDeviceName},
+			}
+			logic := tasks.NewDeviceRenderLogic(log, deviceSvc, repositorySvc, catalogSvc, &mockK8sClient{}, kvStoreInst, nil, orgId, event)
+			err = logic.RenderDevice(ctx)
+			Expect(err).ToNot(HaveOccurred())
+
+			rendered, err := deviceStore.GetRendered(ctx, orgId, testDeviceName, nil, "")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(rendered.Spec).ToNot(BeNil())
+			Expect(rendered.Spec.Applications).ToNot(BeNil())
+			Expect(*rendered.Spec.Applications).To(HaveLen(1))
+
+			renderedApp := (*rendered.Spec.Applications)[0]
+			container, err := renderedApp.AsContainerApplication()
+			Expect(err).ToNot(HaveOccurred())
+			imageSpec, err := container.AsImageApplicationProviderSpec()
+			Expect(err).ToNot(HaveOccurred())
+			Expect(imageSpec.Image).To(Equal(appUri + ":" + appTag))
+		})
+
+		It("When a device has both OS and app catalog item refs it should resolve both", func() {
+			createCatalogWithItems()
+
+			containerApp := api.ContainerApplication{
+				AppType: api.AppTypeContainer,
+				Name:    lo.ToPtr("catalog-app"),
+			}
+			err := containerApp.FromCatalogItemRefApplicationProviderSpec(api.CatalogItemRefApplicationProviderSpec{
+				CatalogItemRef: api.CatalogItemRefSpec{
+					Catalog: catalogName,
+					Item:    appItemName,
+					Version: appVersion,
+				},
+			})
+			Expect(err).ToNot(HaveOccurred())
+			var appSpec api.ApplicationProviderSpec
+			err = appSpec.FromContainerApplication(containerApp)
+			Expect(err).ToNot(HaveOccurred())
+
+			testDeviceName := deviceName + "-both-catalog-ref-" + uuid.New().String()[:8]
+			device := &api.Device{
+				Metadata: api.ObjectMeta{Name: lo.ToPtr(testDeviceName)},
+				Spec: &api.DeviceSpec{
+					Os: &api.DeviceOsSpec{
+						CatalogItemRef: &api.CatalogItemRefSpec{
+							Catalog: catalogName,
+							Item:    osItemName,
+							Version: osVersion,
+						},
+					},
+					Applications: &[]api.ApplicationProviderSpec{appSpec},
+				},
+			}
+			_, err = deviceStore.Create(ctx, orgId, device, nil)
+			Expect(err).ToNot(HaveOccurred())
+			defer func() { _, _ = deviceStore.Delete(ctx, orgId, testDeviceName, nil) }()
+
+			event := api.Event{
+				Reason:         api.EventReasonResourceUpdated,
+				InvolvedObject: api.ObjectReference{Kind: api.DeviceKind, Name: testDeviceName},
+			}
+			logic := tasks.NewDeviceRenderLogic(log, deviceSvc, repositorySvc, catalogSvc, &mockK8sClient{}, kvStoreInst, nil, orgId, event)
+			err = logic.RenderDevice(ctx)
+			Expect(err).ToNot(HaveOccurred())
+
+			rendered, err := deviceStore.GetRendered(ctx, orgId, testDeviceName, nil, "")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(rendered.Spec).ToNot(BeNil())
+
+			Expect(rendered.Spec.Os).ToNot(BeNil())
+			Expect(rendered.Spec.Os.Image).To(Equal(osUri + ":" + osTag))
+
+			Expect(rendered.Spec.Applications).ToNot(BeNil())
+			Expect(*rendered.Spec.Applications).To(HaveLen(1))
+			renderedApp := (*rendered.Spec.Applications)[0]
+			container, err := renderedApp.AsContainerApplication()
+			Expect(err).ToNot(HaveOccurred())
+			imageSpec, err := container.AsImageApplicationProviderSpec()
+			Expect(err).ToNot(HaveOccurred())
+			Expect(imageSpec.Image).To(Equal(appUri + ":" + appTag))
+		})
+
+		It("When a catalog item ref references a nonexistent catalog it should fail rendering", func() {
+			testDeviceName := deviceName + "-bad-catalog-" + uuid.New().String()[:8]
+			device := &api.Device{
+				Metadata: api.ObjectMeta{Name: lo.ToPtr(testDeviceName)},
+				Spec: &api.DeviceSpec{
+					Os: &api.DeviceOsSpec{
+						CatalogItemRef: &api.CatalogItemRefSpec{
+							Catalog: "nonexistent-catalog",
+							Item:    "some-item",
+							Version: "1.0.0",
+						},
+					},
+				},
+			}
+			_, err := deviceStore.Create(ctx, orgId, device, nil)
+			Expect(err).ToNot(HaveOccurred())
+			defer func() { _, _ = deviceStore.Delete(ctx, orgId, testDeviceName, nil) }()
+
+			event := api.Event{
+				Reason:         api.EventReasonResourceUpdated,
+				InvolvedObject: api.ObjectReference{Kind: api.DeviceKind, Name: testDeviceName},
+			}
+			logic := tasks.NewDeviceRenderLogic(log, deviceSvc, repositorySvc, catalogSvc, &mockK8sClient{}, kvStoreInst, nil, orgId, event)
+			err = logic.RenderDevice(ctx)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("invalid catalog item reference"))
+		})
+
+		It("When a catalog item ref has a wrong type it should fail rendering", func() {
+			createCatalogWithItems()
+
+			testDeviceName := deviceName + "-wrong-type-" + uuid.New().String()[:8]
+			device := &api.Device{
+				Metadata: api.ObjectMeta{Name: lo.ToPtr(testDeviceName)},
+				Spec: &api.DeviceSpec{
+					Os: &api.DeviceOsSpec{
+						CatalogItemRef: &api.CatalogItemRefSpec{
+							Catalog: catalogName,
+							Item:    appItemName, // container type, not OS
+							Version: appVersion,
+						},
+					},
+				},
+			}
+			_, err := deviceStore.Create(ctx, orgId, device, nil)
+			Expect(err).ToNot(HaveOccurred())
+			defer func() { _, _ = deviceStore.Delete(ctx, orgId, testDeviceName, nil) }()
+
+			event := api.Event{
+				Reason:         api.EventReasonResourceUpdated,
+				InvolvedObject: api.ObjectReference{Kind: api.DeviceKind, Name: testDeviceName},
+			}
+			logic := tasks.NewDeviceRenderLogic(log, deviceSvc, repositorySvc, catalogSvc, &mockK8sClient{}, kvStoreInst, nil, orgId, event)
+			err = logic.RenderDevice(ctx)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("cannot use catalog item of type"))
+		})
+
+		It("When a catalog item ref has an unknown version it should fail rendering", func() {
+			createCatalogWithItems()
+
+			testDeviceName := deviceName + "-unknown-ver-" + uuid.New().String()[:8]
+			device := &api.Device{
+				Metadata: api.ObjectMeta{Name: lo.ToPtr(testDeviceName)},
+				Spec: &api.DeviceSpec{
+					Os: &api.DeviceOsSpec{
+						CatalogItemRef: &api.CatalogItemRefSpec{
+							Catalog: catalogName,
+							Item:    osItemName,
+							Version: "99.0.0",
+						},
+					},
+				},
+			}
+			_, err := deviceStore.Create(ctx, orgId, device, nil)
+			Expect(err).ToNot(HaveOccurred())
+			defer func() { _, _ = deviceStore.Delete(ctx, orgId, testDeviceName, nil) }()
+
+			event := api.Event{
+				Reason:         api.EventReasonResourceUpdated,
+				InvolvedObject: api.ObjectReference{Kind: api.DeviceKind, Name: testDeviceName},
+			}
+			logic := tasks.NewDeviceRenderLogic(log, deviceSvc, repositorySvc, catalogSvc, &mockK8sClient{}, kvStoreInst, nil, orgId, event)
+			err = logic.RenderDevice(ctx)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("unknown version 99.0.0"))
 		})
 	})
 
@@ -753,7 +1104,7 @@ var _ = Describe("DeviceRender", func() {
 					},
 				},
 			}
-			_, err = fleetStore.Create(ctx, orgId, fleet, nil)
+			_, err = fleetStore.Create(ctx, orgId, fleet)
 			Expect(err).ToNot(HaveOccurred())
 
 			tvStatus := api.TemplateVersionStatus{Config: &[]api.ConfigProviderSpec{configProvider}}
@@ -782,10 +1133,10 @@ var _ = Describe("DeviceRender", func() {
 			annotations := map[string]string{
 				api.DeviceAnnotationTemplateVersion: "v1",
 			}
-			status := serviceHandler.UpdateDeviceAnnotations(ctx, orgId, testDeviceName, annotations, nil)
+			status := deviceSvc.UpdateDeviceAnnotations(ctx, orgId, testDeviceName, annotations, nil)
 			Expect(status.Code).To(Equal(int32(200)))
 
-			logic := tasks.NewDeviceRenderLogic(log, serviceHandler, &mockK8sClient{}, kvStoreInst, nil, orgId, firstEvent)
+			logic := tasks.NewDeviceRenderLogic(log, deviceSvc, repositorySvc, nil, &mockK8sClient{}, kvStoreInst, nil, orgId, firstEvent)
 			err = logic.RenderDevice(ctx)
 			Expect(err).ToNot(HaveOccurred())
 
@@ -807,7 +1158,7 @@ var _ = Describe("DeviceRender", func() {
 			annotations = map[string]string{
 				api.DeviceAnnotationTemplateVersion: "v1-abc12345",
 			}
-			status = serviceHandler.UpdateDeviceAnnotations(ctx, orgId, testDeviceName, annotations, nil)
+			status = deviceSvc.UpdateDeviceAnnotations(ctx, orgId, testDeviceName, annotations, nil)
 			Expect(status.Code).To(Equal(int32(200)))
 
 			// Second render: FleetRolloutDeviceSelected — previously skipped because
@@ -817,7 +1168,7 @@ var _ = Describe("DeviceRender", func() {
 				Reason:         api.EventReasonFleetRolloutDeviceSelected,
 				InvolvedObject: api.ObjectReference{Kind: api.DeviceKind, Name: testDeviceName},
 			}
-			logic = tasks.NewDeviceRenderLogic(log, serviceHandler, &mockK8sClient{}, kvStoreInst, nil, orgId, secondEvent)
+			logic = tasks.NewDeviceRenderLogic(log, deviceSvc, repositorySvc, nil, &mockK8sClient{}, kvStoreInst, nil, orgId, secondEvent)
 			err = logic.RenderDevice(ctx)
 			Expect(err).ToNot(HaveOccurred())
 
@@ -841,6 +1192,88 @@ var _ = Describe("DeviceRender", func() {
 			Expect(ref.ConfigProviderName).To(Equal("fleet-secret"))
 			Expect(ref.Fingerprint).ToNot(BeNil())
 			Expect(*ref.Fingerprint).To(Equal("42"))
+		})
+
+		// Companion to the re-render case above: after a successful render,
+		// templateVersion == renderedTemplateVersion. A redundant
+		// FleetRolloutDeviceSelected (as the disruption-budget reconciler emits
+		// on every tick for mid-rollout devices) must be a no-op — otherwise
+		// forceUpdate bumps renderedVersion for unchanged content and wakes the
+		// agent into a phantom update cycle.
+		It("When a fleet-owned device receives redundant FleetRolloutDeviceSelected after catching up it should not re-render", func() {
+			k8sConfig := &api.KubernetesSecretProviderSpec{Name: "fleet-secret"}
+			k8sConfig.SecretRef.Name = "my-secret"
+			k8sConfig.SecretRef.Namespace = "default"
+			k8sConfig.SecretRef.MountPath = "/etc/secrets"
+
+			configProvider := api.ConfigProviderSpec{}
+			err := configProvider.FromKubernetesSecretProviderSpec(*k8sConfig)
+			Expect(err).ToNot(HaveOccurred())
+
+			fleet := &api.Fleet{
+				Metadata: api.ObjectMeta{Name: lo.ToPtr(fleetName)},
+				Spec: api.FleetSpec{
+					Selector: &api.LabelSelector{MatchLabels: &map[string]string{"fleet": fleetName}},
+					Template: struct {
+						Metadata *api.ObjectMeta `json:"metadata,omitempty"`
+						Spec     api.DeviceSpec  `json:"spec"`
+					}{
+						Spec: api.DeviceSpec{Config: &[]api.ConfigProviderSpec{configProvider}},
+					},
+				},
+			}
+			_, err = fleetStore.Create(ctx, orgId, fleet)
+			Expect(err).ToNot(HaveOccurred())
+
+			tvStatus := api.TemplateVersionStatus{Config: &[]api.ConfigProviderSpec{configProvider}}
+			err = testutil.CreateTestTemplateVersion(ctx, tvStore, orgId, fleetName, "v1", &tvStatus)
+			Expect(err).ToNot(HaveOccurred())
+
+			testDeviceName := deviceName + "-fleet-rollout-skip-" + uuid.New().String()[:8]
+			device := &api.Device{
+				Metadata: api.ObjectMeta{
+					Name:  lo.ToPtr(testDeviceName),
+					Owner: lo.ToPtr("Fleet/" + fleetName),
+				},
+				Spec: &api.DeviceSpec{Config: &[]api.ConfigProviderSpec{configProvider}},
+			}
+			_, err = deviceStore.Create(ctx, orgId, device, nil)
+			Expect(err).ToNot(HaveOccurred())
+			defer func() { _, _ = deviceStore.Delete(ctx, orgId, testDeviceName, nil) }()
+
+			annotations := map[string]string{
+				api.DeviceAnnotationTemplateVersion: "v1",
+			}
+			status := deviceSvc.UpdateDeviceAnnotations(ctx, orgId, testDeviceName, annotations, nil)
+			Expect(status.Code).To(Equal(int32(200)))
+
+			firstEvent := api.Event{
+				Reason:         api.EventReasonResourceCreated,
+				InvolvedObject: api.ObjectReference{Kind: api.DeviceKind, Name: testDeviceName},
+			}
+			logic := tasks.NewDeviceRenderLogic(log, deviceSvc, repositorySvc, nil, &mockK8sClient{}, kvStoreInst, nil, orgId, firstEvent)
+			err = logic.RenderDevice(ctx)
+			Expect(err).ToNot(HaveOccurred())
+
+			device, err = deviceStore.Get(ctx, orgId, testDeviceName)
+			Expect(err).ToNot(HaveOccurred())
+			Expect((*device.Metadata.Annotations)[api.DeviceAnnotationRenderedVersion]).To(Equal("1"))
+			Expect((*device.Metadata.Annotations)[api.DeviceAnnotationRenderedTemplateVersion]).To(Equal("v1"))
+			Expect((*device.Metadata.Annotations)[api.DeviceAnnotationTemplateVersion]).To(Equal("v1"))
+
+			// Redundant selection: templateVersion already equals renderedTemplateVersion.
+			redundantEvent := api.Event{
+				Reason:         api.EventReasonFleetRolloutDeviceSelected,
+				InvolvedObject: api.ObjectReference{Kind: api.DeviceKind, Name: testDeviceName},
+			}
+			logic = tasks.NewDeviceRenderLogic(log, deviceSvc, repositorySvc, nil, &mockK8sClient{}, kvStoreInst, nil, orgId, redundantEvent)
+			err = logic.RenderDevice(ctx)
+			Expect(err).ToNot(HaveOccurred())
+
+			device, err = deviceStore.Get(ctx, orgId, testDeviceName)
+			Expect(err).ToNot(HaveOccurred())
+			Expect((*device.Metadata.Annotations)[api.DeviceAnnotationRenderedVersion]).To(Equal("1"),
+				"redundant FleetRolloutDeviceSelected must not bump renderedVersion when already caught up")
 		})
 	})
 })

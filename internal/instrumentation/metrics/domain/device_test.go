@@ -8,94 +8,16 @@ import (
 	"github.com/flightctl/flightctl/internal/config"
 	"github.com/flightctl/flightctl/internal/domain"
 	"github.com/flightctl/flightctl/internal/store"
+	devicestore "github.com/flightctl/flightctl/internal/store/device"
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 )
 
-// MockStore implements store.Store for testing
-type MockStore struct {
-	results []store.CountByOrgAndStatusResult
-}
-
-func (m *MockStore) Device() store.Device {
-	return &MockDevice{
-		results: m.results,
-	}
-}
-
-func (m *MockStore) EnrollmentRequest() store.EnrollmentRequest {
-	return nil
-}
-
-func (m *MockStore) CertificateSigningRequest() store.CertificateSigningRequest {
-	return nil
-}
-
-func (m *MockStore) Fleet() store.Fleet {
-	return nil
-}
-
-func (m *MockStore) TemplateVersion() store.TemplateVersion {
-	return nil
-}
-
-func (m *MockStore) Repository() store.Repository {
-	return nil
-}
-
-func (m *MockStore) ResourceSync() store.ResourceSync {
-	return nil
-}
-
-func (m *MockStore) Event() store.Event {
-	return nil
-}
-
-func (m *MockStore) Checkpoint() store.Checkpoint {
-	return nil
-}
-
-func (m *MockStore) Organization() store.Organization {
-	return nil
-}
-
-func (m *MockStore) AuthProvider() store.AuthProvider {
-	return nil
-}
-
-func (m *MockStore) Catalog() store.Catalog {
-	return nil
-}
-
-func (m *MockStore) VulnerabilityFinding() store.VulnerabilityFinding {
-	return nil
-}
-
-func (m *MockStore) SyncState() store.SyncState {
-	return nil
-}
-
-func (m *MockStore) DependencyRef() store.DependencyRef {
-	return nil
-}
-
-func (m *MockStore) RunMigrations(context.Context) error {
-	return nil
-}
-
-func (m *MockStore) Close() error {
-	return nil
-}
-
-func (m *MockStore) CheckHealth(context.Context) error {
-	return nil
-}
-
-// MockDevice implements store.Device for testing
+// MockDevice implements devicestore.Store for testing
 type MockDevice struct {
-	results []store.CountByOrgAndStatusResult
+	results []devicestore.CountByOrgAndStatusResult
 }
 
 func (m *MockDevice) GetWithTimestamp(ctx context.Context, orgId uuid.UUID, name string) (*domain.Device, error) {
@@ -114,25 +36,28 @@ func (m *MockDevice) Healthcheck(ctx context.Context, orgId uuid.UUID, names []s
 	return nil
 }
 
-func (m *MockDevice) CountByOrgAndStatus(ctx context.Context, orgId *uuid.UUID, statusType store.DeviceStatusType, groupByFleet bool) ([]store.CountByOrgAndStatusResult, error) {
+func (m *MockDevice) CountByOrgAndStatus(ctx context.Context, orgId *uuid.UUID, statusType devicestore.DeviceStatusType, groupByFleet bool) ([]devicestore.CountByOrgAndStatusResult, error) {
 	return m.results, nil
 }
 
 // Implement other required methods with empty implementations
 func (m *MockDevice) InitialMigration(ctx context.Context) error { return nil }
-func (m *MockDevice) Create(ctx context.Context, orgId uuid.UUID, device *domain.Device, callback store.EventCallback) (*domain.Device, error) {
+func (m *MockDevice) Create(ctx context.Context, orgId uuid.UUID, device *domain.Device, rendered *devicestore.DeviceRendered) (*domain.Device, error) {
 	return nil, nil
 }
-func (m *MockDevice) Update(ctx context.Context, orgId uuid.UUID, device *domain.Device, fieldsToUnset []string, fromAPI bool, validationCallback store.DeviceStoreValidationCallback, callback store.EventCallback) (*domain.Device, error) {
-	return nil, nil
+func (m *MockDevice) Mutate(ctx context.Context, orgId uuid.UUID, name string, previous *domain.Device, apply devicestore.DeviceApplyFunc, _ ...devicestore.MutateOption) (*domain.Device, *domain.Device, bool, error) {
+	return nil, nil, false, nil
 }
-func (m *MockDevice) CreateOrUpdate(ctx context.Context, orgId uuid.UUID, device *domain.Device, fieldsToUnset []string, fromAPI bool, validationCallback store.DeviceStoreValidationCallback, callback store.EventCallback) (*domain.Device, bool, error) {
-	return nil, false, nil
+func (m *MockDevice) UpdateStatus(ctx context.Context, orgId uuid.UUID, device *domain.Device, previous *domain.Device) (*domain.Device, *domain.Device, error) {
+	return nil, nil, nil
+}
+func (m *MockDevice) UpdateAnnotations(ctx context.Context, orgId uuid.UUID, name string, annotations map[string]string, deleteKeys []string) error {
+	return nil
 }
 func (m *MockDevice) Get(ctx context.Context, orgId uuid.UUID, name string) (*domain.Device, error) {
 	return nil, nil
 }
-func (m *MockDevice) List(ctx context.Context, orgId uuid.UUID, listParams store.DeviceListParams) (*domain.DeviceList, error) {
+func (m *MockDevice) List(ctx context.Context, orgId uuid.UUID, listParams devicestore.DeviceListParams) (*domain.DeviceList, error) {
 	return nil, nil
 }
 func (m *MockDevice) Count(ctx context.Context, orgId uuid.UUID, listParams store.ListParams) (int64, error) {
@@ -147,19 +72,10 @@ func (m *MockDevice) Labels(ctx context.Context, orgId uuid.UUID, listParams sto
 func (m *MockDevice) Delete(ctx context.Context, orgId uuid.UUID, name string, callback store.EventCallback) (bool, error) {
 	return true, nil
 }
-func (m *MockDevice) UpdateStatus(ctx context.Context, orgId uuid.UUID, device *domain.Device, callbackEvent store.EventCallback) (*domain.Device, error) {
-	return nil, nil
-}
 func (m *MockDevice) GetRendered(ctx context.Context, orgId uuid.UUID, name string, knownRenderedVersion *string, consoleGrpcEndpoint string) (*domain.Device, error) {
 	return nil, nil
 }
-func (m *MockDevice) UpdateAnnotations(ctx context.Context, orgId uuid.UUID, name string, annotations map[string]string, deleteKeys []string) error {
-	return nil
-}
-func (m *MockDevice) UpdateRendered(ctx context.Context, orgId uuid.UUID, name, renderedConfig, renderedApplications, specHash string, configFingerprints []domain.DependencySyncConfigRefStatus) (string, error) {
-	return "", nil
-}
-func (m *MockDevice) SetServiceConditions(ctx context.Context, orgId uuid.UUID, name string, conditions []domain.Condition, callback store.ServiceConditionsCallback) error {
+func (m *MockDevice) SetServiceConditions(ctx context.Context, orgId uuid.UUID, name string, conditions []domain.Condition, callback devicestore.ServiceConditionsCallback) error {
 	return nil
 }
 func (m *MockDevice) OverwriteRepositoryRefs(ctx context.Context, orgId uuid.UUID, name string, repositoryNames ...string) error {
@@ -203,16 +119,28 @@ func (m *MockDevice) DecommissionDevice(ctx context.Context, orgId uuid.UUID, na
 	return nil, nil
 }
 
+func (m *MockDevice) ListDevicesByOsCatalogItemRef(ctx context.Context, orgId uuid.UUID, catalog string, item string, listParams store.ListParams) (*domain.DeviceList, error) {
+	return nil, nil
+}
+
+func (m *MockDevice) ListDevicesByAppCatalogItemRef(ctx context.Context, orgId uuid.UUID, catalog string, item string, listParams store.ListParams) (*domain.DeviceList, error) {
+	return nil, nil
+}
+
+func (m *MockDevice) ListDevicesByVolumeCatalogItemRef(ctx context.Context, orgId uuid.UUID, catalog string, item string, listParams store.ListParams) (*domain.DeviceList, error) {
+	return nil, nil
+}
+
 func TestDeviceCollectorWithGroupByFleet(t *testing.T) {
 	// Provide mock SQL results for org/status aggregation
-	mockResults := []store.CountByOrgAndStatusResult{
+	mockResults := []devicestore.CountByOrgAndStatusResult{
 		{OrgID: "org1", Fleet: "fleet1", Status: "Online", Count: 3},
 		{OrgID: "org1", Fleet: "fleet1", Status: "Unknown", Count: 3},
 		{OrgID: "org2", Fleet: "fleet2", Status: "Online", Count: 3},
 		{OrgID: "org2", Fleet: "fleet2", Status: "Unknown", Count: 1},
 	}
 
-	mockStore := &MockStore{results: mockResults}
+	mockDevice := &MockDevice{results: mockResults}
 	log := logrus.New()
 	log.SetLevel(logrus.DebugLevel)
 
@@ -223,7 +151,7 @@ func TestDeviceCollectorWithGroupByFleet(t *testing.T) {
 	// Create collector with 1ms interval for fast testing
 	config := config.NewDefault()
 	config.Metrics.DeviceCollector.GroupByFleet = true
-	collector := NewDeviceCollector(ctx, mockStore, log, config)
+	collector := NewDeviceCollector(ctx, mockDevice, log, config)
 
 	// Wait a bit for the collector to start and collect metrics
 	time.Sleep(10 * time.Millisecond)
@@ -253,14 +181,14 @@ func TestDeviceCollectorWithGroupByFleet(t *testing.T) {
 }
 func TestDeviceCollectorWithoutGroupByFleet(t *testing.T) {
 	// Provide mock SQL results for org/status aggregation
-	mockResults := []store.CountByOrgAndStatusResult{
+	mockResults := []devicestore.CountByOrgAndStatusResult{
 		{OrgID: "org1", Status: "Online", Count: 3},
 		{OrgID: "org1", Status: "Unknown", Count: 3},
 		{OrgID: "org2", Status: "Online", Count: 3},
 		{OrgID: "org2", Status: "Unknown", Count: 1},
 	}
 
-	mockStore := &MockStore{results: mockResults}
+	mockDevice := &MockDevice{results: mockResults}
 	log := logrus.New()
 	log.SetLevel(logrus.DebugLevel)
 
@@ -271,7 +199,7 @@ func TestDeviceCollectorWithoutGroupByFleet(t *testing.T) {
 	// Create collector with 1ms interval for fast testing
 	config := config.NewDefault()
 	config.Metrics.DeviceCollector.GroupByFleet = false
-	collector := NewDeviceCollector(ctx, mockStore, log, config)
+	collector := NewDeviceCollector(ctx, mockDevice, log, config)
 
 	// Wait a bit for the collector to start and collect metrics
 	time.Sleep(10 * time.Millisecond)
@@ -306,7 +234,7 @@ func TestDeviceCollectorWithOrgFilter(t *testing.T) {
 
 	// Test that org filtering works correctly
 	mockDevice := &MockDevice{
-		results: []store.CountByOrgAndStatusResult{
+		results: []devicestore.CountByOrgAndStatusResult{
 			{OrgID: "org1", Status: "Online", Count: 2},
 			{OrgID: "org1", Status: "Unknown", Count: 1},
 		},
@@ -314,7 +242,7 @@ func TestDeviceCollectorWithOrgFilter(t *testing.T) {
 
 	// Test with specific org filter
 	orgId := uuid.New()
-	results, err := mockDevice.CountByOrgAndStatus(ctx, &orgId, store.DeviceStatusTypeSummary, false)
+	results, err := mockDevice.CountByOrgAndStatus(ctx, &orgId, devicestore.DeviceStatusTypeSummary, false)
 	assert.NoError(t, err)
 	assert.Len(t, results, 2)
 
@@ -324,14 +252,14 @@ func TestDeviceCollectorWithOrgFilter(t *testing.T) {
 	}
 
 	// Test with nil org (no filter)
-	results, err = mockDevice.CountByOrgAndStatus(ctx, nil, store.DeviceStatusTypeSummary, false)
+	results, err = mockDevice.CountByOrgAndStatus(ctx, nil, devicestore.DeviceStatusTypeSummary, false)
 	assert.NoError(t, err)
 	assert.Len(t, results, 2)
 }
 
 func TestDeviceCollectorWithEmptyResults(t *testing.T) {
 	// Test the new behavior where empty results emit a default metric
-	mockStore := &MockStore{results: []store.CountByOrgAndStatusResult{}} // Empty results
+	mockDevice := &MockDevice{results: []devicestore.CountByOrgAndStatusResult{}} // Empty results
 	log := logrus.New()
 	log.SetLevel(logrus.DebugLevel)
 
@@ -342,7 +270,7 @@ func TestDeviceCollectorWithEmptyResults(t *testing.T) {
 	// Create collector
 	config := config.NewDefault()
 	config.Metrics.DeviceCollector.GroupByFleet = true
-	collector := NewDeviceCollector(ctx, mockStore, log, config)
+	collector := NewDeviceCollector(ctx, mockDevice, log, config)
 
 	// Wait a bit for the collector to start and collect metrics
 	time.Sleep(10 * time.Millisecond)
@@ -369,7 +297,7 @@ func TestDeviceCollectorWithEmptyResults(t *testing.T) {
 
 func TestDeviceCollectorUpdateDeviceMetricsWithEmptyResults(t *testing.T) {
 	// Test the updateDeviceMetrics method directly with empty results
-	mockStore := &MockStore{results: []store.CountByOrgAndStatusResult{}} // Empty results
+	mockDevice := &MockDevice{results: []devicestore.CountByOrgAndStatusResult{}} // Empty results
 	log := logrus.New()
 	log.SetLevel(logrus.DebugLevel)
 
@@ -380,7 +308,7 @@ func TestDeviceCollectorUpdateDeviceMetricsWithEmptyResults(t *testing.T) {
 	// Create collector
 	config := config.NewDefault()
 	config.Metrics.DeviceCollector.GroupByFleet = true
-	collector := NewDeviceCollector(ctx, mockStore, log, config)
+	collector := NewDeviceCollector(ctx, mockDevice, log, config)
 
 	// Call updateDeviceMetrics directly
 	collector.updateDeviceMetrics()

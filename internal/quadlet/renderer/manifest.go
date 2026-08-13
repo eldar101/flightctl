@@ -75,6 +75,10 @@ func servicesManifest(config *RendererConfig) []InstallAction {
 		{Action: ActionCopyFile, Source: "deploy/podman/flightctl-imagebuilder-worker/flightctl-imagebuilder-worker.container", Destination: filepath.Join(config.QuadletFilesOutputDir, "flightctl-imagebuilder-worker.container"), Template: true, Mode: RegularFileMode},
 		{Action: ActionCopyDir, Source: "deploy/podman/flightctl-imagebuilder-worker/flightctl-imagebuilder-worker-config/", Destination: filepath.Join(config.ReadOnlyConfigOutputDir, "flightctl-imagebuilder-worker/"), Template: false, Mode: RegularFileMode},
 
+		// Remote Access service
+		{Action: ActionCopyFile, Source: "deploy/podman/flightctl-remote-access/flightctl-remote-access.container", Destination: filepath.Join(config.QuadletFilesOutputDir, "flightctl-remote-access.container"), Template: true, Mode: RegularFileMode},
+		{Action: ActionCopyDir, Source: "deploy/podman/flightctl-remote-access/flightctl-remote-access-config/", Destination: filepath.Join(config.ReadOnlyConfigOutputDir, "flightctl-remote-access/"), Template: false, Mode: RegularFileMode},
+
 		// Telemetry Gateway service
 		{Action: ActionCopyFile, Source: "deploy/podman/flightctl-telemetry-gateway/flightctl-telemetry-gateway.container", Destination: filepath.Join(config.QuadletFilesOutputDir, "flightctl-telemetry-gateway.container"), Template: true, Mode: RegularFileMode},
 		{Action: ActionCopyDir, Source: "deploy/podman/flightctl-telemetry-gateway/flightctl-telemetry-gateway-config/", Destination: filepath.Join(config.ReadOnlyConfigOutputDir, "flightctl-telemetry-gateway/"), Template: false, Mode: RegularFileMode},
@@ -98,10 +102,12 @@ func servicesManifest(config *RendererConfig) []InstallAction {
 		// Certs init service
 		{Action: ActionCopyFile, Source: "deploy/podman/flightctl-certs-init.service", Destination: filepath.Join(config.SystemdUnitOutputDir, "flightctl-certs-init.service"), Template: false, Mode: RegularFileMode},
 		{Action: ActionCopyFile, Source: "deploy/helm/flightctl/scripts/generate-certificates.sh", Destination: filepath.Join(config.ReadOnlyConfigOutputDir, "generate-certificates.sh"), Template: false, Mode: ExecutableFileMode},
+		{Action: ActionCopyFile, Source: "deploy/helm/flightctl/scripts/generate-encryption-key.sh", Destination: filepath.Join(config.ReadOnlyConfigOutputDir, "generate-encryption-key.sh"), Template: false, Mode: ExecutableFileMode},
 
 		// Shared files
 		{Action: ActionCopyFile, Source: "deploy/podman/flightctl.network", Destination: filepath.Join(config.QuadletFilesOutputDir, "flightctl.network"), Template: false, Mode: RegularFileMode},
 		{Action: ActionCopyFile, Source: "deploy/podman/flightctl.target", Destination: filepath.Join(config.SystemdUnitOutputDir, "flightctl.target"), Template: false, Mode: RegularFileMode},
+		{Action: ActionCopyFile, Source: "deploy/podman/flightctl-listeners.volume", Destination: filepath.Join(config.QuadletFilesOutputDir, "flightctl-listeners.volume"), Template: false, Mode: RegularFileMode},
 		{Action: ActionCopyFile, Source: "deploy/podman/flightctl-observability.target", Destination: filepath.Join(config.SystemdUnitOutputDir, "flightctl-observability.target"), Template: false, Mode: RegularFileMode},
 		{Action: ActionCopyFile, Source: "deploy/podman/service-config.yaml", Destination: filepath.Join(config.WriteableConfigOutputDir, "service-config.yaml"), Template: false, Mode: RegularFileMode},
 
@@ -120,6 +126,7 @@ func servicesManifest(config *RendererConfig) []InstallAction {
 		{Action: ActionCreateEmptyFile, Destination: filepath.Join(config.WriteableConfigOutputDir, "ssh", "known_hosts"), Mode: RegularFileMode},
 
 		// Empty directories
+		{Action: ActionCreateEmptyDir, Destination: filepath.Join(config.WriteableConfigOutputDir, "encryption"), Mode: ExecutableFileMode},
 		{Action: ActionCreateEmptyDir, Destination: filepath.Join(config.WriteableConfigOutputDir, "pki"), Mode: ExecutableFileMode},
 		{Action: ActionCreateEmptyDir, Destination: filepath.Join(config.WriteableConfigOutputDir, "pki", "flightctl-api"), Mode: ExecutableFileMode},
 		{Action: ActionCreateEmptyDir, Destination: filepath.Join(config.WriteableConfigOutputDir, "pki", "flightctl-alertmanager-proxy"), Mode: ExecutableFileMode},
@@ -143,6 +150,8 @@ func servicesManifest(config *RendererConfig) []InstallAction {
 		{Action: ActionCreateEmptyDir, Destination: filepath.Join(config.WriteableConfigOutputDir, "flightctl-db-migrate"), Mode: ExecutableFileMode},
 		{Action: ActionCreateEmptyDir, Destination: filepath.Join(config.WriteableConfigOutputDir, "flightctl-imagebuilder-api"), Mode: ExecutableFileMode},
 		{Action: ActionCreateEmptyDir, Destination: filepath.Join(config.WriteableConfigOutputDir, "flightctl-imagebuilder-worker"), Mode: ExecutableFileMode},
+		{Action: ActionCreateEmptyDir, Destination: filepath.Join(config.WriteableConfigOutputDir, "flightctl-remote-access"), Mode: ExecutableFileMode},
+		{Action: ActionCreateEmptyDir, Destination: filepath.Join(config.WriteableConfigOutputDir, "pki", "flightctl-remote-access"), Mode: ExecutableFileMode},
 		{Action: ActionCreateEmptyDir, Destination: filepath.Join(config.VarTmpOutputDir, "flightctl-builds"), Mode: ExecutableFileMode},
 		{Action: ActionCreateEmptyDir, Destination: filepath.Join(config.VarTmpOutputDir, "flightctl-exports"), Mode: ExecutableFileMode},
 		{Action: ActionCreateEmptyDir, Destination: filepath.Join(config.WriteableConfigOutputDir, "flightctl-telemetry-gateway"), Mode: ExecutableFileMode},

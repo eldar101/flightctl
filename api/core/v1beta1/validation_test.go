@@ -11,6 +11,7 @@ import (
 	"github.com/flightctl/flightctl/internal/identity"
 	"github.com/robfig/cron/v3"
 	"github.com/samber/lo"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -417,6 +418,138 @@ func TestValidateParametersInString(t *testing.T) {
 		{
 			name:           "using if",
 			paramString:    "{{if .metadata.name }} Resource Name: {{ .metadata.name }} {{ else }} Resource Name is not set. {{ end }}",
+			containsParams: true,
+			expectError:    0,
+		},
+		{
+			name:           "using else if",
+			paramString:    `{{if eq .metadata.name "prod"}}production{{else if eq .metadata.name "dev"}}development{{else}}unknown{{end}}`,
+			containsParams: true,
+			expectError:    0,
+		},
+		{
+			name:           "using with",
+			paramString:    `{{with .metadata.name}}Name: {{.}}{{else}}no name{{end}}`,
+			containsParams: true,
+			expectError:    0,
+		},
+		{
+			name:           "nested if",
+			paramString:    `{{if .metadata.name}}{{if eq .metadata.name "prod"}}production{{end}}{{end}}`,
+			containsParams: true,
+			expectError:    0,
+		},
+		{
+			name:           "if with comparison",
+			paramString:    `{{if ne .metadata.name ""}}{{.metadata.name}}{{end}}`,
+			containsParams: true,
+			expectError:    0,
+		},
+		{
+			name:           "range inside if is rejected",
+			paramString:    `{{if .metadata.name}}{{range $k, $v := .metadata.labels}}{{$k}}={{$v}}{{end}}{{end}}`,
+			containsParams: true,
+			expectError:    1,
+		},
+		{
+			name:           "range inside with is rejected",
+			paramString:    `{{with .metadata.labels}}{{range $k, $v := .}}{{$k}}={{$v}}{{end}}{{end}}`,
+			containsParams: true,
+			expectError:    1,
+		},
+		{
+			name:           "range inside else branch is rejected",
+			paramString:    `{{if .metadata.name}}ok{{else}}{{range $k, $v := .metadata.labels}}{{$k}}={{$v}}{{end}}{{end}}`,
+			containsParams: true,
+			expectError:    1,
+		},
+		{
+			name:           "invalid field access in else branch is rejected",
+			paramString:    `{{if .metadata.name}}ok{{else}}{{.metadata.annotations.key}}{{end}}`,
+			containsParams: true,
+			expectError:    1,
+		},
+		{
+			name:           "invalid field access in label-gated branch is rejected",
+			paramString:    `{{if .metadata.labels.env}}{{.metadata.annotations.key}}{{end}}`,
+			containsParams: true,
+			expectError:    1,
+		},
+		{
+			name:           "invalid field access in with body is rejected",
+			paramString:    `{{with .metadata.labels.region}}{{.metadata.annotations}}{{end}}`,
+			containsParams: true,
+			expectError:    1,
+		},
+		{
+			name:           "root field without dollar in with body is rejected",
+			paramString:    `{{with .metadata.labels.region}}{{.metadata.name}}{{end}}`,
+			containsParams: true,
+			expectError:    1,
+		},
+		{
+			name:           "else if with label comparisons",
+			paramString:    `{{if eq .metadata.labels.env "prod"}}production{{else if eq .metadata.labels.env "staging"}}staging{{else}}development{{end}}`,
+			containsParams: true,
+			expectError:    0,
+		},
+		{
+			name:           "dollar-rooted invalid field access is rejected",
+			paramString:    `{{$.metadata.annotations.key}}`,
+			containsParams: true,
+			expectError:    1,
+		},
+		{
+			name:           "dollar-rooted invalid field inside with body is rejected",
+			paramString:    `{{with .metadata.labels.region}}{{$.metadata.annotations.key}}{{end}}`,
+			containsParams: true,
+			expectError:    1,
+		},
+		{
+			name:           "dollar-rooted valid field access",
+			paramString:    `{{with .metadata.labels.region}}region={{.}} name={{$.metadata.name}}{{end}}`,
+			containsParams: true,
+			expectError:    0,
+		},
+		{
+			name:           "chained field access is rejected",
+			paramString:    `{{with .metadata.labels.region}}{{(index $ "metadata").annotations.key}}{{end}}`,
+			containsParams: true,
+			expectError:    1,
+		},
+		{
+			name:           "with else branch preserves root context",
+			paramString:    `{{with .metadata.labels.region}}{{.}}{{else}}{{.metadata.name}}{{end}}`,
+			containsParams: true,
+			expectError:    0,
+		},
+		{
+			name:           "if inside with body using dollar",
+			paramString:    `{{with .metadata.labels.region}}{{if $.metadata.name}}{{.}}{{end}}{{end}}`,
+			containsParams: true,
+			expectError:    0,
+		},
+		{
+			name:           "valid dot access in with body",
+			paramString:    `{{with .metadata.labels.region}}Region: {{.}}{{end}}`,
+			containsParams: true,
+			expectError:    0,
+		},
+		{
+			name:           "getOrDefault in conditional",
+			paramString:    `{{if getOrDefault .metadata.labels "env" ""}}yes{{end}}`,
+			containsParams: true,
+			expectError:    0,
+		},
+		{
+			name:           "index in conditional",
+			paramString:    `{{if index .metadata.labels "my-key"}}yes{{end}}`,
+			containsParams: true,
+			expectError:    0,
+		},
+		{
+			name:           "excessive nesting depth is rejected",
+			paramString:    `{{if .metadata.name}}{{if .metadata.name}}{{if .metadata.name}}{{if .metadata.name}}{{if .metadata.name}}{{if .metadata.name}}{{if .metadata.name}}{{if .metadata.name}}{{if .metadata.name}}{{if .metadata.name}}{{if .metadata.name}}deep{{end}}{{end}}{{end}}{{end}}{{end}}{{end}}{{end}}{{end}}{{end}}{{end}}{{end}}`,
 			containsParams: true,
 			expectError:    1,
 		},
@@ -1111,21 +1244,21 @@ func TestValidateApplications(t *testing.T) {
 			apps: []ApplicationProviderSpec{
 				newTestApplicationWithPortsAndResources(require, "app1", "quay.io/app/image:1", []string{"8080"}, nil),
 			},
-			wantErrs: []string{"must be in format 'portnumber:portnumber'"},
+			wantErrs: []string{"must be in format 'portnumber:portnumber[/protocol]'"},
 		},
 		{
 			name: "container app with invalid port format - not numbers",
 			apps: []ApplicationProviderSpec{
 				newTestApplicationWithPortsAndResources(require, "app1", "quay.io/app/image:1", []string{"abc:def"}, nil),
 			},
-			wantErrs: []string{"must be in format 'portnumber:portnumber'"},
+			wantErrs: []string{"must be in format 'portnumber:portnumber[/protocol]'"},
 		},
 		{
 			name: "container app with invalid port format - too many colons",
 			apps: []ApplicationProviderSpec{
 				newTestApplicationWithPortsAndResources(require, "app1", "quay.io/app/image:1", []string{"8080:80:90"}, nil),
 			},
-			wantErrs: []string{"must be in format 'portnumber:portnumber'"},
+			wantErrs: []string{"must be in format 'portnumber:portnumber[/protocol]'"},
 		},
 		{
 			name: "container app with valid CPU formats",
@@ -1210,6 +1343,89 @@ func TestValidateApplications(t *testing.T) {
 			},
 			wantErrs: []string{"must be in format 'number[unit]' where unit is b, k, m, or g"},
 		},
+		{
+			name: "container app with client-supplied desiredState is rejected",
+			apps: []ApplicationProviderSpec{
+				newTestContainerAppWithLifecycle(require, "app1", lo.ToPtr(ApplicationDesiredStateStopped), nil),
+			},
+			wantErrs: []string{"spec.applications[app1].desiredState is read-only"},
+		},
+		{
+			name: "container app with client-supplied restartGeneration is rejected",
+			apps: []ApplicationProviderSpec{
+				newTestContainerAppWithLifecycle(require, "app1", nil, lo.ToPtr(1)),
+			},
+			wantErrs: []string{"spec.applications[app1].restartGeneration is read-only"},
+		},
+		{
+			name: "container app with both client-supplied lifecycle fields is rejected for both",
+			apps: []ApplicationProviderSpec{
+				newTestContainerAppWithLifecycle(require, "app1", lo.ToPtr(ApplicationDesiredStateStopped), lo.ToPtr(1)),
+			},
+			wantErrs: []string{"spec.applications[app1].desiredState is read-only", "spec.applications[app1].restartGeneration is read-only"},
+		},
+		{
+			name: "container app without lifecycle fields is valid",
+			apps: []ApplicationProviderSpec{
+				newTestContainerAppWithLifecycle(require, "app1", nil, nil),
+			},
+		},
+		{
+			name: "helm app with client-supplied desiredState is rejected",
+			apps: []ApplicationProviderSpec{
+				newTestHelmAppWithLifecycle(require, "app1", lo.ToPtr(ApplicationDesiredStateStopped), nil),
+			},
+			wantErrs: []string{"spec.applications[app1].desiredState is read-only"},
+		},
+		{
+			name: "helm app with client-supplied restartGeneration is rejected",
+			apps: []ApplicationProviderSpec{
+				newTestHelmAppWithLifecycle(require, "app1", nil, lo.ToPtr(1)),
+			},
+			wantErrs: []string{"spec.applications[app1].restartGeneration is read-only"},
+		},
+		{
+			name: "compose app with client-supplied desiredState is rejected",
+			apps: []ApplicationProviderSpec{
+				newTestComposeAppWithLifecycle(require, "app1", lo.ToPtr(ApplicationDesiredStateStopped), nil),
+			},
+			wantErrs: []string{"spec.applications[app1].desiredState is read-only"},
+		},
+		{
+			name: "compose app with client-supplied restartGeneration is rejected",
+			apps: []ApplicationProviderSpec{
+				newTestComposeAppWithLifecycle(require, "app1", nil, lo.ToPtr(1)),
+			},
+			wantErrs: []string{"spec.applications[app1].restartGeneration is read-only"},
+		},
+		{
+			name: "quadlet app with client-supplied desiredState is rejected",
+			apps: []ApplicationProviderSpec{
+				newTestQuadletAppWithLifecycle(require, "app1", lo.ToPtr(ApplicationDesiredStateStopped), nil),
+			},
+			wantErrs: []string{"spec.applications[app1].desiredState is read-only"},
+		},
+		{
+			name: "quadlet app with client-supplied restartGeneration is rejected",
+			apps: []ApplicationProviderSpec{
+				newTestQuadletAppWithLifecycle(require, "app1", nil, lo.ToPtr(1)),
+			},
+			wantErrs: []string{"spec.applications[app1].restartGeneration is read-only"},
+		},
+		{
+			name: "vm app with client-supplied desiredState is rejected",
+			apps: []ApplicationProviderSpec{
+				newTestVmAppWithLifecycle(require, "app1", lo.ToPtr(ApplicationDesiredStateStopped), nil),
+			},
+			wantErrs: []string{"spec.applications[app1].desiredState is read-only"},
+		},
+		{
+			name: "vm app with client-supplied restartGeneration is rejected",
+			apps: []ApplicationProviderSpec{
+				newTestVmAppWithLifecycle(require, "app1", nil, lo.ToPtr(1)),
+			},
+			wantErrs: []string{"spec.applications[app1].restartGeneration is read-only"},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1265,12 +1481,15 @@ func newTestApplicationWithVolume(require *require.Assertions, name string, appT
 
 	switch appType {
 	case AppTypeContainer:
+		imageSpec := ImageApplicationProviderSpec{
+			Image: appImage,
+		}
 		containerApp := ContainerApplication{
 			Name:    lo.ToPtr(name),
 			AppType: appType,
-			Image:   appImage,
 			Volumes: &volumes,
 		}
+		require.NoError(containerApp.FromImageApplicationProviderSpec(imageSpec))
 		require.NoError(app.FromContainerApplication(containerApp))
 	case AppTypeCompose:
 		imageSpec := ImageApplicationProviderSpec{
@@ -1309,13 +1528,16 @@ func newTestApplicationWithPortsAndResources(require *require.Assertions, name s
 		appPorts = &ports
 	}
 
+	imageSpec := ImageApplicationProviderSpec{
+		Image: appImage,
+	}
 	containerApp := ContainerApplication{
 		Name:      lo.ToPtr(name),
 		AppType:   AppTypeContainer,
-		Image:     appImage,
 		Ports:     appPorts,
 		Resources: resources,
 	}
+	require.NoError(containerApp.FromImageApplicationProviderSpec(imageSpec))
 	require.NoError(app.FromContainerApplication(containerApp))
 
 	return app
@@ -1454,6 +1676,105 @@ func TestValidateVolumeReclaimPolicy(t *testing.T) {
 		require.Len(errs, 1)
 		require.Contains(errs[0].Error(), "reclaimPolicy")
 	})
+}
+
+func TestValidateVolumeCatalogItemRef(t *testing.T) {
+	tests := []struct {
+		name        string
+		appType     AppType
+		volume      func(t *testing.T) ApplicationVolume
+		expectErr   bool
+		errorSubstr string
+	}{
+		{
+			name:    "When image volume has catalog item ref it should be valid",
+			appType: AppTypeCompose,
+			volume: func(t *testing.T) ApplicationVolume {
+				return createCatalogRefImageVolume(t, "vol1", "my-catalog", "my-item", "1.0.0")
+			},
+			expectErr: false,
+		},
+		{
+			name:    "When image-mount volume has catalog item ref it should be valid",
+			appType: AppTypeContainer,
+			volume: func(t *testing.T) ApplicationVolume {
+				return createCatalogRefImageMountVolume(t, "vol1", "my-catalog", "my-item", "1.0.0", "/data:ro")
+			},
+			expectErr: false,
+		},
+		{
+			name:    "When image volume has both reference and catalog item ref it should be invalid",
+			appType: AppTypeCompose,
+			volume: func(t *testing.T) ApplicationVolume {
+				t.Helper()
+				var volume ApplicationVolume
+				volume.Name = "vol1"
+				err := volume.FromImageVolumeProviderSpec(ImageVolumeProviderSpec{
+					Image: ImageVolumeSource{
+						Reference: "quay.io/test/image:v1",
+						CatalogItemRef: &CatalogItemRefSpec{
+							Catalog: "my-catalog",
+							Item:    "my-item",
+							Version: "1.0.0",
+						},
+					},
+				})
+				require.NoError(t, err)
+				return volume
+			},
+			expectErr:   true,
+			errorSubstr: "cannot have both reference and catalogItemRef",
+		},
+		{
+			name:    "When image volume has neither reference nor catalog item ref it should be invalid",
+			appType: AppTypeCompose,
+			volume: func(t *testing.T) ApplicationVolume {
+				t.Helper()
+				var volume ApplicationVolume
+				volume.Name = "vol1"
+				err := volume.FromImageVolumeProviderSpec(ImageVolumeProviderSpec{
+					Image: ImageVolumeSource{},
+				})
+				require.NoError(t, err)
+				return volume
+			},
+			expectErr:   true,
+			errorSubstr: "must have either reference or catalogItemRef",
+		},
+		{
+			name:    "When catalog item ref has empty fields it should be invalid",
+			appType: AppTypeCompose,
+			volume: func(t *testing.T) ApplicationVolume {
+				return createCatalogRefImageVolume(t, "vol1", "", "my-item", "1.0.0")
+			},
+			expectErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require := require.New(t)
+			vol := tt.volume(t)
+			path := "spec.applications[test].volumes[0]"
+			errs := validateVolume(vol, path, false, tt.appType)
+
+			if tt.expectErr {
+				require.NotEmpty(errs, "expected errors but got none")
+				if tt.errorSubstr != "" {
+					found := false
+					for _, err := range errs {
+						if strings.Contains(err.Error(), tt.errorSubstr) {
+							found = true
+							break
+						}
+					}
+					require.True(found, "expected error containing %q, got errors: %v", tt.errorSubstr, errs)
+				}
+			} else {
+				require.Empty(errs, "expected no errors but got: %v", errs)
+			}
+		})
+	}
 }
 
 func TestValidateResourceMonitor(t *testing.T) {
@@ -1797,6 +2118,49 @@ func createImageMountVolume(t *testing.T, name, imageRef, path string) Applicati
 	return volume
 }
 
+func createCatalogRefImageVolume(t *testing.T, name, catalog, item, version string) ApplicationVolume {
+	t.Helper()
+	var volume ApplicationVolume
+	volume.Name = name
+	err := volume.FromImageVolumeProviderSpec(ImageVolumeProviderSpec{
+		Image: ImageVolumeSource{
+			CatalogItemRef: &CatalogItemRefSpec{
+				Catalog: catalog,
+				Item:    item,
+				Version: version,
+			},
+			PullPolicy: lo.ToPtr(PullIfNotPresent),
+		},
+	})
+	if err != nil {
+		t.Fatalf("Failed to create catalog ref image volume: %v", err)
+	}
+	return volume
+}
+
+func createCatalogRefImageMountVolume(t *testing.T, name, catalog, item, version, path string) ApplicationVolume {
+	t.Helper()
+	var volume ApplicationVolume
+	volume.Name = name
+	err := volume.FromImageMountVolumeProviderSpec(ImageMountVolumeProviderSpec{
+		Image: ImageVolumeSource{
+			CatalogItemRef: &CatalogItemRefSpec{
+				Catalog: catalog,
+				Item:    item,
+				Version: version,
+			},
+			PullPolicy: lo.ToPtr(PullIfNotPresent),
+		},
+		Mount: VolumeMount{
+			Path: path,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Failed to create catalog ref image-mount volume: %v", err)
+	}
+	return volume
+}
+
 func TestValidateApplicationContentQuadlet(t *testing.T) {
 	require := require.New(t)
 
@@ -1989,6 +2353,13 @@ PublishPort=8080:80`,
 			wantErrCount:  1,
 			wantErrSubstr: "badfunction",
 		},
+		{
+			name: "valid kube quadlet",
+			content: `[Kube]
+Yaml=pod.yaml`,
+			path:         "my-vm.kube",
+			wantErrCount: 0,
+		},
 	}
 
 	for _, tt := range tests {
@@ -2000,6 +2371,87 @@ PublishPort=8080:80`,
 			require.Len(errs, tt.wantErrCount, "expected %d errors, got %d: %v", tt.wantErrCount, len(errs), errs)
 			if tt.wantErrSubstr != "" && len(errs) > 0 {
 				require.Contains(errs[0].Error(), tt.wantErrSubstr)
+			}
+		})
+	}
+}
+
+func TestValidateQuadletApplication_KubeYamlValidation(t *testing.T) {
+	t.Parallel()
+
+	validPodYAML := "apiVersion: v1\nkind: Pod\nmetadata:\n  name: my-vm\n"
+	validKubeUnit := "[Kube]\nYaml=pod.yaml\n"
+
+	newQuadletInlineApp := func(t *testing.T, files map[string]string) ApplicationProviderSpec {
+		t.Helper()
+		contents := make([]ApplicationContent, 0, len(files))
+		for path, content := range files {
+			c := content
+			contents = append(contents, ApplicationContent{Path: path, Content: &c})
+		}
+		inlineSpec := InlineApplicationProviderSpec{Inline: contents}
+		app := QuadletApplication{AppType: AppTypeQuadlet, Name: lo.ToPtr("my-vm")}
+		require.NoError(t, app.FromInlineApplicationProviderSpec(inlineSpec))
+		var spec ApplicationProviderSpec
+		require.NoError(t, spec.FromQuadletApplication(app))
+		return spec
+	}
+
+	tests := []struct {
+		name     string
+		files    map[string]string
+		wantErrs []string
+		wantPass bool
+	}{
+		{
+			name: "When .kube has Yaml=pod.yaml and pod.yaml is a valid Pod manifest it should be valid",
+			files: map[string]string{
+				"my-vm.kube": validKubeUnit,
+				"pod.yaml":   validPodYAML,
+			},
+			wantPass: true,
+		},
+		{
+			name: "When .kube has Yaml=pod.yaml but pod.yaml is absent it should fail",
+			files: map[string]string{
+				"my-vm.kube": validKubeUnit,
+			},
+			wantErrs: []string{"pod.yaml", "not present in the inline set"},
+		},
+		{
+			name: "When .kube has Yaml=pod.yaml but pod.yaml has kind Deployment it should fail",
+			files: map[string]string{
+				"my-vm.kube": validKubeUnit,
+				"pod.yaml":   "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: my-vm\n",
+			},
+			wantErrs: []string{"kind must be \"Pod\""},
+		},
+		{
+			name: "When .kube has no Yaml= directive it should be valid (no target to check)",
+			files: map[string]string{
+				"my-vm.kube": "[Kube]\n",
+			},
+			wantPass: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			spec := newQuadletInlineApp(t, tc.files)
+			errs := validateQuadletApplication(spec, "my-vm", false)
+
+			if tc.wantPass {
+				assert.Empty(t, errs, "expected no errors but got: %v", errs)
+				return
+			}
+			require.NotEmpty(t, errs)
+			allErrText := ""
+			for _, e := range errs {
+				allErrText += e.Error() + "\n"
+			}
+			for _, substr := range tc.wantErrs {
+				assert.Contains(t, allErrText, substr)
 			}
 		})
 	}
@@ -2541,4 +2993,406 @@ func TestRepository_Validate_BackwardCompatibility(t *testing.T) {
 		errs := repo.Validate()
 		require.Empty(t, errs, "HttpRepoSpec should validate successfully")
 	})
+}
+
+func TestValidateVmApplication(t *testing.T) {
+	tests := []struct {
+		name     string
+		app      func(t *testing.T) ApplicationProviderSpec
+		wantErrs []string
+	}{
+		// ── Inline — valid paths ──────────────────────────────────────────
+		{
+			name: "When inline has valid vm.yaml it should be valid",
+			app: func(t *testing.T) ApplicationProviderSpec {
+				return newTestVmInlineApp(t, "my-vm", map[string]string{
+					"vm.yaml": validVmYaml("my-vm"),
+				})
+			},
+		},
+		// ── Image provider — valid path ───────────────────────────────────
+		{
+			name: "When image provider has valid OCI reference it should be valid",
+			app: func(t *testing.T) ApplicationProviderSpec {
+				return newTestVmImageApp(t, "my-vm", "quay.io/containerdisks/fedora:40")
+			},
+		},
+
+		// ── Missing vm.yaml ───────────────────────────────────────────────
+		{
+			name: "When inline is empty it should fail with vm.yaml error",
+			app: func(t *testing.T) ApplicationProviderSpec {
+				return newTestVmInlineApp(t, "my-vm", map[string]string{})
+			},
+			wantErrs: []string{"vm.yaml"},
+		},
+		{
+			name: "When inline has only a .kube file and no vm.yaml it should fail",
+			app: func(t *testing.T) ApplicationProviderSpec {
+				return newTestVmInlineApp(t, "my-vm", map[string]string{
+					"my-vm.kube": "[Kube]\nYaml=vm.yaml\n",
+				})
+			},
+			wantErrs: []string{"vm.yaml"},
+		},
+
+		// ── vm.yaml content validation ────────────────────────────────────
+		{
+			name: "When vm.yaml has wrong kind it should fail",
+			app: func(t *testing.T) ApplicationProviderSpec {
+				return newTestVmInlineApp(t, "my-vm", map[string]string{
+					"vm.yaml": "apiVersion: kubevirt.io/v1\nkind: Deployment\nmetadata:\n  name: my-vm\n",
+				})
+			},
+			wantErrs: []string{"kind"},
+		},
+		{
+			name: "When vm.yaml has wrong apiVersion it should fail",
+			app: func(t *testing.T) ApplicationProviderSpec {
+				return newTestVmInlineApp(t, "my-vm", map[string]string{
+					"vm.yaml": "apiVersion: apps/v1\nkind: VirtualMachine\nmetadata:\n  name: my-vm\n",
+				})
+			},
+			wantErrs: []string{"apiVersion"},
+		},
+		{
+			name: "When vm.yaml metadata.name does not match app name it should fail",
+			app: func(t *testing.T) ApplicationProviderSpec {
+				return newTestVmInlineApp(t, "my-vm", map[string]string{
+					"vm.yaml": validVmYaml("other-vm"),
+				})
+			},
+			wantErrs: []string{"metadata.name"},
+		},
+		{
+			name: "When vm.yaml is not valid YAML it should fail",
+			app: func(t *testing.T) ApplicationProviderSpec {
+				return newTestVmInlineApp(t, "my-vm", map[string]string{
+					"vm.yaml": "{ invalid: yaml: :",
+				})
+			},
+			wantErrs: []string{"vm.yaml"},
+		},
+
+		// ── extra files rejected ──────────────────────────────────────────
+		{
+			name: "When inline has extra files alongside vm.yaml it should fail",
+			app: func(t *testing.T) ApplicationProviderSpec {
+				return newTestVmInlineApp(t, "my-vm", map[string]string{
+					"vm.yaml": validVmYaml("my-vm"),
+					"a.kube":  "[Kube]\nYaml=vm.yaml\n",
+					"b.kube":  "[Kube]\nYaml=vm.yaml\n",
+				})
+			},
+			wantErrs: []string{"only vm.yaml is allowed"},
+		},
+
+		// ── Unrecognised files ────────────────────────────────────────────
+		{
+			name: "When inline has an unrecognised file it should fail",
+			app: func(t *testing.T) ApplicationProviderSpec {
+				return newTestVmInlineApp(t, "my-vm", map[string]string{
+					"vm.yaml":  validVmYaml("my-vm"),
+					"extra.sh": "#!/bin/sh\n",
+				})
+			},
+			wantErrs: []string{"unrecognised"},
+		},
+
+		// ── Duplicate inline paths ────────────────────────────────────────
+		{
+			name: "When inline has duplicate paths it should fail",
+			app: func(t *testing.T) ApplicationProviderSpec {
+				vm := VmApplication{AppType: AppTypeVm, Name: lo.ToPtr("my-vm")}
+				require.NoError(t, vm.FromInlineApplicationProviderSpec(InlineApplicationProviderSpec{
+					Inline: []ApplicationContent{
+						{Path: "vm.yaml", Content: lo.ToPtr(validVmYaml("my-vm"))},
+						{Path: "vm.yaml", Content: lo.ToPtr(validVmYaml("my-vm"))},
+					},
+				}))
+				var spec ApplicationProviderSpec
+				require.NoError(t, spec.FromVmApplication(vm))
+				return spec
+			},
+			wantErrs: []string{"duplicate"},
+		},
+		// ── Image provider — invalid OCI reference ────────────────────────
+		{
+			name: "When image provider has invalid OCI reference it should fail",
+			app: func(t *testing.T) ApplicationProviderSpec {
+				return newTestVmImageApp(t, "my-vm", "not a valid image!!!")
+			},
+			wantErrs: []string{"image"},
+		},
+
+		// ── publishPorts validation ───────────────────────────────────────
+		{
+			name: "When publishPorts has a valid mapping it should be valid",
+			app: func(t *testing.T) ApplicationProviderSpec {
+				return newTestVmInlineAppWithPorts(t, "my-vm", []string{"2222:22"})
+			},
+		},
+		{
+			name: "When publishPorts has a valid mapping with protocol it should be valid",
+			app: func(t *testing.T) ApplicationProviderSpec {
+				return newTestVmInlineAppWithPorts(t, "my-vm", []string{"8080:80/tcp"})
+			},
+		},
+		{
+			name: "When publishPorts entry has no colon it should fail",
+			app: func(t *testing.T) ApplicationProviderSpec {
+				return newTestVmInlineAppWithPorts(t, "my-vm", []string{"2222"})
+			},
+			wantErrs: []string{"publishPorts"},
+		},
+		{
+			name: "When publishPorts entry has an unknown protocol it should fail",
+			app: func(t *testing.T) ApplicationProviderSpec {
+				return newTestVmInlineAppWithPorts(t, "my-vm", []string{"2222:22/ftp"})
+			},
+			wantErrs: []string{"publishPorts"},
+		},
+		{
+			name: "When publishPorts entry has port 0 it should fail",
+			app: func(t *testing.T) ApplicationProviderSpec {
+				return newTestVmInlineAppWithPorts(t, "my-vm", []string{"0:22"})
+			},
+			wantErrs: []string{"publishPorts"},
+		},
+		{
+			name: "When publishPorts entry has port above 65535 it should fail",
+			app: func(t *testing.T) ApplicationProviderSpec {
+				return newTestVmInlineAppWithPorts(t, "my-vm", []string{"2222:99999"})
+			},
+			wantErrs: []string{"publishPorts"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			apps := []ApplicationProviderSpec{tt.app(t)}
+			gotErrs := validateApplications(apps, false)
+			if len(tt.wantErrs) > 0 {
+				require.NotEmpty(t, gotErrs, "expected errors containing %v but got none", tt.wantErrs)
+				for _, wantErr := range tt.wantErrs {
+					found := false
+					for _, gotErr := range gotErrs {
+						if strings.Contains(gotErr.Error(), wantErr) {
+							found = true
+							break
+						}
+					}
+					require.True(t, found, "expected an error containing %q, got: %v", wantErr, gotErrs)
+				}
+			} else {
+				require.Empty(t, gotErrs, "expected no errors but got: %v", gotErrs)
+			}
+		})
+	}
+}
+
+// validVmYaml returns a minimal valid KubeVirt VirtualMachine YAML for the given name.
+func validVmYaml(name string) string {
+	return "apiVersion: kubevirt.io/v1\nkind: VirtualMachine\nmetadata:\n  name: " + name + "\nspec:\n  running: false\n"
+}
+
+// newTestVmInlineApp builds a VmApplication with an inline: provider from a map of path→content.
+func newTestVmInlineApp(t *testing.T, name string, files map[string]string) ApplicationProviderSpec {
+	t.Helper()
+	inline := make([]ApplicationContent, 0, len(files))
+	for path, content := range files {
+		inline = append(inline, ApplicationContent{
+			Path:    path,
+			Content: lo.ToPtr(content),
+		})
+	}
+	vm := VmApplication{
+		AppType: AppTypeVm,
+		Name:    lo.ToPtr(name),
+	}
+	if name == "" {
+		vm.Name = nil
+	}
+	require.NoError(t, vm.FromInlineApplicationProviderSpec(InlineApplicationProviderSpec{
+		Inline: inline,
+	}))
+	var spec ApplicationProviderSpec
+	require.NoError(t, spec.FromVmApplication(vm))
+	return spec
+}
+
+// newTestVmInlineAppWithPorts builds a VmApplication with a valid vm.yaml and the given publishPorts.
+func newTestVmInlineAppWithPorts(t *testing.T, name string, publishPorts []string) ApplicationProviderSpec {
+	t.Helper()
+	vm := VmApplication{
+		AppType:      AppTypeVm,
+		Name:         lo.ToPtr(name),
+		PublishPorts: &publishPorts,
+	}
+	require.NoError(t, vm.FromInlineApplicationProviderSpec(InlineApplicationProviderSpec{
+		Inline: []ApplicationContent{
+			{Path: "vm.yaml", Content: lo.ToPtr(validVmYaml(name))},
+		},
+	}))
+	var spec ApplicationProviderSpec
+	require.NoError(t, spec.FromVmApplication(vm))
+	return spec
+}
+
+// newTestVmImageApp builds a VmApplication with an image: provider.
+func newTestVmImageApp(t *testing.T, name, imageRef string) ApplicationProviderSpec {
+	t.Helper()
+	vm := VmApplication{
+		AppType: AppTypeVm,
+		Name:    lo.ToPtr(name),
+	}
+	require.NoError(t, vm.FromImageApplicationProviderSpec(ImageApplicationProviderSpec{
+		Image: imageRef,
+	}))
+	var spec ApplicationProviderSpec
+	require.NoError(t, spec.FromVmApplication(vm))
+	return spec
+}
+
+func TestDisruptionBudgetValidateGroupBy(t *testing.T) {
+	require := require.New(t)
+	minAvail := 1
+
+	tests := []struct {
+		name    string
+		groupBy []string
+		wantErr bool
+	}{
+		{"valid single key", []string{"region"}, false},
+		{"valid dotted key", []string{"node.kubernetes.io/zone"}, false},
+		{"valid multi key", []string{"region", "zone"}, false},
+		{"duplicate keys", []string{"region", "region"}, true},
+		{"empty key", []string{""}, true},
+		{"key with space", []string{"region zone"}, true},
+		{"key with comma", []string{"key,value"}, true},
+		{"key with parentheses", []string{"key(value)"}, true},
+		{"key with single quote", []string{"key'value"}, true},
+		{"key with semicolon", []string{"key;DROP"}, true},
+		{"key with equals", []string{"key=value"}, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db := &DisruptionBudget{
+				MinAvailable: &minAvail,
+				GroupBy:      lo.ToPtr(tt.groupBy),
+			}
+			errs := db.Validate()
+			if tt.wantErr {
+				require.NotEmpty(errs, "expected validation error for groupBy %v", tt.groupBy)
+			} else {
+				require.Empty(errs, "unexpected validation error for groupBy %v: %v", tt.groupBy, errs)
+			}
+		})
+	}
+}
+
+func TestDeviceSpecValidate_OsSpec(t *testing.T) {
+	validCatalogItemRef := &CatalogItemRefSpec{
+		Catalog: "my-catalog",
+		Item:    "my-item",
+		Version: "1.0.0",
+	}
+
+	tests := []struct {
+		name         string
+		os           *DeviceOsSpec
+		wantErr      bool
+		errorStrings []string
+	}{
+		{
+			name:    "When os is nil it should pass",
+			os:      nil,
+			wantErr: false,
+		},
+		{
+			name:    "When os has only a valid image it should pass",
+			os:      &DeviceOsSpec{Image: "quay.io/org/image:latest"},
+			wantErr: false,
+		},
+		{
+			name:    "When os has only a valid catalog item ref it should pass",
+			os:      &DeviceOsSpec{CatalogItemRef: validCatalogItemRef},
+			wantErr: false,
+		},
+		{
+			name:    "When os has neither image nor catalog item ref it should pass",
+			os:      &DeviceOsSpec{},
+			wantErr: false,
+		},
+		{
+			name: "When os has both image and catalog item ref it should fail",
+			os: &DeviceOsSpec{
+				Image:          "quay.io/org/image:latest",
+				CatalogItemRef: validCatalogItemRef,
+			},
+			wantErr:      true,
+			errorStrings: []string{"cannot have both image and catalog item ref for device OS"},
+		},
+		{
+			name:         "When os has an invalid image it should fail",
+			os:           &DeviceOsSpec{Image: "invalid image!!!"},
+			wantErr:      true,
+			errorStrings: []string{"spec.os.image"},
+		},
+		{
+			name: "When os has a catalog item ref with missing fields it should fail",
+			os: &DeviceOsSpec{
+				CatalogItemRef: &CatalogItemRefSpec{
+					Catalog: "",
+					Item:    "",
+					Version: "",
+				},
+			},
+			wantErr:      true,
+			errorStrings: []string{"catalog, item, and version are all required fields"},
+		},
+		{
+			name: "When os has a catalog item ref with whitespace-padded fields it should fail",
+			os: &DeviceOsSpec{
+				CatalogItemRef: &CatalogItemRefSpec{
+					Catalog: " my-catalog ",
+					Item:    "my-item",
+					Version: "1.0.0",
+				},
+			},
+			wantErr:      true,
+			errorStrings: []string{"must not contain leading or trailing whitespace"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require := require.New(t)
+			spec := DeviceSpec{
+				Os: tt.os,
+			}
+			errs := spec.Validate(false)
+			if tt.wantErr {
+				require.NotEmpty(errs, "expected errors but got none")
+				for _, errStr := range tt.errorStrings {
+					found := false
+					for _, err := range errs {
+						if strings.Contains(err.Error(), errStr) {
+							found = true
+							break
+						}
+					}
+					require.True(found, "expected error containing %q, got: %v", errStr, errs)
+				}
+			} else {
+				require.Empty(errs, "expected no errors but got: %v", errs)
+			}
+		})
+	}
+}
+
+func TestApplicationStatusTypeConstants(t *testing.T) {
+	require.Equal(t, ApplicationStatusType("Stopped"), ApplicationStatusStopped)
+	require.Equal(t, ApplicationStatusType("Stopping"), ApplicationStatusStopping)
 }

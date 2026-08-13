@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -14,13 +15,22 @@ import (
 	"github.com/flightctl/flightctl/internal/api_server/middleware"
 	"github.com/flightctl/flightctl/internal/config"
 	"github.com/flightctl/flightctl/internal/crypto"
+	"github.com/flightctl/flightctl/internal/instrumentation/encryption"
 	"github.com/flightctl/flightctl/internal/instrumentation/metrics"
 	"github.com/flightctl/flightctl/internal/instrumentation/metrics/domain"
+	encmetrics "github.com/flightctl/flightctl/internal/instrumentation/metrics/encryption"
 	"github.com/flightctl/flightctl/internal/instrumentation/metrics/system"
+	instpprof "github.com/flightctl/flightctl/internal/instrumentation/pprof"
+	"github.com/flightctl/flightctl/internal/instrumentation/profiling"
 	"github.com/flightctl/flightctl/internal/instrumentation/tracing"
 	"github.com/flightctl/flightctl/internal/kvstore"
 	"github.com/flightctl/flightctl/internal/rendered"
+	canaryservice "github.com/flightctl/flightctl/internal/service/canary"
 	"github.com/flightctl/flightctl/internal/store"
+	devicestore "github.com/flightctl/flightctl/internal/store/device"
+	fleetstore "github.com/flightctl/flightctl/internal/store/fleet"
+	repositorystore "github.com/flightctl/flightctl/internal/store/repository"
+	resourcesyncstore "github.com/flightctl/flightctl/internal/store/resourcesync"
 	"github.com/flightctl/flightctl/internal/util"
 	"github.com/flightctl/flightctl/pkg/log"
 	"github.com/flightctl/flightctl/pkg/queues"
@@ -60,21 +70,41 @@ func main() {
 		}
 	}()
 
+	ctx, cancel := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGHUP, syscall.SIGTERM, syscall.SIGQUIT)
+	profiling.Start(ctx, log, cfg, "flightctl-api", instpprof.DefaultPortAPI)
+
+	if err := encryption.InitGlobalEncryption(log, cfg); err != nil {
+		log.Fatalf("initializing encryption: %v", err)
+	}
+
+	var encCollector prometheus.Collector
+	if cfg.Metrics != nil && cfg.Metrics.Enabled {
+		if encMgr := encryption.GlobalManager(); encMgr != nil {
+			ec := encmetrics.NewEncryptionCollector(encMgr)
+			encMgr.SetMetricsRecorder(ec)
+			encCollector = ec
+		}
+	}
+
 	log.Println("Initializing data store")
 	db, err := store.InitDB(cfg, log)
 	if err != nil {
 		log.Fatalf("initializing data store: %v", err)
 	}
+	defer func() {
+		if sqlDB, err := db.DB(); err == nil {
+			_ = sqlDB.Close()
+		}
+	}()
 
-	store := store.NewStore(db, log.WithField("pkg", "store"))
-	defer store.Close()
+	if err := canaryservice.InitEncryption(ctx, db, log); err != nil {
+		log.Fatalf("initializing encryption canary store: %v", err)
+	}
 
 	tlsConfig, agentTlsConfig, err := crypto.TLSConfigForServer(ca.GetCABundleX509(), serverCerts)
 	if err != nil {
 		log.Fatalf("failed creating TLS config: %v", err)
 	}
-
-	ctx, cancel := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGHUP, syscall.SIGTERM, syscall.SIGQUIT)
 
 	processID := fmt.Sprintf("api-%s-%s", util.GetHostname(), uuid.New().String())
 	provider, err := queues.NewRedisProvider(ctx, log, processID, cfg.KV.Hostname, cfg.KV.Port, cfg.KV.Password, queues.DefaultRetryConfig())
@@ -94,12 +124,23 @@ func main() {
 	}
 
 	// create the agent service listener as tcp (combined HTTP+gRPC)
-	agentListener, err := net.Listen("tcp", cfg.Service.AgentEndpointAddress)
+	network := "tcp"
+	agentAddress := cfg.Service.AgentEndpointAddress
+	if strings.HasPrefix(cfg.Service.AgentEndpointAddress, "unix://") {
+		network = "unix"
+		agentAddress = strings.TrimPrefix(cfg.Service.AgentEndpointAddress, "unix://")
+		if _, err := os.Stat(agentAddress); err == nil {
+			if err := os.Remove(agentAddress); err != nil {
+				log.Fatalf("Failed to remove previous unix socket at %s: %v", agentAddress, err)
+			}
+		}
+	}
+	agentListener, err := net.Listen(network, agentAddress)
 	if err != nil {
 		log.Fatalf("creating listener: %s", err)
 	}
 
-	agentServer, err := agentserver.New(ctx, log, cfg, store, caClient, agentListener, provider, agentTlsConfig)
+	agentServer, err := agentserver.New(ctx, log, cfg, db, caClient, agentListener, provider, agentTlsConfig)
 	if err != nil {
 		log.Fatalf("initializing agent server: %v", err)
 	}
@@ -118,7 +159,7 @@ func main() {
 			log.Fatalf("creating listener: %s", err)
 		}
 		// we pass the grpc server for now, to let the console sessions to establish a connection in grpc
-		server := apiserver.New(log, cfg, store, caClient, listener, provider, agentServer.GetGRPCServer())
+		server := apiserver.New(log, cfg, db, caClient, listener, provider, agentServer.GetGRPCServer())
 		if err := server.Run(ctx); err != nil {
 			log.Fatalf("Error running server: %s", err)
 		}
@@ -135,16 +176,16 @@ func main() {
 	if cfg.Metrics != nil && cfg.Metrics.Enabled {
 		var collectors []prometheus.Collector
 		if cfg.Metrics.DeviceCollector != nil && cfg.Metrics.DeviceCollector.Enabled {
-			collectors = append(collectors, domain.NewDeviceCollector(ctx, store, log, cfg))
+			collectors = append(collectors, domain.NewDeviceCollector(ctx, devicestore.NewDeviceStore(db, log.WithField("pkg", "device-store")), log, cfg))
 		}
 		if cfg.Metrics.FleetCollector != nil && cfg.Metrics.FleetCollector.Enabled {
-			collectors = append(collectors, domain.NewFleetCollector(ctx, store, log, cfg))
+			collectors = append(collectors, domain.NewFleetCollector(ctx, fleetstore.NewFleetStore(db, log.WithField("pkg", "fleet-store")), log, cfg))
 		}
 		if cfg.Metrics.RepositoryCollector != nil && cfg.Metrics.RepositoryCollector.Enabled {
-			collectors = append(collectors, domain.NewRepositoryCollector(ctx, store, log, cfg))
+			collectors = append(collectors, domain.NewRepositoryCollector(ctx, repositorystore.NewRepositoryStore(db, log.WithField("pkg", "repository-store")), log, cfg))
 		}
 		if cfg.Metrics.ResourceSyncCollector != nil && cfg.Metrics.ResourceSyncCollector.Enabled {
-			collectors = append(collectors, domain.NewResourceSyncCollector(ctx, store, log, cfg))
+			collectors = append(collectors, domain.NewResourceSyncCollector(ctx, resourcesyncstore.NewResourceSyncStore(db, log.WithField("pkg", "resourcesync-store")), log, cfg))
 		}
 		if cfg.Metrics.SystemCollector != nil && cfg.Metrics.SystemCollector.Enabled {
 			if systemMetricsCollector := system.NewSystemCollector(ctx, cfg); systemMetricsCollector != nil {
@@ -165,6 +206,10 @@ func main() {
 					}
 				}()
 			}
+		}
+
+		if encCollector != nil {
+			collectors = append(collectors, encCollector)
 		}
 
 		go func() {

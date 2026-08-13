@@ -17,9 +17,6 @@ import (
 var _ = Describe("ImageBuild", Label("imagebuild"), func() {
 	Context("ImageBuild wrong configurations", func() {
 		It("should fail with non-existing repository", Label("87338", "imagebuild"), func() {
-			Expect(workerHarness).ToNot(BeNil())
-			Expect(workerHarness.ImageBuilderClient).ToNot(BeNil(), "ImageBuilderClient must be available")
-
 			testID := workerHarness.GetTestIDFromContext()
 
 			By("Step 1: Attempting to create ImageBuild with non-existing source repository")
@@ -54,9 +51,6 @@ var _ = Describe("ImageBuild", Label("imagebuild"), func() {
 		})
 
 		It("should fail with wrong image name/tag for source", Label("87706", "imagebuild"), func() {
-			Expect(workerHarness).ToNot(BeNil())
-			Expect(workerHarness.ImageBuilderClient).ToNot(BeNil(), "ImageBuilderClient must be available")
-
 			testID := workerHarness.GetTestIDFromContext()
 			registryAddress := auxSvcs.Registry.Host + ":" + auxSvcs.Registry.Port
 
@@ -68,8 +62,9 @@ var _ = Describe("ImageBuild", Label("imagebuild"), func() {
 				_, _ = resources.Delete(workerHarness, resources.Repositories, sourceRepoName)
 			}()
 
+			resolveSourceRegistry(workerHarness)
 			_, err := resources.CreateOCIRepository(workerHarness, sourceRepoName, sourceRegistry,
-				lo.ToPtr(api.Https), lo.ToPtr(api.Read), false, nil)
+				lo.ToPtr(api.Https), lo.ToPtr(api.Read), isLocalSourceRegistry(), nil)
 			Expect(err).ToNot(HaveOccurred())
 
 			_, err = resources.CreateOCIRepository(workerHarness, destRepoName, registryAddress,
@@ -121,9 +116,6 @@ var _ = Describe("ImageBuild", Label("imagebuild"), func() {
 		})
 
 		It("should fail validation with invalid image reference format", Label("87705", "imagebuild"), func() {
-			Expect(workerHarness).ToNot(BeNil())
-			Expect(workerHarness.ImageBuilderClient).ToNot(BeNil(), "ImageBuilderClient must be available")
-
 			testID := workerHarness.GetTestIDFromContext()
 			registryAddress := auxSvcs.Registry.Host + ":" + auxSvcs.Registry.Port
 
@@ -135,8 +127,9 @@ var _ = Describe("ImageBuild", Label("imagebuild"), func() {
 				_, _ = resources.Delete(workerHarness, resources.Repositories, sourceRepoName)
 			}()
 
+			resolveSourceRegistry(workerHarness)
 			_, err := resources.CreateOCIRepository(workerHarness, sourceRepoName, sourceRegistry,
-				lo.ToPtr(api.Https), lo.ToPtr(api.Read), false, nil)
+				lo.ToPtr(api.Https), lo.ToPtr(api.Read), isLocalSourceRegistry(), nil)
 			Expect(err).ToNot(HaveOccurred())
 
 			_, err = resources.CreateOCIRepository(workerHarness, destRepoName, registryAddress,
@@ -189,9 +182,6 @@ var _ = Describe("ImageBuild", Label("imagebuild"), func() {
 		})
 
 		It("should fail with empty required fields", Label("87708", "imagebuild"), func() {
-			Expect(workerHarness).ToNot(BeNil())
-			Expect(workerHarness.ImageBuilderClient).ToNot(BeNil(), "ImageBuilderClient must be available")
-
 			testID := workerHarness.GetTestIDFromContext()
 
 			emptyFieldCases := []struct {

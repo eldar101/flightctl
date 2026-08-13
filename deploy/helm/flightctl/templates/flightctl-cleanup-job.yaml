@@ -2,21 +2,23 @@
 {{- if .Values.global.internalNamespace }}
 {{- $namespaces = append $namespaces .Values.global.internalNamespace }}
 {{- end }}
+{{- $releaseName := .Release.Name }}
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: flightctl-cleanup-pvcs
+  name: flightctl-cleanup
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "flightctl.standardLabels" . | nindent 4 }}
   annotations:
     "helm.sh/hook": post-delete
-    "helm.sh/hook-delete-policy": hook-succeeded
+    "helm.sh/hook-weight": "3"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
 spec:
   template:
     metadata:
       labels:
-        flightctl.service: pvc-cleanup
+        flightctl.service: cleanup
         {{- include "flightctl.standardLabels" . | nindent 8 }}
     spec:
       serviceAccountName: flightctl-cleanup
@@ -36,7 +38,68 @@ spec:
                 | grep "flightctl-alertmanager-data-flightctl-alertmanager-" \
                 | xargs -r oc delete -n {{ $ns }} --ignore-not-found
               {{- end }}
+              echo "Deleting Jobs, except cleanup..."
+              {{- range $ns := $namespaces }}
+              oc delete job -l 'app.kubernetes.io/instance={{ $releaseName }}' --field-selector metadata.name!=flightctl-cleanup -n {{ $ns }} --ignore-not-found
+              {{- end }}
               echo "Cleanup completed successfully!"
               exit 0
       restartPolicy: Never
-      
+
+---
+kind: ServiceAccount
+apiVersion: v1
+metadata:
+  name: flightctl-cleanup
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    "helm.sh/hook": post-delete
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+  labels:
+    {{- include "flightctl.standardLabels" . | nindent 4 }}
+
+{{- range $ns := uniq $namespaces }}
+---
+kind: Role
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: flightctl-cleanup
+  namespace: {{ $ns }}
+  annotations:
+    "helm.sh/hook": post-delete
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+  labels:
+    {{- include "flightctl.standardLabels" $ | nindent 4 }}
+rules:
+  - verbs: [get, list, delete]
+    apiGroups: ['']
+    resources:
+      - persistentvolumeclaims
+  - verbs: [get, list, delete]
+    apiGroups: ['batch']
+    resources:
+      - jobs
+
+---
+kind: RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: flightctl-cleanup
+  namespace: {{ $ns }}
+  annotations:
+    "helm.sh/hook": post-delete
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+  labels:
+    {{- include "flightctl.standardLabels" $ | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: flightctl-cleanup
+    namespace: {{ $.Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: flightctl-cleanup
+{{- end }}

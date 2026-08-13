@@ -6,11 +6,21 @@ import (
 	"time"
 
 	"github.com/flightctl/flightctl/internal/domain"
+	fleetstore "github.com/flightctl/flightctl/internal/store/fleet"
 	"github.com/google/uuid"
 	"github.com/samber/lo"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 )
+
+type stubFleetStore struct {
+	fleetstore.Store
+	fleet *domain.Fleet
+}
+
+func (s *stubFleetStore) Get(_ context.Context, _ uuid.UUID, _ string, _ ...fleetstore.GetOption) (*domain.Fleet, error) {
+	return s.fleet, nil
+}
 
 func TestComputeDeviceStatusChanges_DeviceUpdateFailed(t *testing.T) {
 	ctx := context.Background()
@@ -64,13 +74,13 @@ func TestComputeDeviceStatusChanges_DeviceUpdateFailed(t *testing.T) {
 	}
 
 	// Test case 1: Device with update error should emit DeviceUpdateFailed event
-	updates := ComputeDeviceStatusChanges(ctx, oldDevice, deviceWithError, orgId, nil)
+	updates := ComputeDeviceStatusChanges(ctx, oldDevice, deviceWithError, orgId)
 	assert.Len(t, updates, 1)
 	assert.Equal(t, domain.EventReasonDeviceUpdateFailed, updates[0].Reason)
 	assert.Contains(t, updates[0].Details, "update failed")
 
 	// Test case 2: Device without update error should emit DeviceContentOutOfDate event
-	updates = ComputeDeviceStatusChanges(ctx, oldDevice, deviceWithoutError, orgId, nil)
+	updates = ComputeDeviceStatusChanges(ctx, oldDevice, deviceWithoutError, orgId)
 	assert.Len(t, updates, 1)
 	assert.Equal(t, domain.EventReasonDeviceContentOutOfDate, updates[0].Reason)
 	assert.Contains(t, updates[0].Details, "has not been updated")
@@ -130,7 +140,7 @@ func TestComputeDeviceStatusChanges_OSImageChanged_EDM3986(t *testing.T) {
 				},
 			}
 
-			updates := ComputeDeviceStatusChanges(ctx, oldDevice, newDevice, orgId, nil)
+			updates := ComputeDeviceStatusChanges(ctx, oldDevice, newDevice, orgId)
 
 			var osImageEvents []ResourceUpdate
 			for _, u := range updates {
@@ -188,7 +198,7 @@ func TestComputeDeviceStatusChanges_StatusTransition(t *testing.T) {
 	}
 
 	// Test transition from UpToDate to OutOfDate with error
-	updates := ComputeDeviceStatusChanges(ctx, oldDevice, newDevice, orgId, nil)
+	updates := ComputeDeviceStatusChanges(ctx, oldDevice, newDevice, orgId)
 	assert.Len(t, updates, 1)
 	assert.Equal(t, domain.EventReasonDeviceUpdateFailed, updates[0].Reason)
 	assert.Contains(t, updates[0].Details, "update failed")
@@ -399,35 +409,100 @@ func TestUpdateServerSideDeviceUpdatedStatus_OsImageMismatch(t *testing.T) {
 	log := logrus.NewEntry(logrus.StandardLogger())
 
 	tests := []struct {
-		name           string
-		specOsImage    string
-		statusOsImage  string
-		expectedStatus domain.DeviceUpdatedStatusType
-		expectMismatch bool
+		name               string
+		specOsImage        string
+		specCatalogItemRef *domain.CatalogItemRefSpec
+		statusOsImage      string
+		capabilities       *domain.DeviceCapabilities
+		expectedStatus     domain.DeviceUpdatedStatusType
+		expectInfoContains string
 	}{
 		{
-			name:           "matching OS images remains UpToDate",
+			name:           "When image-mode device has matching OS images it should remain UpToDate",
 			specOsImage:    "quay.io/flightctl/device:v7",
 			statusOsImage:  "quay.io/flightctl/device:v7",
+			capabilities:   &domain.DeviceCapabilities{OsMode: lo.ToPtr(domain.OsModeImage)},
 			expectedStatus: domain.DeviceUpdatedStatusUpToDate,
 		},
 		{
-			name:           "mismatching OS images overrides to OutOfDate",
-			specOsImage:    "quay.io/flightctl/device:v7",
-			statusOsImage:  "quay.io/flightctl/device:base",
-			expectedStatus: domain.DeviceUpdatedStatusOutOfDate,
-			expectMismatch: true,
+			name:               "When image-mode device has mismatching OS images it should override to OutOfDate",
+			specOsImage:        "quay.io/flightctl/device:v7",
+			statusOsImage:      "quay.io/flightctl/device:base",
+			capabilities:       &domain.DeviceCapabilities{OsMode: lo.ToPtr(domain.OsModeImage)},
+			expectedStatus:     domain.DeviceUpdatedStatusOutOfDate,
+			expectInfoContains: "OS image mismatch",
 		},
 		{
-			name:           "no spec OS image remains UpToDate",
+			name:               "When package-mode device has spec OS image it should override to OutOfDate",
+			specOsImage:        "quay.io/flightctl/device:v7",
+			statusOsImage:      "",
+			capabilities:       &domain.DeviceCapabilities{OsMode: lo.ToPtr(domain.OsModePackage)},
+			expectedStatus:     domain.DeviceUpdatedStatusOutOfDate,
+			expectInfoContains: "OS image mismatch",
+		},
+		{
+			name:           "When package-mode device has no spec OS image it should remain UpToDate",
 			specOsImage:    "",
-			statusOsImage:  "quay.io/flightctl/device:base",
+			statusOsImage:  "",
+			capabilities:   &domain.DeviceCapabilities{OsMode: lo.ToPtr(domain.OsModePackage)},
 			expectedStatus: domain.DeviceUpdatedStatusUpToDate,
 		},
 		{
-			name:           "no status OS image remains UpToDate",
+			name:           "When legacy device without capabilities has empty status OS image it should remain UpToDate",
 			specOsImage:    "quay.io/flightctl/device:v7",
 			statusOsImage:  "",
+			capabilities:   nil,
+			expectedStatus: domain.DeviceUpdatedStatusUpToDate,
+		},
+		{
+			name:           "When legacy device without capabilities has mismatching OS images it should remain UpToDate",
+			specOsImage:    "quay.io/flightctl/device:v7",
+			statusOsImage:  "quay.io/flightctl/device:base",
+			capabilities:   nil,
+			expectedStatus: domain.DeviceUpdatedStatusUpToDate,
+		},
+		{
+			name:           "When device has capabilities with nil osMode it should remain UpToDate",
+			specOsImage:    "quay.io/flightctl/device:v7",
+			statusOsImage:  "quay.io/flightctl/device:base",
+			capabilities:   &domain.DeviceCapabilities{OsMode: nil},
+			expectedStatus: domain.DeviceUpdatedStatusUpToDate,
+		},
+		{
+			name:           "When no spec OS image is set it should remain UpToDate regardless of capabilities",
+			specOsImage:    "",
+			statusOsImage:  "quay.io/flightctl/device:base",
+			capabilities:   &domain.DeviceCapabilities{OsMode: lo.ToPtr(domain.OsModeImage)},
+			expectedStatus: domain.DeviceUpdatedStatusUpToDate,
+		},
+		{
+			name:               "When package-mode device has catalogItemRef only it should override to OutOfDate",
+			specCatalogItemRef: &domain.CatalogItemRefSpec{Catalog: "cat", Item: "os", Version: "v1"},
+			capabilities:       &domain.DeviceCapabilities{OsMode: lo.ToPtr(domain.OsModePackage)},
+			expectedStatus:     domain.DeviceUpdatedStatusOutOfDate,
+			expectInfoContains: "catalog OS target",
+		},
+		{
+			name:               "When image-mode device has catalogItemRef only it should remain UpToDate",
+			specCatalogItemRef: &domain.CatalogItemRefSpec{Catalog: "cat", Item: "os", Version: "v1"},
+			capabilities:       &domain.DeviceCapabilities{OsMode: lo.ToPtr(domain.OsModeImage)},
+			expectedStatus:     domain.DeviceUpdatedStatusUpToDate,
+		},
+		{
+			name:               "When legacy device without capabilities has catalogItemRef it should remain UpToDate",
+			specCatalogItemRef: &domain.CatalogItemRefSpec{Catalog: "cat", Item: "os", Version: "v1"},
+			capabilities:       nil,
+			expectedStatus:     domain.DeviceUpdatedStatusUpToDate,
+		},
+		{
+			name:               "When device has capabilities with nil osMode and catalogItemRef it should remain UpToDate",
+			specCatalogItemRef: &domain.CatalogItemRefSpec{Catalog: "cat", Item: "os", Version: "v1"},
+			capabilities:       &domain.DeviceCapabilities{OsMode: nil},
+			expectedStatus:     domain.DeviceUpdatedStatusUpToDate,
+		},
+		{
+			name:           "When package-mode device has no OS target it should remain UpToDate",
+			capabilities:   &domain.DeviceCapabilities{OsMode: lo.ToPtr(domain.OsModePackage)},
 			expectedStatus: domain.DeviceUpdatedStatusUpToDate,
 		},
 	}
@@ -456,16 +531,117 @@ func TestUpdateServerSideDeviceUpdatedStatus_OsImageMismatch(t *testing.T) {
 					},
 				},
 			}
-			if tt.specOsImage != "" {
-				device.Spec.Os = &domain.DeviceOsSpec{Image: tt.specOsImage}
+			if tt.specOsImage != "" || tt.specCatalogItemRef != nil {
+				device.Spec.Os = &domain.DeviceOsSpec{
+					Image:          tt.specOsImage,
+					CatalogItemRef: tt.specCatalogItemRef,
+				}
 			}
+			device.Status.Capabilities = tt.capabilities
 
 			updateServerSideDeviceUpdatedStatus(device, ctx, nil, log, orgId)
 
 			assert.Equal(t, tt.expectedStatus, device.Status.Updated.Status)
-			if tt.expectMismatch {
-				assert.Contains(t, *device.Status.Updated.Info, "OS image mismatch")
+			if tt.expectInfoContains != "" {
+				assert.Contains(t, *device.Status.Updated.Info, tt.expectInfoContains)
 			}
+		})
+	}
+}
+
+func TestUpdateServerSideDeviceUpdatedStatus_ManagedDeviceErrorPriority(t *testing.T) {
+	ctx := context.Background()
+	orgId := uuid.New()
+	log := logrus.NewEntry(logrus.StandardLogger())
+
+	fleetName := "test-fleet"
+	fleetTV := "v2"
+	fleet := &domain.Fleet{
+		Metadata: domain.ObjectMeta{
+			Name:        &fleetName,
+			Annotations: &map[string]string{domain.FleetAnnotationTemplateVersion: fleetTV},
+		},
+	}
+	fs := &stubFleetStore{fleet: fleet}
+	owner := "Fleet/test-fleet"
+
+	tests := []struct {
+		name            string
+		annotations     map[string]string
+		conditions      []domain.Condition
+		expectedContain string
+	}{
+		{
+			name: "When only lastRolloutError is present it should show the rollout error",
+			annotations: map[string]string{
+				domain.DeviceAnnotationTemplateVersion:  "v1",
+				domain.DeviceAnnotationLastRolloutError: "failed replacing parameters in env var DNS_SERVER_DOMAIN",
+			},
+			conditions:      nil,
+			expectedContain: "failed replacing parameters in env var DNS_SERVER_DOMAIN",
+		},
+		{
+			name: "When both lastRolloutError and DeviceUpdating error exist it should prefer rollout error",
+			annotations: map[string]string{
+				domain.DeviceAnnotationTemplateVersion:  "v1",
+				domain.DeviceAnnotationLastRolloutError: "template rendering failure",
+			},
+			conditions: []domain.Condition{
+				{
+					Type:    domain.ConditionTypeDeviceUpdating,
+					Status:  domain.ConditionStatusFalse,
+					Reason:  string(domain.UpdateStateError),
+					Message: "old agent update error",
+				},
+			},
+			expectedContain: "template rendering failure",
+		},
+		{
+			name: "When only DeviceUpdating error is present it should show the agent error",
+			annotations: map[string]string{
+				domain.DeviceAnnotationTemplateVersion: "v1",
+			},
+			conditions: []domain.Condition{
+				{
+					Type:    domain.ConditionTypeDeviceUpdating,
+					Status:  domain.ConditionStatusFalse,
+					Reason:  string(domain.UpdateStateError),
+					Message: "agent update failed",
+				},
+			},
+			expectedContain: "agent update failed",
+		},
+		{
+			name: "When neither error source is present it should show generic out-of-sync message",
+			annotations: map[string]string{
+				domain.DeviceAnnotationTemplateVersion: "v1",
+			},
+			conditions:      nil,
+			expectedContain: domain.DeviceOutOfSyncWithFleetText,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			device := &domain.Device{
+				Metadata: domain.ObjectMeta{
+					Name:        lo.ToPtr("test-device"),
+					Owner:       &owner,
+					Annotations: &tt.annotations,
+				},
+				Spec: &domain.DeviceSpec{},
+				Status: &domain.DeviceStatus{
+					LastSeen:   lo.ToPtr(time.Now()),
+					Updated:    domain.DeviceUpdatedStatus{Status: domain.DeviceUpdatedStatusOutOfDate},
+					Conditions: tt.conditions,
+				},
+			}
+
+			changed := updateServerSideDeviceUpdatedStatus(device, ctx, fs, log, orgId)
+
+			assert.False(t, changed, "status enum did not change so changed must be false")
+			assert.Equal(t, domain.DeviceUpdatedStatusOutOfDate, device.Status.Updated.Status)
+			assert.Contains(t, *device.Status.Updated.Info, tt.expectedContain)
 		})
 	}
 }

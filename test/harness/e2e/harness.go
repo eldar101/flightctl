@@ -64,6 +64,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -88,6 +89,17 @@ const fiveSecondTimeout = 5 * time.Second
 
 // setupSnapshotRestoreTimeout is the maximum time allowed for VM snapshot restore in BeforeEach.
 const setupSnapshotRestoreTimeout = 10 * time.Minute
+
+const (
+	cliRateLimitRetryAttempts       = 8
+	cliRateLimitRetryDelay          = 2 * time.Second
+	cliRateLimitResponseStatus      = "response status: 429"
+	cliRateLimitServerReturned      = "server returned 429"
+	cliRateLimitExceeded            = "rate limit exceeded"
+	cliLoginRateLimitExceededOutput = "Login rate limit exceeded, please try again later"
+	flightctlAgentStartAttempts     = 5
+	flightctlAgentStartRetryDelay   = 2 * time.Second
+)
 
 const (
 	POLLING     = "250ms"
@@ -759,18 +771,47 @@ func (h *Harness) RunInteractiveCLI(args ...string) (io.WriteCloser, io.ReadClos
 }
 
 func (h *Harness) CLIWithStdin(stdin string, args ...string) (string, error) {
-	return h.SHWithStdin(stdin, flightctlPath(), args...)
+	return h.SHWithStdin(stdin, flightctlPath(), false, args...)
 }
 
-func (h *Harness) SHWithStdin(stdin, command string, args ...string) (string, error) {
-	cmd := exec.Command(command)
+// CLIWithStdinRedacted runs the flightctl CLI with the given stdin, suppressing stdin from logs.
+// Use this when stdin contains credentials or other sensitive data.
+func (h *Harness) CLIWithStdinRedacted(stdin string, args ...string) (string, error) {
+	return h.SHWithStdin(stdin, flightctlPath(), true, args...)
+}
 
-	cmd.Stdin = strings.NewReader(stdin)
+// SHWithStdin runs a command with stdin. Set redactStdin to true to suppress stdin from logs (e.g. secrets).
+func (h *Harness) SHWithStdin(stdin, command string, redactStdin bool, args ...string) (string, error) {
+	stdinLog := stdin
+	if redactStdin {
+		stdinLog = "<redacted>"
+	}
 
-	h.setArgsInCmd(cmd, args...)
+	var output []byte
+	var err error
+	var cmd *exec.Cmd
+	ctx := h.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for attempt := 1; attempt <= cliRateLimitRetryAttempts; attempt++ {
+		cmd = exec.CommandContext(ctx, command)
+		cmd.Stdin = strings.NewReader(stdin)
+		h.setArgsInCmd(cmd, args...)
 
-	logrus.Infof("running: %s with stdin: %s", strings.Join(cmd.Args, " "), stdin)
-	output, err := cmd.CombinedOutput()
+		logrus.Infof("running: %s with stdin: %s", strings.Join(redactCommandArgs(cmd.Args), " "), stdinLog)
+		output, err = cmd.CombinedOutput()
+		if err == nil || !isCLIRateLimitOutput(string(output)) || attempt == cliRateLimitRetryAttempts {
+			break
+		}
+		logrus.Warnf("%s hit API rate limit, retrying attempt %d/%d in %s", cmd.Args[0], attempt+1, cliRateLimitRetryAttempts, cliRateLimitRetryDelay)
+		select {
+		case <-ctx.Done():
+			return string(output), ctx.Err()
+		case <-time.After(cliRateLimitRetryDelay):
+		}
+	}
+
 	if err != nil {
 		logrus.Errorf("executing cli: %s", err)
 		// keeping standard error output for debugging, otherwise log output
@@ -779,6 +820,59 @@ func (h *Harness) SHWithStdin(stdin, command string, args ...string) (string, er
 	}
 
 	return string(output), err
+}
+
+// isCLIRateLimitOutput reports whether CLI output indicates an API rate limit.
+func isCLIRateLimitOutput(output string) bool {
+	normalizedOutput := strings.ToLower(output)
+	return strings.Contains(output, cliRateLimitResponseStatus) ||
+		strings.Contains(output, cliRateLimitServerReturned) ||
+		strings.Contains(normalizedOutput, cliRateLimitExceeded)
+}
+
+// redactCommandArgs returns a copy of args with known credential-bearing values
+// replaced before command lines are written to logs.
+func redactCommandArgs(args []string) []string {
+	redactedArgs := slices.Clone(args)
+	redactNext := false
+	for i, arg := range redactedArgs {
+		if redactNext {
+			redactedArgs[i] = "<redacted>"
+			redactNext = false
+			continue
+		}
+		if isSensitiveArg(arg) {
+			if strings.Contains(arg, "=") {
+				redactedArgs[i] = redactInlineArgValue(arg)
+			} else {
+				redactNext = true
+			}
+		}
+	}
+	return redactedArgs
+}
+
+// isSensitiveArg reports whether an argument key carries a value that must not
+// be written to logs.
+func isSensitiveArg(arg string) bool {
+	switch arg {
+	case "--token", "-p", "--password", "--client-key", "--client-key-data":
+		return true
+	default:
+		return strings.HasPrefix(arg, "--token=") ||
+			strings.HasPrefix(arg, "--password=") ||
+			strings.HasPrefix(arg, "--client-key=") ||
+			strings.HasPrefix(arg, "--client-key-data=")
+	}
+}
+
+// redactInlineArgValue replaces the value in a --flag=value style argument.
+func redactInlineArgValue(arg string) string {
+	key, _, found := strings.Cut(arg, "=")
+	if !found {
+		return arg
+	}
+	return key + "=<redacted>"
 }
 
 func flightctlPath() string {
@@ -829,7 +923,7 @@ func (h *Harness) CLIWithEnvAndShell(env map[string]string, shellCommand string)
 }
 
 func (h *Harness) SH(command string, args ...string) (string, error) {
-	return h.SHWithStdin("", command, args...)
+	return h.SHWithStdin("", command, false, args...)
 }
 
 func updateResourceWithRetries(updateFunc func() error) {
@@ -1009,7 +1103,7 @@ func (h *Harness) CleanUpTestResources(resourceTypes ...string) error {
 			if line == "" {
 				continue
 			}
-			resourceNames = append(resourceNames, line)
+			resourceNames = append(resourceNames, resourceNameFromCLIOutput(line))
 		}
 
 		if len(resourceNames) == 0 {
@@ -1017,12 +1111,18 @@ func (h *Harness) CleanUpTestResources(resourceTypes ...string) error {
 			continue
 		}
 
-		// Delete the resources by name
-		deleteArgs := append([]string{"delete", resourceType}, resourceNames...)
-		_, err = h.CLI(deleteArgs...)
-		if err != nil {
-			logrus.Infof("Error deleting %s resources with test-id %s: %v", resourceType, testID, err)
-			return err
+		// Delete resources individually. Bulk deletes can partially succeed before
+		// a rate-limit response, which makes retries fail on already-deleted names.
+		for _, resourceName := range resourceNames {
+			output, err := h.CLI("delete", resourceType, resourceName)
+			if err != nil {
+				if isCLINotFoundOutput(output) {
+					logrus.Debugf("%s resource %s was already deleted during cleanup for test-id %s", resourceType, resourceName, testID)
+					continue
+				}
+				logrus.Infof("Error deleting %s resource %s with test-id %s: %v", resourceType, resourceName, testID, err)
+				return fmt.Errorf("deleting %s resource %s: %w", resourceType, resourceName, err)
+			}
 		}
 
 		logrus.Infof("Successfully deleted %d %s resources with test-id %s: %v", len(resourceNames), resourceType, testID, resourceNames)
@@ -1032,12 +1132,34 @@ func (h *Harness) CleanUpTestResources(resourceTypes ...string) error {
 	return nil
 }
 
+// resourceNameFromCLIOutput extracts the resource name from CLI "-o name" output.
+func resourceNameFromCLIOutput(resource string) string {
+	if !strings.Contains(resource, "/") {
+		return resource
+	}
+	parts := strings.Split(resource, "/")
+	return parts[len(parts)-1]
+}
+
+// isCLINotFoundOutput reports whether CLI output describes a missing resource.
+func isCLINotFoundOutput(output string) bool {
+	output = strings.ToLower(output)
+	return strings.Contains(output, "not found") ||
+		strings.Contains(output, "response status: 404") ||
+		strings.Contains(output, "server returned 404")
+}
+
 // cleanUpEnrollmentRequests handles the special case for enrollment requests
 // Since enrollment requests don't support labels, we need to:
-// 1. Get devices with the test label
-// 2. Delete enrollment requests with the same names as those devices
+// 1. Delete pending ERs whose spec.labels include the test-id (simulator skip-auto-approve path)
+// 2. Get devices with the test label
+// 3. Delete enrollment requests with the same names as those devices
 func (h *Harness) cleanUpEnrollmentRequests(testID string) error {
 	logrus.Debugf("Cleaning up enrollment requests for test-id: %s", testID)
+
+	if err := h.deleteEnrollmentRequestsBySpecTestID(testID); err != nil {
+		return fmt.Errorf("deleting enrollment requests by spec test-id: %w", err)
+	}
 
 	// Get devices with the test label
 	devices, err := h.CLI("get", util.Device, "-l", fmt.Sprintf("test-id=%s", testID), "-o", "name")
@@ -1821,22 +1943,32 @@ func (h *Harness) SetupVMFromPoolAndStartAgent(workerID int) error {
 	if err := h.SetupVMFromPool(workerID); err != nil {
 		return err
 	}
-	testVM := h.VM
 
-	const flightctlAgentStartAttempts = 5
-	const flightctlAgentStartRetryDelay = 2 * time.Second
+	return h.StartAgentWithRetry()
+}
 
-	// Start the agent after snapshot revert (retry: systemd may report "Job ... canceled" right after QEMU resume).
+// StartAgentWithRetry starts flightctl-agent after snapshot restore and retries
+// transient systemd start failures caused by VM resume timing.
+func (h *Harness) StartAgentWithRetry() error {
+	if h == nil {
+		return fmt.Errorf("harness is nil")
+	}
+	if h.VM == nil {
+		return fmt.Errorf("harness VM is nil")
+	}
+
 	GinkgoWriter.Printf("🔄 Starting flightctl-agent after snapshot revert\n")
-	if _, err := testVM.RunSSH([]string{"sudo", "systemctl", "daemon-reload"}, nil); err != nil {
+	if _, err := h.VM.RunSSH([]string{"sudo", "systemctl", "daemon-reload"}, nil); err != nil {
 		logrus.Warnf("daemon-reload before starting flightctl-agent: %v", err)
 	}
 	time.Sleep(time.Second)
 
 	var lastErr error
 	for attempt := 1; attempt <= flightctlAgentStartAttempts; attempt++ {
-		_, _ = testVM.RunSSH([]string{"sudo", "systemctl", "reset-failed", "flightctl-agent"}, nil)
-		_, err := testVM.RunSSH([]string{"sudo", "systemctl", "start", "flightctl-agent"}, nil)
+		if _, err := h.VM.RunSSH([]string{"sudo", "systemctl", "reset-failed", "flightctl-agent"}, nil); err != nil {
+			logrus.Warnf("systemctl reset-failed flightctl-agent before start attempt %d/%d failed: %v", attempt, flightctlAgentStartAttempts, err)
+		}
+		_, err := h.VM.RunSSH([]string{"sudo", "systemctl", "start", "flightctl-agent"}, nil)
 		if err == nil {
 			GinkgoWriter.Printf("✅ flightctl-agent started successfully after snapshot revert\n")
 			return nil
@@ -2656,7 +2788,7 @@ func printAgentFilesForVM(vm vm.TestVMInterface, context string) {
 	agentFiles := map[string]string{
 		"current.json": "/var/lib/flightctl/current.json",
 		"desired.json": "/var/lib/flightctl/desired.json",
-		"agent secret": "/etc/flightctl/certs/agent.crt",
+		"agent cert":   "/var/lib/flightctl/certs/agent.crt",
 	}
 
 	for fileType, filePath := range agentFiles {

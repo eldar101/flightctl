@@ -3,8 +3,10 @@ package quadlet
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	v1beta1 "github.com/flightctl/flightctl/api/core/v1beta1"
 	"github.com/flightctl/flightctl/pkg/template"
 	"github.com/flightctl/flightctl/test/e2e/infra"
 	"github.com/stretchr/testify/assert"
@@ -110,6 +112,9 @@ db:
 service:
   rateLimit:
     enabled: false
+worker:
+  vmRender:
+    passtWorkarounds: true
 imagebuilderWorker:
   logLevel: info
   maxConcurrentBuilds: 2
@@ -144,6 +149,18 @@ vulnerabilityReporting:
 			var assertValue func(t *testing.T, section interface{})
 
 			switch service {
+			case infra.ServiceWorker:
+				sectionKey = "worker"
+				setValue = "quay.io/kubevirt/virt-launcher:v1.9.0"
+				getSection = func(m map[string]interface{}) interface{} { return m["worker"] }
+				assertValue = func(t *testing.T, section interface{}) {
+					s, ok := section.(map[string]interface{})
+					require.True(t, ok)
+					vmRender, ok := s["vmRender"].(map[string]interface{})
+					require.True(t, ok)
+					assert.Equal(t, "quay.io/kubevirt/virt-launcher:v1.9.0", vmRender["launcherImage"])
+					assert.Equal(t, false, vmRender["passtWorkarounds"])
+				}
 			case infra.ServiceImageBuilderWorker:
 				sectionKey = "imageBuilderWorker"
 				setValue = float64(6)
@@ -201,6 +218,11 @@ vulnerabilityReporting:
 			require.NotNil(t, section, "section %q not found in config", sectionKey)
 			// Set the field we care about based on service type
 			switch service {
+			case infra.ServiceWorker:
+				vmRender, ok := section["vmRender"].(map[string]interface{})
+				require.True(t, ok)
+				vmRender["launcherImage"] = setValue
+				vmRender["passtWorkarounds"] = false
 			case infra.ServiceImageBuilderWorker:
 				section["maxConcurrentBuilds"] = setValue
 			case infra.ServiceTelemetryGateway:
@@ -272,8 +294,8 @@ imagebuilderWorker:
 }
 
 func TestApplyServiceConfigMappings_NoMappingReturnsNil(t *testing.T) {
-	// Use a service without mappings (ServiceWorker has none)
-	updates, err := applyServiceConfigMappings(infra.ServiceWorker, exampleImageBuilderWorkerPerServiceYAML)
+	// Use a service without mappings (ServiceUI has none)
+	updates, err := applyServiceConfigMappings(infra.ServiceUI, exampleImageBuilderWorkerPerServiceYAML)
 	require.NoError(t, err)
 	assert.Nil(t, updates)
 }
@@ -318,6 +340,54 @@ vulnerabilityReporting:
 			assert.Equal(t, "none", auth["mode"])
 		})
 	}
+}
+
+// TestApplyServiceConfigMappings_DependenciesSync verifies that the dependenciesSync
+// section is correctly extracted from per-service config into service-config.yaml updates.
+// Equivalent to TestApplyServiceConfigMappings_VulnerabilityReporting for the dependenciesSync mapping.
+func TestApplyServiceConfigMappings_DependenciesSync(t *testing.T) {
+	configYAML := `
+dependenciesSync:
+  pollInterval: 30s
+`
+	updates, err := applyServiceConfigMappings(infra.ServicePeriodic, configYAML)
+	require.NoError(t, err)
+	require.NotNil(t, updates)
+
+	section, ok := updates["dependenciesSync"].(map[string]interface{})
+	require.True(t, ok, "updates should contain dependenciesSync")
+	assert.Equal(t, "30s", section["pollInterval"])
+}
+
+// TestApplyServiceConfigMappings_DependenciesSyncDeletion verifies that an explicit null
+// for dependenciesSync signals deletion from service-config.yaml.
+// Equivalent to TestApplyServiceConfigMappings_VulnerabilityReportingDeletion for the dependenciesSync mapping.
+func TestApplyServiceConfigMappings_DependenciesSyncDeletion(t *testing.T) {
+	configYAML := `
+dependenciesSync: null
+`
+	updates, err := applyServiceConfigMappings(infra.ServicePeriodic, configYAML)
+	require.NoError(t, err)
+	require.NotNil(t, updates, "should return updates map")
+
+	value, exists := updates["dependenciesSync"]
+	require.True(t, exists, "updates should contain dependenciesSync key")
+	assert.Nil(t, value, "value should be nil to signal deletion")
+}
+
+// TestApplyServiceConfigMappings_DependenciesSyncMissing verifies that a missing
+// dependenciesSync key does not appear in updates, leaving the existing value unchanged.
+// Equivalent to TestApplyServiceConfigMappings_VulnerabilityReportingMissing for the dependenciesSync mapping.
+func TestApplyServiceConfigMappings_DependenciesSyncMissing(t *testing.T) {
+	configYAML := `
+database: {}
+`
+	updates, err := applyServiceConfigMappings(infra.ServicePeriodic, configYAML)
+	require.NoError(t, err)
+	require.NotNil(t, updates, "should return updates map (possibly empty)")
+
+	_, exists := updates["dependenciesSync"]
+	assert.False(t, exists, "missing key should not be in updates")
 }
 
 func TestApplyServiceConfigMappings_VulnerabilityReportingDeletion(t *testing.T) {
@@ -441,4 +511,73 @@ func TestDeepCopyMap(t *testing.T) {
 	inner := copied["b"].(map[string]interface{})
 	inner["c"] = 100
 	assert.Equal(t, 2, orig["b"].(map[string]interface{})["c"], "nested map should be copied")
+}
+
+func TestEncryptionConfigSurvivesRender(t *testing.T) {
+	serviceConfig := map[string]interface{}{
+		"global": map[string]interface{}{
+			"baseDomain":           "test.example.com",
+			"generateCertificates": "builtin",
+			"auth": map[string]interface{}{
+				"type":                  "none",
+				"insecureSkipTlsVerify": true,
+			},
+		},
+		"db": map[string]interface{}{
+			"name": "flightctl",
+			"type": "builtin",
+		},
+		"service": map[string]interface{}{
+			"rateLimit": map[string]interface{}{
+				"enabled": false,
+			},
+		},
+		"encryption": map[string]interface{}{
+			"activeKeyID": "key-2026-07",
+			"keys": []interface{}{
+				map[string]interface{}{"id": "default", "path": "/root/.flightctl/encryption/key"},
+				map[string]interface{}{"id": "key-2026-07", "path": "/root/.flightctl/encryption/key-2026-07"},
+			},
+		},
+	}
+
+	encryptionServices := []string{
+		"flightctl-api",
+		"flightctl-worker",
+		"flightctl-periodic",
+		"flightctl-alert-exporter",
+		"flightctl-alertmanager-proxy",
+		"flightctl-remote-access",
+		"flightctl-imagebuilder-api",
+		"flightctl-imagebuilder-worker",
+	}
+
+	repoRoot := findRepoRoot(t)
+	for _, svc := range encryptionServices {
+		t.Run(svc, func(t *testing.T) {
+			tplPath := filepath.Join(repoRoot, "deploy", "podman", svc, svc+"-config", "config.yaml.template")
+			if _, err := os.Stat(tplPath); err != nil {
+				t.Fatalf("template not found (run from repo root): %s", tplPath)
+			}
+
+			outDir := t.TempDir()
+			outPath := filepath.Join(outDir, "config.yaml")
+			err := template.RenderWithData(serviceConfig, tplPath, outPath,
+				template.WithFuncMap(v1beta1.GetGoTemplateFuncMap()))
+			require.NoError(t, err)
+
+			rendered, err := os.ReadFile(outPath)
+			require.NoError(t, err)
+			content := string(rendered)
+
+			assert.True(t, strings.Contains(content, "activeKeyID: key-2026-07"),
+				"%s: rendered config should contain activeKeyID: key-2026-07", svc)
+			assert.True(t, strings.Contains(content, "id: default"),
+				"%s: rendered config should contain the default key entry", svc)
+			assert.True(t, strings.Contains(content, "id: key-2026-07"),
+				"%s: rendered config should contain the rotated key entry", svc)
+			assert.True(t, strings.Contains(content, "path: /root/.flightctl/encryption/key-2026-07"),
+				"%s: rendered config should contain the rotated key path", svc)
+		})
+	}
 }

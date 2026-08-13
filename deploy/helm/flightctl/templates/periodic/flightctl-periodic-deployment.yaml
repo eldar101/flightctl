@@ -29,7 +29,7 @@ spec:
       {{- include "flightctl.migrationWaitInitContainer" (dict "context" . "timeout" 600) | nindent 6 }}
       containers:
         - name: periodic
-          image: {{ include "flightctl.ensureOsQualifiedImage" .Values.periodic.image.image }}:{{ default .Chart.AppVersion .Values.periodic.image.tag }}
+          image: {{ include "flightctl.ensureOsQualifiedImage" (dict "root" . "imageName" .Values.periodic.image.image) }}:{{ default .Chart.AppVersion .Values.periodic.image.tag }}
           imagePullPolicy: {{ default .Values.global.imagePullPolicy .Values.periodic.image.pullPolicy }}
           ports:
             - containerPort: 15690
@@ -82,6 +82,9 @@ spec:
             - mountPath: /etc/flightctl/ssh
               name: flightctl-ssh-known-hosts
               readOnly: true
+            - mountPath: /root/.flightctl/encryption
+              name: flightctl-encryption-key
+              readOnly: true
             {{- include "flightctl.dbSslVolumeMounts" . | nindent 12 }}
 
       restartPolicy: Always
@@ -95,4 +98,8 @@ spec:
             items:
               - key: known_hosts
                 path: known_hosts
+        - name: flightctl-encryption-key
+          secret:
+            secretName: flightctl-encryption-key
+            defaultMode: 0400
         {{- include "flightctl.dbSslVolumes" . | nindent 8 }}

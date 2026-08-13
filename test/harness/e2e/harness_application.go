@@ -19,6 +19,50 @@ import (
 const (
 	// QuadletUnitPath is the quadlet unit path on device (rootful)
 	QuadletUnitPath = "/etc/containers/systemd"
+
+	// vmYAMLTemplate is a KubeVirt VirtualMachine manifest template for e2e VM tests.
+	// Placeholders: 1=name, 2=containerdisk image.
+	vmYAMLTemplate = `apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: %s
+spec:
+  running: true
+  template:
+    spec:
+      domain:
+        devices:
+          disks:
+          - disk:
+              bus: virtio
+            name: containerdisk
+          - disk:
+              bus: virtio
+            name: cloudinitdisk
+          interfaces:
+          - masquerade: {}
+            name: default
+            ports:
+            - port: 2222
+          rng: {}
+        memory:
+          guest: 1024M
+        resources: {}
+      networks:
+      - name: default
+        pod: {}
+      volumes:
+      - containerdisk:
+          image: %s
+        name: containerdisk
+      - cloudInitNoCloud:
+          userData: |-
+            #cloud-config
+            ssh_pwauth: true
+            password: fedora
+            chpasswd: { expire: False }
+        name: cloudinitdisk
+`
 )
 
 // QuadletPathForUser returns the quadlet systemd path for the given user.
@@ -202,10 +246,16 @@ func NewContainerApplicationSpecWithRunAs(
 	containerApp := v1beta1.ContainerApplication{
 		Name:      lo.ToPtr(name),
 		AppType:   v1beta1.AppTypeContainer,
-		Image:     image,
-		Ports:     &ports,
 		Resources: resources,
 		Volumes:   volumes,
+	}
+	if err := containerApp.FromImageApplicationProviderSpec(v1beta1.ImageApplicationProviderSpec{Image: image}); err != nil {
+		return v1beta1.ApplicationProviderSpec{}, err
+	}
+	// Only set Ports when non-nil. A non-nil pointer to a nil slice marshals as
+	// "ports": null, which OpenAPI validation rejects.
+	if ports != nil {
+		containerApp.Ports = &ports
 	}
 	if runAs != "" {
 		containerApp.RunAs = v1beta1.Username(runAs)
@@ -231,13 +281,42 @@ func NewMountVolume(name, mountPath string) (v1beta1.ApplicationVolume, error) {
 	return volume, err
 }
 
+// NewVmApplicationSpec creates an inline VmApplication spec containing a KubeVirt
+// VirtualMachine manifest (vm.yaml). The port mapping is expressed via
+// publishPorts so that the server-side renderer can inject it into the
+// generated .pod unit.
+func NewVmApplicationSpec(name, image string) (v1beta1.ApplicationProviderSpec, error) {
+	vmYAML := fmt.Sprintf(vmYAMLTemplate, name, image)
+	publishPorts := []string{"2222:2222"}
+
+	vmApp := v1beta1.VmApplication{
+		AppType:      v1beta1.AppTypeVm,
+		Name:         lo.ToPtr(name),
+		PublishPorts: &publishPorts,
+	}
+	if err := vmApp.FromInlineApplicationProviderSpec(v1beta1.InlineApplicationProviderSpec{
+		Inline: []v1beta1.ApplicationContent{
+			{Path: "vm.yaml", Content: lo.ToPtr(vmYAML)},
+		},
+	}); err != nil {
+		return v1beta1.ApplicationProviderSpec{}, fmt.Errorf("building inline VM application spec: %w", err)
+	}
+	var appSpec v1beta1.ApplicationProviderSpec
+	if err := appSpec.FromVmApplication(vmApp); err != nil {
+		return v1beta1.ApplicationProviderSpec{}, fmt.Errorf("converting VM application to provider spec: %w", err)
+	}
+	return appSpec, nil
+}
+
 // NewHelmApplicationSpec creates a HelmApplication spec with optional values files.
 func NewHelmApplicationSpec(name, image, namespace string, valuesFiles []string) (v1beta1.ApplicationProviderSpec, error) {
 	helmApp := v1beta1.HelmApplication{
 		AppType:   v1beta1.AppTypeHelm,
 		Name:      lo.ToPtr(name),
-		Image:     image,
 		Namespace: lo.ToPtr(namespace),
+	}
+	if err := helmApp.FromImageApplicationProviderSpec(v1beta1.ImageApplicationProviderSpec{Image: image}); err != nil {
+		return v1beta1.ApplicationProviderSpec{}, err
 	}
 	if len(valuesFiles) > 0 {
 		helmApp.ValuesFiles = &valuesFiles
@@ -252,9 +331,11 @@ func NewHelmApplicationSpecWithValues(name, image, namespace string, values map[
 	helmApp := v1beta1.HelmApplication{
 		AppType:   v1beta1.AppTypeHelm,
 		Name:      lo.ToPtr(name),
-		Image:     image,
 		Namespace: lo.ToPtr(namespace),
 		Values:    &values,
+	}
+	if err := helmApp.FromImageApplicationProviderSpec(v1beta1.ImageApplicationProviderSpec{Image: image}); err != nil {
+		return v1beta1.ApplicationProviderSpec{}, err
 	}
 	var appSpec v1beta1.ApplicationProviderSpec
 	err := appSpec.FromHelmApplication(helmApp)
@@ -422,7 +503,11 @@ func GetContainerApplicationImage(spec v1beta1.ApplicationProviderSpec) (string,
 	if err != nil {
 		return "", err
 	}
-	return app.Image, nil
+	imageSpec, err := app.AsImageApplicationProviderSpec()
+	if err != nil {
+		return "", fmt.Errorf("GetContainerApplicationImage: %w", err)
+	}
+	return imageSpec.Image, nil
 }
 
 // GetContainerApplicationVolumeImageRef returns the image reference of the named volume in a ContainerApplication spec.

@@ -24,9 +24,12 @@ const (
 	QuadletTargetName        = "flightctl-quadlet-app.target"
 
 	podmanImageVolumeDriver = "image"
+	podmanLocalVolumeDriver = "local"
+	podmanTmpfsVolumeType   = "tmpfs"
 )
 
 var _ ActionHandler = (*Quadlet)(nil)
+var _ LifecycleHandler = (*Quadlet)(nil)
 
 type Quadlet struct {
 	systemdFactory systemd.ManagerFactory
@@ -143,36 +146,47 @@ func (q *Quadlet) add(ctx context.Context, action Action, systemctl systemd.Mana
 	return nil
 }
 
-func (q *Quadlet) remove(ctx context.Context, action Action, systemctl systemd.Manager) error {
+// stopUnits stops the application target and all loaded dependent services, then
+// clears any failed state left by non-zero exits. That is common when stopping
+// VM/virt-launcher units, which exit non-zero when killed by systemctl stop.
+// It does not remove unit files or Podman resources.
+//
+// An empty dependency list is not treated as target absence: list-dependencies
+// does not include the queried unit and a loaded target can have no transitive
+// deps. The target's load state is checked first; ListDependencies runs only
+// for loaded targets so a missing unit does not fail stop.
+//
+// Returns the dependency list (may be empty) so callers can update exclusions.
+func (q *Quadlet) stopUnits(ctx context.Context, action Action, systemctl systemd.Manager, target string) ([]string, error) {
 	appName := action.Name
 
-	target, err := targetName(action.ID)
+	targetUnits, err := q.loadedUnits(ctx, systemctl, []string{target})
 	if err != nil {
-		return fmt.Errorf("target name: %w", err)
+		return nil, fmt.Errorf("listing loading units: %w", err)
+	}
+	if _, loaded := targetUnits[target]; !loaded {
+		q.log.Debugf("Skipping stop for %s: target %s is not loaded", appName, target)
+		return nil, nil
 	}
 
 	services, err := systemctl.ListDependencies(ctx, target)
 	if err != nil {
-		return fmt.Errorf("listing dependencies: %w", err)
-	}
-
-	// If there are no dependencies, the target was never created or has already
-	// been removed. Skip stopping and proceed directly to resource cleanup for
-	// idempotent removal.
-	if len(services) == 0 {
-		q.log.Debugf("Skipping stop for %s: target has no dependencies", appName)
-		return q.cleanResources(ctx, action)
+		return nil, fmt.Errorf("listing dependencies: %w", err)
 	}
 
 	q.log.Debugf("Stopping quadlet: %s target: %s", appName, target)
-	// stopping the target will begin stopping the individual services, but it is not a synchronous operation.
+	// Stopping the target begins stopping the individual services, but it is not synchronous.
 	if err := systemctl.Stop(ctx, target); err != nil {
-		return fmt.Errorf("stopping target %s: %w", target, err)
+		return nil, fmt.Errorf("stopping target %s: %w", target, err)
+	}
+
+	if len(services) == 0 {
+		return services, nil
 	}
 
 	unitSet, err := q.loadedUnits(ctx, systemctl, services)
 	if err != nil {
-		return fmt.Errorf("listing loading units: %w", err)
+		return nil, fmt.Errorf("listing loading units: %w", err)
 	}
 
 	if len(unitSet) > 0 {
@@ -180,17 +194,32 @@ func (q *Quadlet) remove(ctx context.Context, action Action, systemctl systemd.M
 		for service := range unitSet {
 			servicesToStop = append(servicesToStop, service)
 		}
-		// stop and wait for all services to finish
+		// Stop and wait for all services to finish.
 		q.log.Debugf("Stopping quadlet: %s services: %s", appName, strings.Join(servicesToStop, ", "))
 		if err := systemctl.Stop(ctx, servicesToStop...); err != nil {
-			return fmt.Errorf("stopping services: %w", err)
+			return nil, fmt.Errorf("stopping services: %w", err)
 		}
 		q.log.Debugf("Resetting failed state for services: %q", strings.Join(servicesToStop, ", "))
-		// Reset all services so that properties such as restart counts are reset
+		// Clear failed state (and restart counts) so stopped units do not linger in "Failed Units".
 		if err := systemctl.ResetFailed(ctx, servicesToStop...); err != nil {
-			return fmt.Errorf("resetting failed: %w", err)
+			return nil, fmt.Errorf("resetting failed: %w", err)
 		}
 	}
+
+	return services, nil
+}
+
+func (q *Quadlet) remove(ctx context.Context, action Action, systemctl systemd.Manager) error {
+	target, err := targetName(action.ID)
+	if err != nil {
+		return fmt.Errorf("target name: %w", err)
+	}
+
+	services, err := q.stopUnits(ctx, action, systemctl, target)
+	if err != nil {
+		return err
+	}
+
 	systemctl.RemoveExclusions(append(services, target)...)
 
 	return q.cleanResources(ctx, action)
@@ -221,16 +250,20 @@ func (q *Quadlet) cleanResources(ctx context.Context, action Action) error {
 	return nil
 }
 
-// removeImageBackedVolumes removes volumes that use Podman's native image driver.
-// Image-driver volumes are read-only overlays fully derived from their
-// source image — they contain no user data and Podman recreates them automatically on next container start.
-func removeImageBackedVolumes(ctx context.Context, log *log.PrefixLogger, podman *client.Podman, labels, filters []string) error {
+// removeEphemeralVolumes removes volumes that require no explicit cleanup:
+//   - image-driver volumes: read-only overlays fully derived from their source
+//     image, containing no user data. Podman recreates them automatically on
+//     next container start.
+//   - tmpfs-backed local volumes: Podman's stand-in for a Kubernetes emptyDir.
+//     Like emptyDir, their content must not survive pod deletion/recreation;
+//     Podman recreates them empty on next container start.
+func removeEphemeralVolumes(ctx context.Context, log *log.PrefixLogger, podman *client.Podman, labels, filters []string) error {
 	volumes, err := podman.ListVolumes(ctx, labels, filters)
 	if err != nil {
 		return fmt.Errorf("listing volumes: %w", err)
 	}
 
-	var imageVolumes []string
+	var ephemeralVolumes []string
 	for _, volume := range volumes {
 		driver, err := podman.InspectVolumeDriver(ctx, volume)
 		if err != nil {
@@ -238,17 +271,77 @@ func removeImageBackedVolumes(ctx context.Context, log *log.PrefixLogger, podman
 			continue
 		}
 		if driver == podmanImageVolumeDriver {
-			imageVolumes = append(imageVolumes, volume)
+			ephemeralVolumes = append(ephemeralVolumes, volume)
+			continue
+		}
+		if driver != podmanLocalVolumeDriver {
+			continue
+		}
+
+		optionType, err := podman.InspectVolumeOptionType(ctx, volume)
+		if err != nil {
+			log.Warnf("Failed to inspect volume %q options, skipping: %v", volume, err)
+			continue
+		}
+		if optionType == podmanTmpfsVolumeType {
+			ephemeralVolumes = append(ephemeralVolumes, volume)
 		}
 	}
 
-	if len(imageVolumes) > 0 {
-		log.Debugf("Removing %d image-backed volume(s)", len(imageVolumes))
-		if err := podman.RemoveVolumes(ctx, imageVolumes...); err != nil {
+	if len(ephemeralVolumes) > 0 {
+		log.Debugf("Removing %d ephemeral volume(s)", len(ephemeralVolumes))
+		if err := podman.RemoveVolumes(ctx, ephemeralVolumes...); err != nil {
 			return fmt.Errorf("removing volumes: %w", err)
 		}
 	}
 	return nil
+}
+
+// resolveTarget resolves the systemd client and target name for the action's user/app.
+func (q *Quadlet) resolveTarget(action Action) (systemd.Manager, string, error) {
+	systemctl, err := q.systemdFactory(action.User)
+	if err != nil {
+		return nil, "", fmt.Errorf("creating systemd client: %w", err)
+	}
+	target, err := targetName(action.ID)
+	if err != nil {
+		return nil, "", fmt.Errorf("target name: %w", err)
+	}
+	return systemctl, target, nil
+}
+
+// Stop stops the application's systemd target and dependent services without
+// removing files or Podman resources. It also clears failed unit state so that
+// expected non-zero exits (for example virt-launcher killed on stop) do not
+// remain listed as Failed Units.
+func (q *Quadlet) Stop(ctx context.Context, action Action) error {
+	systemctl, target, err := q.resolveTarget(action)
+	if err != nil {
+		return err
+	}
+	_, err = q.stopUnits(ctx, action, systemctl, target)
+	return err
+}
+
+// Start starts a previously stopped application's systemd target.
+// The unit files are already on disk — no DaemonReload is required.
+func (q *Quadlet) Start(ctx context.Context, action Action) error {
+	systemctl, target, err := q.resolveTarget(action)
+	if err != nil {
+		return err
+	}
+	return systemctl.Start(ctx, target)
+}
+
+// Restart restarts the application's systemd target directly. VM workloads are
+// rendered as native quadlet units like any other application, so no special
+// handling is required.
+func (q *Quadlet) Restart(ctx context.Context, action Action) error {
+	systemctl, target, err := q.resolveTarget(action)
+	if err != nil {
+		return err
+	}
+	return systemctl.Restart(ctx, target)
 }
 
 func (q *Quadlet) Execute(ctx context.Context, actions Actions) error {

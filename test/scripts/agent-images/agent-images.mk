@@ -14,12 +14,12 @@ $(E2E_AGENT_IMAGES_SENTINEL): | bin
 		case "$(AGENT_OS_ID)" in \
 			cs10*) \
 				echo "Using COPR packages for EL10 build"; \
-				BUILD_TYPE=$(BUILD_TYPE) BREW_BUILD_URL=$(BREW_BUILD_URL) SOURCE_GIT_TAG=$(SOURCE_GIT_TAG) SOURCE_GIT_TREE_STATE=$(SOURCE_GIT_TREE_STATE) SOURCE_GIT_COMMIT=$(SOURCE_GIT_COMMIT) \
+				BREW_BUILD_URL=$(BREW_BUILD_URL) SOURCE_GIT_TAG=$(SOURCE_GIT_TAG) SOURCE_GIT_TREE_STATE=$(SOURCE_GIT_TREE_STATE) SOURCE_GIT_COMMIT=$(SOURCE_GIT_COMMIT) \
 					FLIGHTCTL_RPM=stable AGENT_OS_ID=$(AGENT_OS_ID) PUSH_IMAGES=false ARTIFACTS_OUTPUT_DIR=$(AGENT_BUNDLE_DIR) $(ROOT_DIR)/test/scripts/agent-images/create_agent_images.sh; \
 				;; \
 			*) \
 				$(MAKE) bin/.rpm; \
-				BUILD_TYPE=$(BUILD_TYPE) BREW_BUILD_URL=$(BREW_BUILD_URL) SOURCE_GIT_TAG=$(SOURCE_GIT_TAG) SOURCE_GIT_TREE_STATE=$(SOURCE_GIT_TREE_STATE) SOURCE_GIT_COMMIT=$(SOURCE_GIT_COMMIT) \
+				BREW_BUILD_URL=$(BREW_BUILD_URL) SOURCE_GIT_TAG=$(SOURCE_GIT_TAG) SOURCE_GIT_TREE_STATE=$(SOURCE_GIT_TREE_STATE) SOURCE_GIT_COMMIT=$(SOURCE_GIT_COMMIT) \
 					AGENT_OS_ID=$(AGENT_OS_ID) PUSH_IMAGES=false ARTIFACTS_OUTPUT_DIR=$(AGENT_BUNDLE_DIR) $(ROOT_DIR)/test/scripts/agent-images/create_agent_images.sh; \
 				;; \
 		esac; \
@@ -54,7 +54,12 @@ push-e2e-agent-images: e2e-agent-images
 	$(ROOT_DIR)/test/scripts/agent-images/scripts/upload-quadlets.sh
 
 bin/.e2e-agent-certs:
-	./test/scripts/agent-images/prepare_agent_config.sh
+	# Short enrollment-verify interval for e2e speed; wider Cap/Steps so that short
+	# interval cannot exhaust the backoff during pristine VM-pool bootstrap.
+	./test/scripts/agent-images/prepare_agent_config.sh \
+		--enrollment-verify-interval 0m2s \
+		--enrollment-verify-cap 0m90s \
+		--enrollment-verify-steps 11
 	touch bin/.e2e-agent-certs
 
 .PHONY: e2e-agent-images

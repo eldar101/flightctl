@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	api "github.com/flightctl/flightctl/api/core/v1beta1"
 	"github.com/flightctl/flightctl/internal/config"
 	"github.com/sirupsen/logrus"
 	"github.com/sirupsen/logrus/hooks/test"
@@ -20,16 +21,7 @@ func writeServiceConfig(t *testing.T, cfg *config.Config) string {
 	return path
 }
 
-// externalDBServiceConfig returns a config with an external database hostname.
-func externalDBServiceConfig() *config.Config {
-	cfg := config.NewDefault()
-	cfg.Database.Hostname = "db.example.com"
-	cfg.Database.Port = 5432
-	cfg.Database.User = "testuser"
-	cfg.Database.Name = "testdb"
-	cfg.Database.Password = "testpass"
-	return cfg
-}
+const testDBPassword api.SecureString = "x-not-a-real-credential" //nolint:gosec // G101: throwaway test value
 
 // internalDBServiceConfig returns a config with an internal (localhost) database hostname.
 func internalDBServiceConfig() *config.Config {
@@ -38,13 +30,20 @@ func internalDBServiceConfig() *config.Config {
 	cfg.Database.Port = 5432
 	cfg.Database.User = "flightctl"
 	cfg.Database.Name = "flightctl"
-	cfg.Database.Password = "password"
+	cfg.Database.Password = testDBPassword
 	return cfg
 }
 
 func TestPodmanDeployer_BackupDatabase_ExternalDB(t *testing.T) {
 	log, _ := test.NewNullLogger()
-	cfgPath := writeServiceConfig(t, externalDBServiceConfig())
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "service-config.yaml")
+	rawYAML := `db:
+  type: "external"
+  name: flightctl
+`
+	require.NoError(t, os.WriteFile(cfgPath, []byte(rawYAML), 0600))
 
 	deployer := NewPodmanDeployer(log, WithServiceConfigPath(cfgPath))
 	ctx := context.Background()
@@ -113,7 +112,7 @@ func TestPodmanDeployer_BackupDatabase_CommandConstruction(t *testing.T) {
 			cfg.Database.Port = tt.port
 			cfg.Database.User = tt.user
 			cfg.Database.Name = tt.dbname
-			cfg.Database.Password = "testpass"
+			cfg.Database.Password = testDBPassword
 			cfgPath := writeServiceConfig(t, cfg)
 
 			log, _ := test.NewNullLogger()
@@ -180,7 +179,7 @@ func TestPodmanDeployer_BackupDatabase_MissingServiceConfig(t *testing.T) {
 	err := deployer.BackupDatabase(ctx, outputDir)
 
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "failed to load service configuration")
+	require.Contains(t, err.Error(), "failed to read service configuration")
 }
 
 func TestPodmanDeployer_BackupPKI_Success(t *testing.T) {
@@ -304,4 +303,112 @@ func TestPodmanDeployer_BackupConfig_DirectoryPermissions(t *testing.T) {
 	require.NoError(t, err, "config directory should be created")
 	require.True(t, stat.IsDir(), "config should be a directory")
 	require.Equal(t, os.FileMode(0700), stat.Mode().Perm(), "config directory should have 0700 permissions")
+}
+
+func TestPodmanDeployer_BackupEncryptionKeys_MissingDirectory(t *testing.T) {
+	log, _ := test.NewNullLogger()
+
+	nonExistentPath := filepath.Join(t.TempDir(), "does-not-exist")
+	deployer := NewPodmanDeployer(log, WithEncryptionPath(nonExistentPath))
+	ctx := context.Background()
+	outputDir := t.TempDir()
+
+	err := deployer.BackupEncryptionKeys(ctx, outputDir)
+
+	require.NoError(t, err, "missing encryption directory should not be an error")
+
+	encDir := filepath.Join(outputDir, "encryption")
+	_, statErr := os.Stat(encDir)
+	require.True(t, os.IsNotExist(statErr), "encryption output directory should not be created when source is missing")
+}
+
+func TestPodmanDeployer_BackupEncryptionKeys_Success(t *testing.T) {
+	tmpRoot := t.TempDir()
+	encSrc := filepath.Join(tmpRoot, "encryption")
+	require.NoError(t, os.MkdirAll(encSrc, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(encSrc, "encryption.key"), []byte("secret-key"), 0600))
+
+	log, _ := test.NewNullLogger()
+	log.SetLevel(logrus.InfoLevel)
+
+	deployer := NewPodmanDeployer(log, WithEncryptionPath(encSrc))
+	ctx := context.Background()
+	outputDir := t.TempDir()
+
+	err := deployer.BackupEncryptionKeys(ctx, outputDir)
+	require.NoError(t, err)
+
+	encDst := filepath.Join(outputDir, "encryption")
+	require.FileExists(t, filepath.Join(encDst, "encryption.key"))
+
+	data, err := os.ReadFile(filepath.Join(encDst, "encryption.key"))
+	require.NoError(t, err)
+	require.Equal(t, "secret-key", string(data))
+
+	info, err := os.Stat(filepath.Join(encDst, "encryption.key"))
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0600), info.Mode().Perm())
+}
+
+func TestPodmanDeployer_BackupEncryptionKeys_DirectoryPermissions(t *testing.T) {
+	tmpRoot := t.TempDir()
+	encSrc := filepath.Join(tmpRoot, "encryption")
+	require.NoError(t, os.MkdirAll(encSrc, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(encSrc, "key.dat"), []byte("k"), 0600))
+
+	log, _ := test.NewNullLogger()
+	deployer := NewPodmanDeployer(log, WithEncryptionPath(encSrc))
+	ctx := context.Background()
+	outputDir := t.TempDir()
+
+	require.NoError(t, deployer.BackupEncryptionKeys(ctx, outputDir))
+
+	encDst := filepath.Join(outputDir, "encryption")
+	stat, err := os.Stat(encDst)
+	require.NoError(t, err)
+	require.True(t, stat.IsDir())
+	require.Equal(t, os.FileMode(0700), stat.Mode().Perm(), "encryption directory should have 0700 permissions")
+}
+
+func TestPodmanDeployer_BackupEncryptionKeys_CleanupOnError(t *testing.T) {
+	tmpRoot := t.TempDir()
+	encSrc := filepath.Join(tmpRoot, "encryption")
+	require.NoError(t, os.MkdirAll(encSrc, 0755))
+	require.NoError(t, os.Symlink("/dev/null", filepath.Join(encSrc, "badlink")))
+
+	log, _ := test.NewNullLogger()
+	deployer := NewPodmanDeployer(log, WithEncryptionPath(encSrc))
+	ctx := context.Background()
+	outputDir := t.TempDir()
+
+	err := deployer.BackupEncryptionKeys(ctx, outputDir)
+	require.Error(t, err, "should fail when encountering a symlink")
+
+	encDst := filepath.Join(outputDir, "encryption")
+	_, statErr := os.Stat(encDst)
+	require.True(t, os.IsNotExist(statErr), "encryption directory should be cleaned up on error")
+}
+
+func TestPodmanDeployer_BackupEncryptionKeys_PreservesPermissions(t *testing.T) {
+	tmpRoot := t.TempDir()
+	encSrc := filepath.Join(tmpRoot, "encryption")
+	subDir := filepath.Join(encSrc, "subdir")
+	require.NoError(t, os.MkdirAll(subDir, 0750))
+	require.NoError(t, os.WriteFile(filepath.Join(subDir, "nested.key"), []byte("nested"), 0640))
+
+	log, _ := test.NewNullLogger()
+	deployer := NewPodmanDeployer(log, WithEncryptionPath(encSrc))
+	ctx := context.Background()
+	outputDir := t.TempDir()
+
+	require.NoError(t, deployer.BackupEncryptionKeys(ctx, outputDir))
+
+	encDst := filepath.Join(outputDir, "encryption")
+	dirInfo, err := os.Stat(filepath.Join(encDst, "subdir"))
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0750), dirInfo.Mode().Perm())
+
+	fileInfo, err := os.Stat(filepath.Join(encDst, "subdir", "nested.key"))
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0640), fileInfo.Mode().Perm())
 }

@@ -9,8 +9,13 @@ import (
 	"github.com/flightctl/flightctl/internal/config"
 	"github.com/flightctl/flightctl/internal/consts"
 	"github.com/flightctl/flightctl/internal/kvstore"
-	"github.com/flightctl/flightctl/internal/service"
+	deviceservice "github.com/flightctl/flightctl/internal/service/device"
+	"github.com/flightctl/flightctl/internal/service/events"
+	fleetservice "github.com/flightctl/flightctl/internal/service/fleet"
 	"github.com/flightctl/flightctl/internal/store"
+	devicestore "github.com/flightctl/flightctl/internal/store/device"
+	eventstore "github.com/flightctl/flightctl/internal/store/event"
+	fleetstore "github.com/flightctl/flightctl/internal/store/fleet"
 	"github.com/flightctl/flightctl/internal/tasks"
 	"github.com/flightctl/flightctl/internal/worker_client"
 	flightlog "github.com/flightctl/flightctl/pkg/log"
@@ -28,24 +33,23 @@ import (
 
 var _ = Describe("FleetSelector", func() {
 	var (
-		log            *logrus.Logger
-		ctx            context.Context
-		orgId          uuid.UUID
-		deviceStore    store.Device
-		fleetStore     store.Fleet
-		eventStore     store.Event
-		storeInst      store.Store
-		serviceHandler service.Service
-		cfg            *config.Config
-		dbName         string
-		db             *gorm.DB
-		workerClient   worker_client.WorkerClient
-		logic          tasks.FleetSelectorMatchingLogic
+		log          *logrus.Logger
+		ctx          context.Context
+		orgId        uuid.UUID
+		deviceStore  devicestore.Store
+		fleetStore   fleetstore.Store
+		eventStore   eventstore.Store
+		deviceSvc    deviceservice.Service
+		fleetSvc     fleetservice.Service
+		cfg          *config.Config
+		dbName       string
+		db           *gorm.DB
+		workerClient worker_client.WorkerClient
+		logic        tasks.FleetSelectorMatchingLogic
 	)
 
 	BeforeEach(func() {
 		ctx = testutil.StartSpecTracerForGinkgo(suiteCtx)
-		ctx = context.WithValue(ctx, consts.InternalRequestCtxKey, true)
 		ctx = context.WithValue(ctx, consts.EventSourceComponentCtxKey, "flightctl-worker")
 		ctx = context.WithValue(ctx, consts.EventActorCtxKey, "service:flightctl-worker")
 		orgId = store.NullOrgId
@@ -53,17 +57,20 @@ var _ = Describe("FleetSelector", func() {
 		var err error
 		cfg, dbName, db, err = testdb.CreateTestDB(ctx, log, "", store.InitDB)
 		Expect(err).NotTo(HaveOccurred())
-		storeInst = store.NewStore(db, log.WithField("pkg", "store"))
-		deviceStore = storeInst.Device()
-		fleetStore = storeInst.Fleet()
-		eventStore = storeInst.Event()
+		deviceStore = devicestore.NewDeviceStore(db, log.WithField("pkg", "device-store"))
+		fleetStore = fleetstore.NewFleetStore(db, log.WithField("pkg", "fleet-store"))
+		eventStore = eventstore.NewEventStore(db, log.WithField("pkg", "event-store"))
+		newDeviceStore := devicestore.NewDeviceStore(db, log.WithField("pkg", "device-store"))
+		newFleetStore := fleetstore.NewFleetStore(db, log.WithField("pkg", "fleet-store"))
 		ctrl := gomock.NewController(GinkgoT())
 		producer := queues.NewMockQueueProducer(ctrl)
 		producer.EXPECT().Enqueue(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 		workerClient = worker_client.NewWorkerClient(producer, log)
 		kvStore, err := kvstore.NewKVStore(ctx, log, redisHost, redisPort, redisPassword)
 		Expect(err).ToNot(HaveOccurred())
-		serviceHandler = service.NewServiceHandler(storeInst, workerClient, kvStore, nil, log, "", "", []string{}, false)
+		eventsSvc := events.NewServiceHandler(eventStore, workerClient, log)
+		deviceSvc = deviceservice.NewDeviceServiceHandler(newDeviceStore, nil, newFleetStore, eventsSvc, kvStore, "", log)
+		fleetSvc = fleetservice.NewServiceHandler(newFleetStore, nil, eventsSvc, log)
 		event := api.Event{
 			Reason: api.EventReasonResourceUpdated,
 			InvolvedObject: api.ObjectReference{
@@ -71,12 +78,11 @@ var _ = Describe("FleetSelector", func() {
 				Name: "fleet",
 			},
 		}
-		logic = tasks.NewFleetSelectorMatchingLogic(log, serviceHandler, orgId, event)
+		logic = tasks.NewFleetSelectorMatchingLogic(log, deviceSvc, fleetSvc, orgId, event)
 		logic.SetItemsPerPage(2)
 	})
 
 	AfterEach(func() {
-		_ = storeInst.Close()
 		Expect(testdb.DeleteTestDB(ctx, log, cfg, db, dbName)).To(Succeed())
 	})
 
@@ -223,7 +229,7 @@ var _ = Describe("FleetSelector", func() {
 			err := logic.FleetSelectorUpdated(ctx)
 			Expect(err).ToNot(HaveOccurred())
 
-			listParams := store.DeviceListParams{ListParams: store.ListParams{Limit: 0}}
+			listParams := devicestore.DeviceListParams{ListParams: store.ListParams{Limit: 0}}
 			devices, err := deviceStore.List(ctx, orgId, listParams)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(len(devices.Items)).To(Equal(6))
@@ -284,7 +290,7 @@ var _ = Describe("FleetSelector", func() {
 			err := logic.FleetSelectorUpdated(ctx)
 			Expect(err).ToNot(HaveOccurred())
 
-			listParams := store.DeviceListParams{ListParams: store.ListParams{Limit: 0}}
+			listParams := devicestore.DeviceListParams{ListParams: store.ListParams{Limit: 0}}
 			devices, err := deviceStore.List(ctx, orgId, listParams)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(len(devices.Items)).To(Equal(4))
@@ -306,7 +312,7 @@ var _ = Describe("FleetSelector", func() {
 			err := logic.FleetSelectorUpdated(ctx)
 			Expect(err).ToNot(HaveOccurred())
 
-			listParams := store.DeviceListParams{ListParams: store.ListParams{Limit: 0}}
+			listParams := devicestore.DeviceListParams{ListParams: store.ListParams{Limit: 0}}
 			devices, err := deviceStore.List(ctx, orgId, listParams)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(len(devices.Items)).To(Equal(4))
@@ -340,7 +346,7 @@ var _ = Describe("FleetSelector", func() {
 			testutil.CreateTestDevice(ctx, deviceStore, orgId, "nolabels-noowner", nil, nil, &map[string]string{})
 
 			// Set all devices to have multiple owners condition initially
-			listParams := store.DeviceListParams{ListParams: store.ListParams{Limit: 0}}
+			listParams := devicestore.DeviceListParams{ListParams: store.ListParams{Limit: 0}}
 			devices, err := deviceStore.List(ctx, orgId, listParams)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(len(devices.Items)).To(Equal(7))
@@ -428,7 +434,7 @@ var _ = Describe("FleetSelector", func() {
 			err := deviceStore.SetServiceConditions(ctx, orgId, noLabelsNoOwnerDevice, []api.Condition{condition}, nil)
 			Expect(err).ToNot(HaveOccurred())
 
-			listParams := store.DeviceListParams{ListParams: store.ListParams{Limit: 0}}
+			listParams := devicestore.DeviceListParams{ListParams: store.ListParams{Limit: 0}}
 			devices, err := deviceStore.List(ctx, orgId, listParams)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(len(devices.Items)).To(Equal(6))
@@ -441,7 +447,7 @@ var _ = Describe("FleetSelector", func() {
 						Name: *device.Metadata.Name,
 					},
 				}
-				deviceLogic := tasks.NewFleetSelectorMatchingLogic(log, serviceHandler, orgId, event)
+				deviceLogic := tasks.NewFleetSelectorMatchingLogic(log, deviceSvc, fleetSvc, orgId, event)
 				deviceLogic.SetItemsPerPage(2)
 
 				err = deviceLogic.DeviceLabelsUpdated(ctx)
@@ -489,15 +495,40 @@ var _ = Describe("FleetSelector", func() {
 			device, err := deviceStore.Get(ctx, orgId, "decommissioning-device")
 			Expect(err).ToNot(HaveOccurred())
 			device.Spec.Decommissioning = &api.DeviceDecommission{}
-			callback := store.EventCallback(func(context.Context, api.ResourceKind, uuid.UUID, string, interface{}, interface{}, bool, error) {})
-			_, _, err = deviceStore.CreateOrUpdate(ctx, orgId, device, nil, false, nil, callback)
+			name := lo.FromPtr(device.Metadata.Name)
+			_, _, _, err = deviceStore.Mutate(ctx, orgId, name, nil, func(m *devicestore.DeviceMutation) error {
+				if m.Device == nil {
+					m.Device = device
+					return nil
+				}
+				if device.Spec != nil {
+					m.Device.Spec = device.Spec
+				}
+				if device.Status != nil {
+					m.Device.Status = device.Status
+				}
+				store.ApplyObjectMetaUpdate(&m.Device.Metadata, &device.Metadata, nil)
+				return nil
+			})
 			Expect(err).ToNot(HaveOccurred())
 
 			// Change fleet selector so device no longer matches
 			fleet, err := fleetStore.Get(ctx, orgId, "fleet")
 			Expect(err).ToNot(HaveOccurred())
 			fleet.Spec.Selector.MatchLabels = &map[string]string{"different": "value"}
-			_, _, err = fleetStore.CreateOrUpdate(ctx, orgId, fleet, nil, false, nil)
+			fleetName := lo.FromPtr(fleet.Metadata.Name)
+			_, _, _, err = fleetStore.Mutate(ctx, orgId, fleetName, nil, func(m *fleetstore.FleetMutation) error {
+				if m.Fleet == nil {
+					m.Fleet = fleet
+					return nil
+				}
+				m.Fleet.Spec = fleet.Spec
+				if fleet.Status != nil {
+					m.Fleet.Status = fleet.Status
+				}
+				store.ApplyObjectMetaUpdate(&m.Fleet.Metadata, &fleet.Metadata, nil)
+				return nil
+			})
 			Expect(err).ToNot(HaveOccurred())
 
 			err = logic.FleetSelectorUpdated(ctx)
@@ -541,7 +572,7 @@ var _ = Describe("FleetSelector", func() {
 			Expect(err).ToNot(HaveOccurred())
 
 			// All devices should still be owned by fleet
-			listParams := store.DeviceListParams{ListParams: store.ListParams{Limit: 0}}
+			listParams := devicestore.DeviceListParams{ListParams: store.ListParams{Limit: 0}}
 			devices, err := deviceStore.List(ctx, orgId, listParams)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(len(devices.Items)).To(Equal(5))
@@ -565,7 +596,7 @@ var _ = Describe("FleetSelector", func() {
 					Name: "no-labels-device",
 				},
 			}
-			deviceLogic := tasks.NewFleetSelectorMatchingLogic(log, serviceHandler, orgId, event)
+			deviceLogic := tasks.NewFleetSelectorMatchingLogic(log, deviceSvc, fleetSvc, orgId, event)
 			deviceLogic.SetItemsPerPage(2)
 
 			err := deviceLogic.DeviceLabelsUpdated(ctx)
@@ -594,7 +625,7 @@ var _ = Describe("FleetSelector", func() {
 					Name: "empty-labels-device",
 				},
 			}
-			deviceLogic := tasks.NewFleetSelectorMatchingLogic(log, serviceHandler, orgId, event)
+			deviceLogic := tasks.NewFleetSelectorMatchingLogic(log, deviceSvc, fleetSvc, orgId, event)
 			deviceLogic.SetItemsPerPage(2)
 
 			err := deviceLogic.DeviceLabelsUpdated(ctx)
@@ -623,7 +654,7 @@ var _ = Describe("FleetSelector", func() {
 					Name: "non-fleet-owner-device",
 				},
 			}
-			deviceLogic := tasks.NewFleetSelectorMatchingLogic(log, serviceHandler, orgId, event)
+			deviceLogic := tasks.NewFleetSelectorMatchingLogic(log, deviceSvc, fleetSvc, orgId, event)
 			deviceLogic.SetItemsPerPage(2)
 
 			err := deviceLogic.DeviceLabelsUpdated(ctx)

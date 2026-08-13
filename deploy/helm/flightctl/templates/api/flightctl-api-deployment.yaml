@@ -29,7 +29,7 @@ spec:
       {{- include "flightctl.migrationWaitInitContainer" (dict "context" . "timeout" 600) | nindent 6 }}
       containers:
         - name: flightctl-api
-          image: {{ include "flightctl.ensureOsQualifiedImage" .Values.api.image.image }}:{{ default .Chart.AppVersion .Values.api.image.tag }}
+          image: {{ include "flightctl.ensureOsQualifiedImage" (dict "root" . "imageName" .Values.api.image.image) }}:{{ default .Chart.AppVersion .Values.api.image.tag }}
           imagePullPolicy: {{ default .Values.global.imagePullPolicy .Values.api.image.pullPolicy }}
           env:
             - name: HOME
@@ -123,6 +123,9 @@ spec:
               name: flightctl-ca-bundle
               subPath: ca-bundle.crt
               readOnly: true
+            - mountPath: /root/.flightctl/encryption
+              name: flightctl-encryption-key
+              readOnly: true
             {{- include "flightctl.dbSslVolumeMounts" . | nindent 12 }}
 
       restartPolicy: Always
@@ -149,4 +152,8 @@ spec:
         - name: flightctl-ca-bundle
           secret:
             secretName: flightctl-ca-bundle
+        - name: flightctl-encryption-key
+          secret:
+            secretName: flightctl-encryption-key
+            defaultMode: 0400
         {{- include "flightctl.dbSslVolumes" . | nindent 8 }}

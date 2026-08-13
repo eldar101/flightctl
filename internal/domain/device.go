@@ -28,6 +28,7 @@ type DeviceLastSeen = v1beta1.DeviceLastSeen
 type DeviceOsStatus = v1beta1.DeviceOsStatus
 type DeviceSystemInfo = v1beta1.DeviceSystemInfo
 type CustomDeviceInfo = v1beta1.CustomDeviceInfo
+type DeviceCapabilities = v1beta1.DeviceCapabilities
 
 // ========== Spec Subtypes ==========
 
@@ -36,6 +37,7 @@ type DeviceUpdatePolicySpec = v1beta1.DeviceUpdatePolicySpec
 
 // ========== Operations ==========
 
+type DeviceRemoteSession = v1beta1.DeviceRemoteSession
 type DeviceConsole = v1beta1.DeviceConsole
 type DeviceDecommission = v1beta1.DeviceDecommission
 type DeviceResumeRequest = v1beta1.DeviceResumeRequest
@@ -44,6 +46,7 @@ type DeviceResumeResponse = v1beta1.DeviceResumeResponse
 // ========== Aggregation ==========
 
 type DevicesSummary = v1beta1.DevicesSummary
+type DevicesSummaryCapabilities = v1beta1.DevicesSummaryCapabilities
 type DeviceCompletionCount = v1beta1.DeviceCompletionCount
 
 // ========== Enum Types ==========
@@ -56,6 +59,14 @@ type DeviceIntegrityStatusSummaryType = v1beta1.DeviceIntegrityStatusSummaryType
 type DeviceIntegrityCheckStatusType = v1beta1.DeviceIntegrityCheckStatusType
 type DeviceDecommissionTargetType = v1beta1.DeviceDecommissionTargetType
 type DeviceLifecycleHookType = v1beta1.DeviceLifecycleHookType
+type OsModeType = v1beta1.OsModeType
+
+// ========== OS Mode Constants ==========
+
+const (
+	OsModeImage   = v1beta1.OsModeImage
+	OsModePackage = v1beta1.OsModePackage
+)
 
 // ========== Device Lifecycle Status Constants ==========
 

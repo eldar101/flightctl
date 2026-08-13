@@ -76,15 +76,19 @@ db:
   # To use external PostgreSQL database replace `builtin` with `external` and set an appropriate `external:` block
   type: "builtin"
 
+remoteAccessService:
+  # Enable or disable the remote access service.
+  enabled: true
+  logLevel: info
+  # Rate limiting for the WebSocket console endpoint currently uses service.rateLimit below.
+
 service:
   # Optional: TPM manufacturer / swtpm CA PEM paths for device enrollment (rendered into flightctl-api config).
   # Must be a YAML list, e.g.:
   # tpmCAPaths:
   #   - /etc/flightctl/tpm-cas/swtpm-localca-rootca-cert.pem
   #   - /etc/flightctl/tpm-cas/issuercert.pem
-  # Rate limiting configuration
-  # Note: Only flightctl-api and flightctl-alertmanager-proxy services use rate limiting
-  # Other services ignore this configuration
+  # Rate limiting configuration (applied per-service where enabled).
   rateLimit:
     enabled: true
     requests: 300
@@ -108,6 +112,16 @@ grafana:
   allowedUnsignedPlugins:
 
 prometheus:
+
+# Worker VM render options (optional). Uncomment to override defaults.
+# Leave launcherImage unset to use the worker built-in default
+# (quay.io/kubevirt/virt-launcher:v1.9.0). In air-gapped environments, mirror
+# virt-launcher to a registry devices can pull from and set launcherImage to that reference.
+# Enable passtWorkarounds only when using older virt-launcher images that need it.
+# worker:
+#   vmRender:
+#     launcherImage: ""
+#     passtWorkarounds: false
 
 # ImageBuilder Worker (optional). Uncomment and set when using custom builder images, SBOM, or skip-TLS.
 # imagebuilderWorker:
@@ -161,6 +175,21 @@ prometheus:
 # dependenciesSync:
 #   pollInterval: 15m
 
+# Profiling (optional). Uncomment to enable loopback pprof and/or Pyroscope push
+# for long-running services that load this shared config. See
+# docs/user/installing/configuring-service-tracing.md.
+# profiling:
+#   pprof:
+#     enabled: true
+#     # port: 15691  # optional single-process override; omit for multi-service hosts
+#   pyroscope:
+#     enabled: true
+#     serverAddress: http://pyroscope:4040
+#     # applicationName: flightctl-worker
+#     # basicAuthUser: ...
+#     # basicAuthPassword: ...
+#     # tenantID: ...
+
 telemetryGateway:
   forward:
     endpoint:
@@ -170,6 +199,16 @@ userinfoProxy:
   insecureSkipTlsVerify:
 
 gateway:
-  # This is for backwards compatibility. Existing installations won't have this set so the nginx gateway
-  # will maintain the old API port exposed on 3443 for existing clients configured with that.
-  suppressOldPorts: true
+  suppressOldPorts: false
+
+# Encryption-at-rest key configuration.
+# The encryption key files live in /etc/flightctl/encryption/ and are mounted
+# at /root/.flightctl/encryption/ inside each service container.
+# For key rotation: write the new key under /etc/flightctl/encryption/ on the host,
+# then list it here with path: /root/.flightctl/encryption/<filename> (container
+# mount path, not host path), and change activeKeyID.
+encryption:
+  activeKeyID: default
+  keys:
+    - id: default
+      path: /root/.flightctl/encryption/key

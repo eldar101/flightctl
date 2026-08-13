@@ -41,7 +41,9 @@ imagebuilderWorker:
 
 ## RHEL Configuration
 
-When running with a RHEL subscription, you can install the `flightctl-agent` package directly from a subscription-managed repository instead of adding an external repo URL.
+When building RHEL-based images, the build container needs access to RHEL subscription data so that `dnf` can resolve packages from subscription-managed repositories. The steps below mount the host's subscription credentials into the build environment.
+
+> **Note:** Mounting subscription data does not change where the `flightctl-agent` package is installed from. By default, the worker uses the public RPM repository (`rpm.flightctl.io`). If you want to install `flightctl-agent` from a subscription-managed repository instead, see the optional RPM repository settings in each section below.
 
 ### Kubernetes (Helm)
 
@@ -98,12 +100,20 @@ oc create secret generic rhel-rhsm-ca -n ${NAMESPACE} \
 
 ##### Step 2: Configure the Helm chart
 
+Mount the subscription secrets:
+
 ```yaml
 imageBuilderWorker:
   entitlementCertsSecretName: "etc-pki-entitlement"
   yumReposSecretName: "rhel-yum-repos"
   rhsmSecretName: "rhel-rhsm"
   rhsmCaSecretName: "rhel-rhsm-ca"
+```
+
+Optionally, if you want to install `flightctl-agent` from a subscription-managed repository instead of the public RPM repository, also add:
+
+```yaml
+imageBuilderWorker:
   rpmRepoAdd: false
   rpmRepoEnable: "edge-manager-1.0-for-rhel-9-x86_64-rpms"
 ```
@@ -132,12 +142,20 @@ kubectl create secret generic rhel-rhsm-ca \
 
 ##### Step 2: Configure the Helm chart
 
+Mount the subscription secrets:
+
 ```yaml
 imageBuilderWorker:
   entitlementCertsSecretName: "rhel-entitlement"
   yumReposSecretName: "rhel-yum-repos"
   rhsmSecretName: "rhel-rhsm"
   rhsmCaSecretName: "rhel-rhsm-ca"
+```
+
+Optionally, if you want to install `flightctl-agent` from a subscription-managed repository instead of the public RPM repository, also add:
+
+```yaml
+imageBuilderWorker:
   rpmRepoAdd: false
   rpmRepoEnable: "edge-manager-1.0-for-rhel-9-x86_64-rpms"
 ```
@@ -149,19 +167,27 @@ imageBuilderWorker:
 
 #### Step 1: Mount host subscription data
 
-Edit `/usr/share/containers/systemd/flightctl-imagebuilder-worker.container` and add the following volume mounts:
+Do **not** edit the packaged unit at
+`/usr/share/containers/systemd/flightctl-imagebuilder-worker.container`
+directly — that file is vendor-owned and edits will be lost on package upgrade.
+Use a Quadlet drop-in instead:
+
+```bash
+sudo mkdir -p /etc/containers/systemd/flightctl-imagebuilder-worker.container.d
+```
+
+Create `/etc/containers/systemd/flightctl-imagebuilder-worker.container.d/rhel-subscription.conf`:
 
 ```ini
 [Container]
-# ... other settings ...
 Volume=/etc/pki/entitlement:/etc/pki/entitlement:ro,z
 Volume=/etc/yum.repos.d:/etc/yum.repos.d:ro,z
 Volume=/etc/rhsm/:/etc/rhsm/:ro,z
 ```
 
-#### Step 2: Configure RPM repository settings
+#### Step 2 (optional): Use a subscription-managed repo for flightctl-agent
 
-Edit `/etc/flightctl/service-config.yaml`:
+By default, the worker installs `flightctl-agent` from the public RPM repository. If you want to install it from a subscription-managed repository instead, edit `/etc/flightctl/service-config.yaml`:
 
 ```yaml
 imagebuilderWorker:
@@ -201,6 +227,7 @@ sudo systemctl restart flightctl-imagebuilder-worker.service
 | `imageBuilderWorker.defaultTTL` | string | `"168h"` | Default time-to-live for build resources |
 | `imageBuilderWorker.privileged` | bool | `true` | Run container in privileged mode (required for image builds) |
 | `imageBuilderWorker.serviceImages` | object | — | Builder images (podman, bootc-image-builder, Syft). Each has `image` (override image, leave empty for default) and `skipTlsVerify` (set to true to skip TLS verification when pulling that image). |
+| `imageBuilderWorker.serviceImages.pullSecretName` | string | `""` | Kubernetes secret containing a key `auth.json` with registry credentials for pulling serviceImages. Mounted at `/root/.config/containers/auth.json`. Required when serviceImages are in an authenticated or air-gapped registry. |
 | `imageBuilderWorker.serviceImages.syft.image` | string | `""` | Syft image used for SBOM scans. If empty, the worker uses the built-in default image (see the Helm chart `README` parameter description for the current reference). |
 | `imageBuilderWorker.serviceImages.syft.skipTlsVerify` | bool | `false` | Set to `true` to skip TLS verification when pulling the Syft image. |
 | `imageBuilderWorker.sbom.enabled` | bool | `true` | After a successful image push, run SBOM generation (Syft) when `true`. |
@@ -274,6 +301,401 @@ To use a custom CA for the registry that serves the Podman or bootc-image-builde
 - **Helm:** Add a volume from a Secret or ConfigMap that contains the CA file (e.g. key `ca.crt`), and a volumeMount on the imagebuilder worker Deployment that mounts it at `/etc/containers/certs.d/<registry>/ca.crt`. Use the same registry host value as in your builder image reference.
 - **Podman Quadlets:** Add a `Volume=` line to the imagebuilder worker container unit so the host path (or path where the CA file lives) is mounted at `/etc/containers/certs.d/<registry>/ca.crt` inside the container.
 
+## Authenticating to a private registry for builder service images
+
+In air-gapped or authenticated-registry environments, the imagebuilder-worker must authenticate when pulling the builder service images (podman, bootc-image-builder, Syft) from a private registry. The worker pod's inner podman process does **not** inherit cluster-level `ImageTagMirrorSet` rules or `imagePullSecrets` — you must mount a registry credential file directly into the worker container.
+
+### Credential file format
+
+Create an `auth.json` file in standard podman/Docker credential format:
+
+```json
+{
+  "auths": {
+    "my-internal.registry.example.com:5000": {
+      "auth": "<base64-encoded-user:password>"
+    }
+  }
+}
+```
+
+To generate the `auth` value:
+
+```bash
+echo -n "myuser:mypassword" | base64
+```
+
+### Kubernetes (Helm)
+
+Create a Kubernetes secret from the `auth.json` file:
+
+```bash
+kubectl create secret generic service-images-pull-secret \
+  -n flightctl \
+  --from-file=auth.json=/path/to/auth.json
+```
+
+Configure the Helm chart to mount it:
+
+```yaml
+imageBuilderWorker:
+  serviceImages:
+    pullSecretName: "service-images-pull-secret"
+```
+
+The secret is mounted read-only at `/root/.config/containers/auth.json` inside the worker pod, which is the default credential lookup path for podman running as root.
+
+Apply the change:
+
+```bash
+helm upgrade flightctl flightctl-chart.tgz \
+    --reset-then-reuse-values \
+    --set imageBuilderWorker.serviceImages.pullSecretName=service-images-pull-secret
+```
+
+### Podman Quadlet
+
+Copy the credential file to the host:
+
+```bash
+sudo mkdir -p /etc/flightctl
+sudo cp /path/to/auth.json /etc/flightctl/service-images-auth.json
+sudo chmod 600 /etc/flightctl/service-images-auth.json
+```
+
+Create a Quadlet drop-in to add the volume mount. Do **not** edit the packaged
+unit at `/usr/share/containers/systemd/flightctl-imagebuilder-worker.container`
+directly — that file is vendor-owned and edits will be lost on package upgrade.
+
+```bash
+sudo mkdir -p /etc/containers/systemd/flightctl-imagebuilder-worker.container.d
+```
+
+Create `/etc/containers/systemd/flightctl-imagebuilder-worker.container.d/auth.conf`:
+
+```ini
+[Container]
+Volume=/etc/flightctl/service-images-auth.json:/root/.config/containers/auth.json:ro,z
+```
+
+Reload and restart the service:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart flightctl-imagebuilder-worker.service
+```
+
+> [!NOTE]
+> The credential file is mounted directly from the host. Keep it protected with mode `600`
+> and owned by `root`. Rotate credentials in place — there is no need to restart the service
+> as long as the file path is unchanged and the next `podman pull` occurs after the update.
+
+## Disconnected environments: base OS image
+
+### Why ImageTagMirrorSet does not help
+
+In a disconnected OpenShift or Kubernetes cluster you may configure an
+`ImageTagMirrorSet` (or `ImageContentSourcePolicy`) to redirect pulls from
+upstream registries to a local mirror. This mechanism works for container images
+pulled by the cluster's CRI-O runtime, but it does **not** apply to the
+imagebuilder-worker's inner podman process. The worker runs `podman build` inside
+a privileged container; that podman instance has its own namespace and does not
+inherit cluster-level mirror rules.
+
+### How the base image is resolved
+
+The Containerfile that the worker generates for every build starts with:
+
+```dockerfile
+FROM ${REGISTRY_HOSTNAME}/${IMAGE_NAME}:${IMAGE_TAG}
+```
+
+These three variables come directly from the `ImageBuild` spec:
+
+| Containerfile arg | Source field |
+|-------------------|--------------|
+| `REGISTRY_HOSTNAME` | OCI registry host of the `spec.source.repository` object |
+| `IMAGE_NAME` | `spec.source.imageName` |
+| `IMAGE_TAG` | `spec.source.imageTag` |
+
+Because the `FROM` value is assembled from the spec at build time, you can point
+it at any registry the worker pod can reach — including a local mirror.
+
+### Making the base image available offline
+
+Mirror the base OS image to your internal registry on the prep machine:
+
+```bash
+skopeo copy \
+  docker://quay.io/centos-bootc/centos-bootc:stream9 \
+  docker://my-internal.registry.example.com:5000/centos-bootc/centos-bootc:stream9
+```
+
+Then create (or update) the `Repository` object that backs the `ImageBuild`
+source so that its OCI registry points at the internal mirror:
+
+```yaml
+apiVersion: flightctl.io/v1alpha1
+kind: Repository
+metadata:
+  name: my-bootc-source
+spec:
+  type: oci
+  url: my-internal.registry.example.com:5000
+```
+
+Reference that repository in the `ImageBuild`:
+
+```yaml
+spec:
+  source:
+    repository: my-bootc-source
+    imageName: centos-bootc/centos-bootc
+    imageTag: stream9
+```
+
+The worker passes the mirror registry host as `REGISTRY_HOSTNAME`, so the inner
+podman pulls:
+
+```dockerfile
+FROM my-internal.registry.example.com:5000/centos-bootc/centos-bootc:stream9
+```
+
+No `registries.conf` mirror configuration is required inside the worker pod.
+
+> [!NOTE]
+> If your internal registry uses a self-signed or private CA, also mount that CA
+> certificate into the imagebuilder-worker pod as described in
+> [Custom CA for builder image registries](#custom-ca-for-builder-image-registries).
+
+## End-to-end disconnected image build walkthrough
+
+This section walks through every step needed to run an image build in an air-gapped
+environment. It assumes Flight Control is already deployed and an internal container
+registry is reachable from both the prep machine and the cluster.
+
+### What needs to be mirrored
+
+| Artifact | Default upstream location | Role |
+|---|---|---|
+| FlightCtl imagebuilder images | `quay.io/flightctl/flightctl-imagebuilder-{api,worker}-el9` | Worker and API pods |
+| podman builder image | `quay.io/podman/stable:v5.7.1` | Inner `podman build` container |
+| bootc-image-builder image | `quay.io/centos-bootc/bootc-image-builder@sha256:773019f…` | Converts bootc image to disk formats |
+| Syft image | `docker.io/anchore/syft:v1.44.0` | SBOM generation (disable if not needed) |
+| Base OS image | e.g. `quay.io/centos-bootc/centos-bootc:stream9` | `FROM` line in the generated Containerfile |
+| FlightCtl RPM repository | `https://rpm.flightctl.io` | `flightctl-agent` installed into the image |
+
+### Step 1: Mirror images on the prep machine
+
+Run `flightctl-mirror-images` to copy all FlightCtl service images to the internal registry:
+
+```bash
+./bin/flightctl-mirror-images --variant community-el9 \
+    --dest-registry my-internal.registry.example.com:5000 \
+    --execute
+```
+
+Mirror the builder service images and the base OS image with skopeo:
+
+```bash
+INTERNAL=my-internal.registry.example.com:5000
+
+# Inner podman that runs the build
+skopeo copy \
+  docker://quay.io/podman/stable:v5.7.1 \
+  docker://${INTERNAL}/podman/stable:v5.7.1
+
+# bootc-image-builder (use the same digest as the binary default)
+skopeo copy \
+  docker://quay.io/centos-bootc/bootc-image-builder@sha256:773019f6b11766ca48170a4a7bf898be4268f3c2acfd0ec1db612408b3092a90 \
+  docker://${INTERNAL}/centos-bootc/bootc-image-builder:latest
+
+# Syft — skip if SBOM generation is disabled
+skopeo copy \
+  docker://docker.io/anchore/syft:v1.44.0 \
+  docker://${INTERNAL}/anchore/syft:v1.44.0
+
+# Base OS image
+skopeo copy \
+  docker://quay.io/centos-bootc/centos-bootc:stream9 \
+  docker://${INTERNAL}/centos-bootc/centos-bootc:stream9
+```
+
+### Step 2: Set up a local RPM mirror
+
+The imagebuilder-worker installs `flightctl-agent` into the built image using `dnf`.
+The default repo URL (`https://rpm.flightctl.io`) is not reachable in a disconnected
+environment. Serve a local mirror instead.
+
+For a targeted download (individual RPMs):
+
+```bash
+sudo dnf config-manager --add-repo https://rpm.flightctl.io/flightctl-epel.repo
+mkdir -p ~/flightctl-rpms
+dnf download --resolve --alldeps --destdir ~/flightctl-rpms flightctl-agent
+createrepo_c ~/flightctl-rpms
+# Serve with any HTTP server reachable from the cluster:
+python3 -m http.server 8080 --directory ~/flightctl-rpms &
+# Write a .repo file your cluster can fetch:
+cat > ~/flightctl-local.repo <<'EOF'
+[flightctl-local]
+name=FlightCtl local mirror
+baseurl=http://my-rpm-mirror.example.com:8080
+gpgcheck=0
+enabled=1
+EOF
+```
+
+For a full repo mirror with proper metadata, use `dnf reposync` — see
+[Setting up a local RPM repository](offline-rpm-repository.md).
+
+### Step 3: Configure the imagebuilder-worker
+
+Override the service images and RPM repo URL to use your internal registry.
+
+#### Kubernetes / Helm
+
+If the internal registry requires authentication, create the credentials secret first:
+
+```bash
+kubectl create secret generic service-images-pull-secret \
+  -n flightctl \
+  --from-file=auth.json=/path/to/auth.json
+```
+
+Create a `disconnected-values.yaml`:
+
+```yaml
+imageBuilderWorker:
+  rpmRepoUrl: "http://my-rpm-mirror.example.com:8080/flightctl-local.repo"
+  serviceImages:
+    pullSecretName: "service-images-pull-secret"   # omit if registry is unauthenticated
+    podman:
+      image: "my-internal.registry.example.com:5000/podman/stable:v5.7.1"
+    bootcImageBuilder:
+      image: "my-internal.registry.example.com:5000/centos-bootc/bootc-image-builder:latest"
+    syft:
+      image: "my-internal.registry.example.com:5000/anchore/syft:v1.44.0"
+```
+
+Apply:
+
+```bash
+helm upgrade flightctl flightctl-chart.tgz \
+    --reset-then-reuse-values \
+    -f disconnected-values.yaml
+```
+
+#### Podman Quadlet (RHEL)
+
+Add the following to `/etc/flightctl/service-config.yaml`:
+
+```yaml
+imagebuilderWorker:
+  rpmRepoUrl: "http://my-rpm-mirror.example.com:8080/flightctl-local.repo"
+  serviceImages:
+    podman:
+      image: "my-internal.registry.example.com:5000/podman/stable:v5.7.1"
+    bootcImageBuilder:
+      image: "my-internal.registry.example.com:5000/centos-bootc/bootc-image-builder:latest"
+    syft:
+      image: "my-internal.registry.example.com:5000/anchore/syft:v1.44.0"
+```
+
+Restart the imagebuilder services to apply:
+
+```bash
+sudo systemctl restart flightctl-imagebuilder-api.service \
+                       flightctl-imagebuilder-worker.service
+```
+
+If the internal registry uses a private CA, also mount it into the worker pod — see
+[Custom CA for builder image registries](#custom-ca-for-builder-image-registries).
+
+### Step 4: Create Repository resources
+
+A source `Repository` pointing at the mirrored base OS image:
+
+```yaml
+apiVersion: flightctl.io/v1alpha1
+kind: Repository
+metadata:
+  name: bootc-source-mirror
+spec:
+  type: oci
+  url: my-internal.registry.example.com:5000
+```
+
+A destination `Repository` for the output image:
+
+```yaml
+apiVersion: flightctl.io/v1alpha1
+kind: Repository
+metadata:
+  name: built-images
+spec:
+  type: oci
+  url: my-internal.registry.example.com:5000
+```
+
+Apply both:
+
+```bash
+flightctl apply -f bootc-source-mirror.yaml
+flightctl apply -f built-images.yaml
+```
+
+### Step 5: Submit the ImageBuild
+
+```yaml
+apiVersion: flightctl.io/v1alpha1
+kind: ImageBuild
+metadata:
+  name: my-disconnected-build
+spec:
+  source:
+    repository: bootc-source-mirror      # Repository resource created above
+    imageName: centos-bootc/centos-bootc
+    imageTag: stream9
+  destination:
+    repository: built-images             # Repository resource created above
+    imageName: edge/my-device-image
+    imageTag: v1.0.0
+  binding:
+    type: late
+```
+
+```bash
+flightctl apply -f my-disconnected-build.yaml
+```
+
+### Step 6: Monitor the build
+
+```bash
+# Watch status transitions
+flightctl get imagebuild my-disconnected-build -w
+
+# Follow live build logs
+flightctl logs imagebuild/my-disconnected-build -f
+```
+
+A successful build progresses through:
+**`Pending`** → **`Building`** → **`Pushing`** → **`Completed`**
+
+On completion, `status.imageReference` contains the full digest-pinned image
+reference ready to use in a Fleet template.
+
+### Disconnected build failure reference
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Stuck in `Pending` | Worker pod cannot pull podman or bootc-image-builder | Set `serviceImages` overrides to internal registry |
+| `unauthorized` or `authentication required` pulling serviceImages | No registry credentials for private serviceImages registry | Create a secret and set `imageBuilderWorker.serviceImages.pullSecretName` (Helm) or mount `auth.json` (Quadlet) |
+| `FROM` pull fails | Base OS not in internal registry, or Repository URL wrong | Mirror base image; verify `spec.url` in source Repository |
+| `Package not found` | RPM repo URL unreachable from build pod | Set `rpmRepoUrl` to internal mirror |
+| Push fails with `no such host` | Destination registry unreachable | Verify destination Repository URL and network policy |
+| TLS errors on any registry | Private CA not trusted | Mount CA into worker pod (see custom CA section) |
+
 ## Troubleshooting
 
 ### Build Fails with "Package not found" Error
@@ -333,3 +755,74 @@ To use a custom CA for the registry that serves the Podman or bootc-image-builde
 - Expired entitlement certificates
 - Incorrect secret format (certificates must be PEM encoded)
 - Missing certificate key file
+
+### Build Fails with "setting RLIMIT\_NOFILE limit … operation not permitted"
+
+**Problem**: Image build fails with an error similar to:
+
+```text
+Error: building at STEP "RUN … dnf install -y … flightctl-agent …":
+setting "RLIMIT_NOFILE" limit to soft=1048576,hard=1048576
+(was soft=524288,hard=524288): operation not permitted
+```
+
+**Cause**: The build container (buildah) tries to raise the open-file-descriptor limit to
+1048576. This fails when the host's hard limit is lower (for example, 524288, which is the
+OpenShift default) and the container runtime does not grant `CAP_SYS_RESOURCE` to raise it.
+
+**Solution**: The ImageBuilder Worker sets `--ulimit nofile=1048576:1048576` on the nested
+podman worker container, relying on the privileged pod's `CAP_SYS_RESOURCE` capability.
+If you still encounter this error, the host itself must be configured to allow the higher limit.
+
+On OpenShift, apply the following `MachineConfig` to the worker nodes:
+
+```yaml
+apiVersion: machineconfiguration.openshift.io/v1
+kind: MachineConfig
+metadata:
+  labels:
+    machineconfiguration.openshift.io/role: worker
+  name: 99-worker-raise-nofile
+spec:
+  config:
+    ignition:
+      version: 3.5.0
+    storage:
+      files:
+        - contents:
+            source: data:,%5BManager%5D%0ADefaultLimitNOFILE%3D1048576%3A1048576%0A
+          mode: 420
+          overwrite: true
+          path: /etc/systemd/system.conf.d/60-nofile.conf
+```
+
+This sets `DefaultLimitNOFILE=1048576:1048576` in systemd, which raises the limit for all
+processes on the node, including container runtimes.
+
+> [!NOTE]
+> `DefaultLimitNOFILE` is a system-wide default that applies to every service started by systemd
+> that does not have its own `LimitNOFILE=` directive in its unit file.
+
+On a Podman Quadlet (Linux host), use a systemd drop-in to raise the limit only for
+`flightctl-imagebuilder-worker.service`, without affecting any other service on the host:
+
+```ini
+# /etc/systemd/system/flightctl-imagebuilder-worker.service.d/limits.conf
+[Service]
+LimitNOFILE=1048576:1048576
+```
+
+Then reload and restart the service:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart flightctl-imagebuilder-worker.service
+```
+
+Verify the running service has the new limit:
+
+```bash
+systemctl show flightctl-imagebuilder-worker.service | grep LimitNOFILE
+```
+
+The output should show `LimitNOFILE=1048576` and `LimitNOFILESoft=1048576`.

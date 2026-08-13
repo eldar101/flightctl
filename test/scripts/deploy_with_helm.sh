@@ -77,6 +77,7 @@ DB_SETUP_IMAGE=$(choose_image "localhost/flightctl-db-setup-el9" "localhost/flig
 TELEMETRY_GATEWAY_IMAGE=$(choose_image "localhost/flightctl-telemetry-gateway-el9" "localhost/flightctl-telemetry-gateway")
 IMAGEBUILDER_API_IMAGE=$(choose_image "localhost/flightctl-imagebuilder-api-el9" "localhost/flightctl-imagebuilder-api")
 IMAGEBUILDER_WORKER_IMAGE=$(choose_image "localhost/flightctl-imagebuilder-worker-el9" "localhost/flightctl-imagebuilder-worker")
+REMOTE_ACCESS_IMAGE=$(choose_image "localhost/flightctl-remote-access-el9" "localhost/flightctl-remote-access")
 
 SERVICE_IMAGE_ARGS="--set api.image.image=${API_IMAGE} --set api.image.tag=latest"
 SERVICE_IMAGE_ARGS="$SERVICE_IMAGE_ARGS --set worker.image.image=${WORKER_IMAGE} --set worker.image.tag=latest"
@@ -88,6 +89,7 @@ SERVICE_IMAGE_ARGS="$SERVICE_IMAGE_ARGS --set dbSetup.image.image=${DB_SETUP_IMA
 SERVICE_IMAGE_ARGS="$SERVICE_IMAGE_ARGS --set telemetryGateway.image.image=${TELEMETRY_GATEWAY_IMAGE} --set telemetryGateway.image.tag=latest"
 SERVICE_IMAGE_ARGS="$SERVICE_IMAGE_ARGS --set imageBuilderApi.image.image=${IMAGEBUILDER_API_IMAGE} --set imageBuilderApi.image.tag=latest"
 SERVICE_IMAGE_ARGS="$SERVICE_IMAGE_ARGS --set imageBuilderWorker.image.image=${IMAGEBUILDER_WORKER_IMAGE} --set imageBuilderWorker.image.tag=latest"
+SERVICE_IMAGE_ARGS="$SERVICE_IMAGE_ARGS --set remoteAccess.image.image=${REMOTE_ACCESS_IMAGE} --set remoteAccess.image.tag=latest"
 
 # helm expects the namespaces to exist, and creating namespaces
 # inside the helm charts is not recommended.
@@ -98,7 +100,7 @@ kubectl create namespace flightctl-e2e      --context kind-kind 2>/dev/null || t
 # if we are only deploying the database, we don't need inject the server container
 if [ -z "$ONLY_DB" ]; then
 
-  for suffix in periodic api worker alert-exporter alertmanager-proxy cli-artifacts db-setup telemetry-gateway imagebuilder-api imagebuilder-worker ; do
+  for suffix in periodic api worker alert-exporter alertmanager-proxy cli-artifacts db-setup telemetry-gateway imagebuilder-api imagebuilder-worker remote-access ; do
     kind_load_image localhost/flightctl-${suffix}-el9:latest
   done
 
@@ -133,6 +135,14 @@ fi
 # Always deploy with Kubernetes auth
 AUTH_ARGS="--set global.auth.type=k8s"
 
+# Opt-in cluster-level secret access for dependency-sync K8s secret tests.
+# Disabled by default to avoid broadening RBAC for normal deploys.
+# Usage: ENABLE_SECRET_SYNC=true make deploy-helm
+SECRET_ACCESS_ARGS=""
+if [ "${ENABLE_SECRET_SYNC:-}" = "true" ]; then
+  SECRET_ACCESS_ARGS="--set periodic.clusterLevelSecretAccess=true --set worker.clusterLevelSecretAccess=true"
+fi
+
 helm dependency build ./deploy/helm/flightctl
 
 # Format IP for DNS: use sslip.io for IPv6 (replace : with -), nip.io for IPv4
@@ -145,6 +155,7 @@ fi
 helm upgrade --install --namespace flightctl-external \
                   --values ./deploy/helm/flightctl/values.dev.yaml \
                   --set global.baseDomain=${BASE_DOMAIN} \
+                  ${SECRET_ACCESS_ARGS} \
                   ${ONLY_DB} ${DB_SIZE_PARAMS} ${AUTH_ARGS} ${SQL_ARG} ${GATEWAY_ARGS} ${KV_ARG} ${SERVICE_IMAGE_ARGS} flightctl \
               ./deploy/helm/flightctl/ --kube-context kind-kind
 
@@ -162,7 +173,6 @@ kubectl exec -n flightctl-internal --context kind-kind "${DB_POD}" -- createdb a
 if [ "$ONLY_DB" ]; then
   exit 0
 fi
-
 
 kubectl rollout status deployment flightctl-api -n flightctl-external -w --timeout=300s
 

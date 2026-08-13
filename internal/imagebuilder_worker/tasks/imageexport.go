@@ -19,6 +19,7 @@ import (
 	"github.com/flightctl/flightctl/internal/flterrors"
 	"github.com/flightctl/flightctl/internal/imagebuilder_api/domain"
 	imagebuilderapi "github.com/flightctl/flightctl/internal/imagebuilder_api/service"
+	"github.com/flightctl/flightctl/internal/instrumentation/encryption"
 	"github.com/flightctl/flightctl/internal/oci"
 	"github.com/flightctl/flightctl/internal/worker_client"
 	"github.com/google/uuid"
@@ -34,6 +35,13 @@ import (
 //
 //go:embed templates/Containerfile.containerdisk.tmpl
 var containerdiskTemplate string
+
+const (
+	// exportStorageBaseDir is the base directory for temporary container storage used
+	// during image export. A unique subdirectory is created per job and removed when
+	// the job completes. Any leftovers from a crash are swept on worker startup.
+	exportStorageBaseDir = "/var/tmp/flightctl-exports"
+)
 
 var (
 	// errImageBuildNotReady is returned when ImageBuild is not ready yet (pending state)
@@ -398,7 +406,11 @@ func (c *Consumer) executeExport(
 	if exportSource.OciRepoSpec.OciAuth != nil {
 		dockerAuth, err := exportSource.OciRepoSpec.OciAuth.AsDockerAuth()
 		if err == nil && dockerAuth.Username != "" && dockerAuth.Password != "" {
-			if err := c.loginToRegistryForExport(ctx, worker, registryHostname, dockerAuth.Username, dockerAuth.Password, exportSource.OciRepoSpec, log); err != nil {
+			decryptedPassword, _, decErr := encryption.Decrypt(ctx, encryption.Ciphertext(dockerAuth.Password))
+			if decErr != nil {
+				return "", cleanup, fmt.Errorf("failed to decrypt OCI password: %w", decErr)
+			}
+			if err := c.loginToRegistryForExport(ctx, worker, registryHostname, dockerAuth.Username, string(decryptedPassword), exportSource.OciRepoSpec, log); err != nil {
 				return "", cleanup, fmt.Errorf("failed to login to registry: %w", err)
 			}
 		}
@@ -477,8 +489,7 @@ func (c *Consumer) startBootcImageBuilderContainer(
 		return nil, fmt.Errorf("failed to create temporary output directory: %w", err)
 	}
 
-	baseStorageDir := "/var/tmp/flightctl-exports"
-	tmpContainerStorage, err := os.MkdirTemp(baseStorageDir, "storage-*")
+	tmpContainerStorage, err := os.MkdirTemp(exportStorageBaseDir, "storage-*")
 	if err != nil {
 		os.RemoveAll(tmpDir)
 		os.RemoveAll(tmpOutDir)
@@ -528,9 +539,13 @@ func (c *Consumer) startBootcImageBuilderContainer(
 		if err := exec.CommandContext(killCtx, "podman", "kill", containerName).Run(); err != nil {
 			log.WithError(err).Warn("Failed to kill bootc-image-builder container during cleanup")
 		}
-		os.RemoveAll(tmpDir)
+		if err := os.RemoveAll(tmpDir); err != nil {
+			log.WithError(err).WithField("path", tmpDir).Warn("Failed to remove temporary directory")
+		}
 		// Don't remove tmpOutDir here - it's cleaned up separately after pushArtifact completes
-		os.RemoveAll(tmpContainerStorage)
+		if err := os.RemoveAll(tmpContainerStorage); err != nil {
+			log.WithError(err).WithField("path", tmpContainerStorage).Warn("Failed to remove temporary container storage directory")
+		}
 	}
 
 	return &privilegedPodmanWorker{
@@ -951,7 +966,7 @@ func (c *Consumer) validateAndNormalizeSource(ctx context.Context, orgID uuid.UU
 	}
 
 	// Get repository and extract OCI spec (common for both source types)
-	repo, err := c.mainStore.Repository().Get(ctx, orgID, repoName)
+	repo, err := c.repositoryStore.Get(ctx, orgID, repoName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get repository %q: %w", repoName, err)
 	}
@@ -1074,7 +1089,7 @@ func (c *Consumer) pushArtifact(
 	}
 
 	// Get destination repository for authentication and to get registry hostname
-	repo, err := c.mainStore.Repository().Get(ctx, orgID, imageBuild.Spec.Destination.Repository)
+	repo, err := c.repositoryStore.Get(ctx, orgID, imageBuild.Spec.Destination.Repository)
 	if err != nil {
 		return fmt.Errorf("failed to load destination repository: %w", err)
 	}
@@ -1112,7 +1127,7 @@ func (c *Consumer) pushArtifact(
 	statusUpdater.reportOutput([]byte("Starting artifact push to destination registry\n"))
 
 	// Create repository reference (no tag needed - referrer will be discoverable via referrers API)
-	repoRef, err := oci.BuildOciRepoRef(&ociSpec, destRef)
+	repoRef, err := oci.BuildOciRepoRef(ctx, &ociSpec, destRef)
 	if err != nil {
 		return fmt.Errorf("failed to configure OCI repository reference: %w", err)
 	}

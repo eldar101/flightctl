@@ -3,13 +3,12 @@ package backup
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 
-	"github.com/flightctl/flightctl/internal/config"
 	"github.com/sirupsen/logrus"
 )
 
@@ -17,9 +16,12 @@ import (
 type PodmanDeployer struct {
 	log               logrus.FieldLogger
 	pkiPath           string // Optional: if empty, defaults to "/etc/flightctl/pki"
+	encryptionPath    string // Optional: if empty, defaults to "/etc/flightctl/encryption"
 	serviceConfigPath string // Optional: if empty, defaults to "/etc/flightctl/service-config.yaml"
 	dbContainerName   string
 	dbName            string
+	dbUser            string
+	dbPassword        string
 	containerCLI      string
 	kvContainerName   string
 }
@@ -31,6 +33,13 @@ type PodmanDeployerOption func(*PodmanDeployer)
 func WithPKIPath(path string) PodmanDeployerOption {
 	return func(d *PodmanDeployer) {
 		d.pkiPath = path
+	}
+}
+
+// WithEncryptionPath sets the encryption key source directory path.
+func WithEncryptionPath(path string) PodmanDeployerOption {
+	return func(d *PodmanDeployer) {
+		d.encryptionPath = path
 	}
 }
 
@@ -63,6 +72,22 @@ func WithContainerCLI(cli string) PodmanDeployerOption {
 	}
 }
 
+// WithDBUser overrides the database user for pg_dump.
+// When empty, the container's $POSTGRESQL_USER env var is used.
+func WithDBUser(user string) PodmanDeployerOption {
+	return func(d *PodmanDeployer) {
+		d.dbUser = user
+	}
+}
+
+// WithDBPassword overrides the database password for pg_dump.
+// When empty, the container's $PGPASSWORD env var is used.
+func WithDBPassword(password string) PodmanDeployerOption {
+	return func(d *PodmanDeployer) {
+		d.dbPassword = password
+	}
+}
+
 // WithKVContainerName sets the KV container name (reserved for future use).
 func WithKVContainerName(name string) PodmanDeployerOption {
 	return func(d *PodmanDeployer) {
@@ -83,6 +108,9 @@ func NewPodmanDeployer(log logrus.FieldLogger, opts ...PodmanDeployerOption) *Po
 	if d.pkiPath == "" {
 		d.pkiPath = "/etc/flightctl/pki"
 	}
+	if d.encryptionPath == "" {
+		d.encryptionPath = "/etc/flightctl/encryption"
+	}
 	if d.serviceConfigPath == "" {
 		d.serviceConfigPath = "/etc/flightctl/service-config.yaml"
 	}
@@ -94,6 +122,9 @@ func NewPodmanDeployer(log logrus.FieldLogger, opts ...PodmanDeployerOption) *Po
 	}
 	if d.kvContainerName == "" {
 		d.kvContainerName = "flightctl-kv"
+	}
+	if d.dbUser == "" {
+		d.dbUser = "flightctl_app"
 	}
 	return d
 }
@@ -108,13 +139,13 @@ func (p *PodmanDeployer) Type() DeploymentType {
 // For internal databases, executes pg_dump via podman exec and writes dump to <outputDir>/db/dump.sql.
 // For external databases, returns ErrExternalDatabase without creating a backup.
 func (p *PodmanDeployer) BackupDatabase(ctx context.Context, outputDir string) error {
-	cfg, err := config.Load(p.serviceConfigPath)
+	rawCfg, err := os.ReadFile(p.serviceConfigPath)
 	if err != nil {
-		return fmt.Errorf("failed to load service configuration from %s: %w", p.serviceConfigPath, err)
+		return fmt.Errorf("failed to read service configuration from %s: %w", p.serviceConfigPath, err)
 	}
 
-	// Check if database is external
-	if !isInternalDB(cfg) {
+	dbCfg := parseServiceConfigDB(rawCfg, p.log)
+	if dbCfg.Type == "external" {
 		return ErrExternalDatabase
 	}
 
@@ -126,10 +157,7 @@ func (p *PodmanDeployer) BackupDatabase(ctx context.Context, outputDir string) e
 
 	p.log.Infof("Starting database backup from container %s...", p.dbContainerName)
 
-	// Build password from config
-	password := string(cfg.Database.Password)
-
-	dbName := cfg.Database.Name
+	dbName := dbCfg.Name
 	if p.dbName != "" {
 		dbName = p.dbName
 	}
@@ -144,16 +172,14 @@ func (p *PodmanDeployer) BackupDatabase(ctx context.Context, outputDir string) e
 
 	// Execute pg_dump inside the container with password from stdin and safely escaped parameters.
 	// Output streams directly to dump file.
-	// Use shell escaping to prevent injection attacks from user/database names.
-	pgDumpCmd := fmt.Sprintf("PGPASSWORD=$(cat -) pg_dump --clean --if-exists -h 127.0.0.1 -p %s -U %s -d %s",
-		ShellEscape(strconv.Itoa(int(cfg.Database.Port))),
-		ShellEscape(cfg.Database.User),
+	pgDumpCmd := fmt.Sprintf("PGPASSWORD=$(cat -) pg_dump --clean --if-exists -h 127.0.0.1 -p 5432 -U %s -d %s",
+		ShellEscape(p.dbUser),
 		ShellEscape(dbName))
 
 	cmd := exec.CommandContext(ctx, p.containerCLI, "exec", "-i", p.dbContainerName, "sh", "-c", pgDumpCmd)
 
 	// Pass password via stdin to avoid exposing it in process argv
-	cmd.Stdin = bytes.NewReader([]byte(password))
+	cmd.Stdin = bytes.NewReader([]byte(p.dbPassword))
 
 	// Stream stdout (SQL dump) directly to file and capture stderr
 	cmd.Stdout = outFile
@@ -202,7 +228,7 @@ func copyDirPreservePerms(src, dst string, ctx context.Context, log logrus.Field
 
 		// Reject symlinks to prevent path traversal attacks and undefined behavior
 		if info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("symlinks not supported in PKI directory: %s", relPath)
+			return fmt.Errorf("symlinks not supported in backup directory: %s", relPath)
 		}
 
 		// Handle directories
@@ -262,7 +288,7 @@ func (p *PodmanDeployer) BackupPKI(ctx context.Context, outputDir string) error 
 	p.log.Infof("Starting PKI backup from %s...", pkiSrcDir)
 
 	// Create destination directory
-	if err := os.MkdirAll(pkiDstDir, pkiDirMode); err != nil {
+	if err := os.MkdirAll(pkiDstDir, sensitiveDataDirMode); err != nil {
 		return fmt.Errorf("failed to create PKI output directory: %w", err)
 	}
 
@@ -286,6 +312,47 @@ func (p *PodmanDeployer) BackupPKI(ctx context.Context, outputDir string) error 
 	return nil
 }
 
+// BackupEncryptionKeys backs up the data-at-rest encryption key directory.
+// Copies <encryptionPath>/ to <outputDir>/encryption/, preserving file permissions.
+// Never returns an error for a missing encryption directory — a warning is logged
+// so the operator knows encrypted fields will be unrecoverable from this backup.
+func (p *PodmanDeployer) BackupEncryptionKeys(ctx context.Context, outputDir string) (retErr error) {
+	encSrcDir := p.encryptionPath
+
+	if _, err := os.Stat(encSrcDir); os.IsNotExist(err) {
+		p.log.Warnf("Encryption key directory not found at %s — skipping. If this deployment uses data-at-rest encryption, encrypted database fields will be unrecoverable from this backup.", encSrcDir)
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("failed to access encryption key directory %s: %w", encSrcDir, err)
+	}
+
+	p.log.Infof("Starting encryption key backup from %s...", encSrcDir)
+
+	encDstDir := filepath.Join(outputDir, "encryption")
+	if err := os.MkdirAll(encDstDir, sensitiveDataDirMode); err != nil {
+		return fmt.Errorf("failed to create encryption output directory: %w", err)
+	}
+
+	// Clean up encryption directory on error to avoid leaving partial sensitive data on disk.
+	success := false
+	defer func() {
+		if !success {
+			if cleanupErr := os.RemoveAll(encDstDir); cleanupErr != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("failed to clean up partial encryption backup at %s: %w", encDstDir, cleanupErr))
+			}
+		}
+	}()
+
+	fileCount, err := copyDirPreservePerms(encSrcDir, encDstDir, ctx, p.log)
+	if err != nil {
+		return fmt.Errorf("failed to copy encryption directory: %w", err)
+	}
+
+	p.log.Infof("Encryption key backup completed. Backed up %d files from %s", fileCount, encSrcDir)
+	success = true
+	return nil
+}
+
 // BackupConfig backs up service configuration files for Podman deployments.
 // Copies /etc/flightctl/service-config.yaml to <outputDir>/config/service-config.yaml.
 // Exports PAM Issuer volume to <outputDir>/volumes/pam-issuer-etc.tar.
@@ -294,7 +361,7 @@ func (p *PodmanDeployer) BackupPKI(ctx context.Context, outputDir string) error 
 func (p *PodmanDeployer) BackupConfig(ctx context.Context, outputDir string) error {
 	// Create config directory
 	configDir := filepath.Join(outputDir, "config")
-	if err := os.MkdirAll(configDir, pkiDirMode); err != nil {
+	if err := os.MkdirAll(configDir, sensitiveDataDirMode); err != nil {
 		return fmt.Errorf("failed to create config directory: %w", err)
 	}
 
@@ -320,7 +387,7 @@ func (p *PodmanDeployer) BackupConfig(ctx context.Context, outputDir string) err
 
 	// Backup PAM Issuer volume (optional component)
 	volumesDir := filepath.Join(outputDir, "volumes")
-	if err := os.MkdirAll(volumesDir, pkiDirMode); err != nil {
+	if err := os.MkdirAll(volumesDir, sensitiveDataDirMode); err != nil {
 		return fmt.Errorf("failed to create volumes directory: %w", err)
 	}
 

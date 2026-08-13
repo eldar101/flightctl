@@ -6,6 +6,7 @@ import (
 	"os"
 	"sync"
 
+	"github.com/flightctl/flightctl/test/e2e/infra/auxiliary"
 	"github.com/onsi/ginkgo/v2"
 	"github.com/sirupsen/logrus"
 )
@@ -16,6 +17,10 @@ const E2ESetupAbortExitCode = 2
 
 // E2ESetupAbortStderrMarker is written to stderr on setup abort so CI can detect it from logs.
 const E2ESetupAbortStderrMarker = "FLIGHTCTL_E2E_SETUP_ABORT=1"
+
+// NeedVMLabel marks specs that require a live VM/agent during suites that
+// otherwise use a no-VM harness by default.
+const NeedVMLabel = "needvm"
 
 var (
 	// Per-worker storage
@@ -90,6 +95,43 @@ func SetupWorkerHarnessWithoutVM() (*Harness, context.Context, error) {
 
 	logrus.Infof("✅ [SetupWorkerHarnessWithoutVM] Worker %d: Harness setup completed (no VM)", workerID)
 	return harness, suiteCtx, nil
+}
+
+// AuxServicesFuture represents an in-flight auxiliary.Get call. Aux service setup
+// (registry, image bundle upload, git server, prometheus) and VM/harness setup are
+// independent of each other (aux uses podman networking, VM setup uses libvirt), so
+// starting aux in the background and waiting on it after VM setup overlaps the two
+// instead of paying both latencies sequentially. On the first package to run in a
+// shard, aux setup is dominated by the agent image bundle upload (~100s).
+type AuxServicesFuture struct {
+	result chan *auxiliary.Services
+}
+
+// StartAuxServicesAsync starts auxiliary.Get(ctx) in the background and returns
+// immediately. Call Wait on the returned future once aux services are needed
+// (typically right after VM/harness setup in BeforeSuite).
+func StartAuxServicesAsync(ctx context.Context) *AuxServicesFuture {
+	future := &AuxServicesFuture{result: make(chan *auxiliary.Services, 1)}
+	go func() {
+		future.result <- auxiliary.Get(ctx)
+	}()
+	return future
+}
+
+// Wait blocks until aux service setup completes and returns the services.
+func (f *AuxServicesFuture) Wait() *auxiliary.Services {
+	return <-f.result
+}
+
+// CurrentSpecNeedsVM reports whether the currently running Ginkgo spec is
+// labeled as requiring VM setup.
+func CurrentSpecNeedsVM() bool {
+	for _, label := range ginkgo.CurrentSpecReport().Labels() {
+		if label == NeedVMLabel {
+			return true
+		}
+	}
+	return false
 }
 
 // GetWorkerHarness retrieves the harness for the current worker.

@@ -14,8 +14,10 @@ import (
 
 	"github.com/flightctl/flightctl/api/core/v1beta1"
 	"github.com/flightctl/flightctl/internal/agent/client"
+	appconsole "github.com/flightctl/flightctl/internal/agent/device/applications/console"
 	"github.com/flightctl/flightctl/internal/agent/device/applications/lifecycle"
 	"github.com/flightctl/flightctl/internal/agent/device/applications/provider"
+	"github.com/flightctl/flightctl/internal/agent/device/errors"
 	"github.com/flightctl/flightctl/internal/agent/device/fileio"
 	"github.com/flightctl/flightctl/internal/agent/device/systemd"
 	"github.com/flightctl/flightctl/pkg/executer"
@@ -35,7 +37,7 @@ func streamDataToStdout(t *testing.T, reader io.Reader) *exec.Cmd {
 }
 
 func podmanEventsCommandMock(execMock *executer.MockExecuter) *gomock.Call {
-	return execMock.EXPECT().CommandContext(gomock.Any(), "podman", "events", gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any())
+	return execMock.EXPECT().CommandContext(gomock.Any(), "podman", "events", gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any())
 }
 
 func TestListenForEvents(t *testing.T) {
@@ -212,20 +214,16 @@ func TestListenForEvents(t *testing.T) {
 
 			// create a pipe to simulate events being written to the monitor
 			reader, writer := io.Pipe()
-			defer reader.Close()
-			defer writer.Close()
 
-			// testify v1.11 changed Eventually to check the condition immediately
-			// rather than waiting for the first tick. This causes false positives
-			// when initial state matches expected final state (e.g. "app start
-			// then removed" where 0 workloads = Unknown before and after events).
-			// Track inspect calls to ensure all events are processed first.
+			// Track inspect calls to ensure all events are processed before
+			// asserting state (avoids false positives when initial state matches
+			// expected final state, e.g. "app start then removed").
 			var inspectCount atomic.Int32
 			execMock.EXPECT().ExecuteWithContext(gomock.Any(), "podman", "inspect", gomock.Any()).
 				DoAndReturn(func(_ context.Context, _ string, _ ...string) (string, string, int) {
 					inspectCount.Add(1)
 					return string(inspectBytes), "", 0
-				}).Times(len(tc.events))
+				}).AnyTimes()
 			podmanEventsCommandMock(execMock).Return(streamDataToStdout(t, reader))
 
 			podman := client.NewPodman(log, execMock, rw, util.NewPollConfig())
@@ -259,13 +257,20 @@ func TestListenForEvents(t *testing.T) {
 			err = podmanMonitor.ExecuteActions(t.Context())
 			require.NoError(err)
 
+			writeDone := make(chan struct{})
 			go func() {
+				defer close(writeDone)
 				for i := range tc.events {
 					event := tc.events[i]
 					if err := writeEvent(writer, &event); err != nil {
-						t.Errorf("failed to write event: %v", err)
+						return
 					}
 				}
+			}()
+			defer func() {
+				writer.Close()
+				<-writeDone
+				reader.Close()
 			}()
 
 			timeoutDuration := 5 * time.Second
@@ -439,6 +444,13 @@ func createTestApplicationWithType(require *require.Assertions, name string, sta
 	return app
 }
 
+func createTestVMApplication(require *require.Assertions, name string, status v1beta1.ApplicationStatusType, user v1beta1.Username) Application {
+	p := newMockProvider(require, name, user, v1beta1.AppTypeVm)
+	app := NewApplication(p)
+	app.status.Status = status
+	return app
+}
+
 func writeEvent(writer io.WriteCloser, event *client.PodmanEvent) error {
 	eventBytes, err := json.Marshal(event)
 	if err != nil {
@@ -455,6 +467,265 @@ func mockPodmanEventSuccess(name string, username v1beta1.Username, service, sta
 
 func mockPodmanEventError(name string, username v1beta1.Username, service, status string, exitCode int) client.PodmanEvent {
 	return createMockPodmanEvent(name, username, service, status, exitCode)
+}
+
+func mockPodmanHealthEvent(name string, username v1beta1.Username, service, health string) client.PodmanEvent {
+	event := createMockPodmanEvent(name, username, service, "health_status", 0)
+	event.HealthStatus = health
+	return event
+}
+
+func TestUpdateContainerHealthStatus(t *testing.T) {
+	const (
+		appName = "app1"
+		service = "app1-service-1"
+	)
+	containerName := fmt.Sprintf("%s-container", service)
+
+	testCases := []struct {
+		name                   string
+		appType                v1beta1.AppType
+		desiredState           v1beta1.ApplicationDesiredState
+		initialWorkloadStatus  StatusType
+		health                 string
+		expectedWorkloadStatus StatusType
+		expectedRequiresHealth bool
+		expectedReady          string
+		expectedAppStatus      v1beta1.ApplicationStatusType
+		expectedSummary        v1beta1.ApplicationsSummaryStatusType
+	}{
+		{
+			name:                   "When running VM workload becomes unhealthy it should report Running degraded",
+			appType:                v1beta1.AppTypeVm,
+			initialWorkloadStatus:  StatusRunning,
+			health:                 "unhealthy",
+			expectedWorkloadStatus: StatusUnhealthy,
+			expectedRequiresHealth: true,
+			expectedReady:          "0/1",
+			expectedAppStatus:      v1beta1.ApplicationStatusRunning,
+			expectedSummary:        v1beta1.ApplicationsSummaryStatusDegraded,
+		},
+		{
+			name:                   "When unhealthy VM workload becomes healthy it should report Running healthy",
+			appType:                v1beta1.AppTypeVm,
+			initialWorkloadStatus:  StatusUnhealthy,
+			health:                 "healthy",
+			expectedWorkloadStatus: StatusRunning,
+			expectedRequiresHealth: true,
+			expectedReady:          "1/1",
+			expectedAppStatus:      v1beta1.ApplicationStatusRunning,
+			expectedSummary:        v1beta1.ApplicationsSummaryStatusHealthy,
+		},
+		{
+			name:                   "When VM health is starting it should report Running degraded",
+			appType:                v1beta1.AppTypeVm,
+			initialWorkloadStatus:  StatusRunning,
+			health:                 "starting",
+			expectedWorkloadStatus: StatusUnhealthy,
+			expectedRequiresHealth: true,
+			expectedReady:          "0/1",
+			expectedAppStatus:      v1beta1.ApplicationStatusRunning,
+			expectedSummary:        v1beta1.ApplicationsSummaryStatusDegraded,
+		},
+		{
+			name:                   "When VM workload is still initializing it should ignore health_status",
+			appType:                v1beta1.AppTypeVm,
+			initialWorkloadStatus:  StatusInit,
+			health:                 "unhealthy",
+			expectedWorkloadStatus: StatusInit,
+			expectedRequiresHealth: false,
+			expectedReady:          "0/1",
+			expectedAppStatus:      v1beta1.ApplicationStatusPreparing,
+			expectedSummary:        v1beta1.ApplicationsSummaryStatusUnknown,
+		},
+		{
+			name:                   "When VM desiredState is stopped and workload is still up unhealthy it should report Stopping",
+			appType:                v1beta1.AppTypeVm,
+			desiredState:           v1beta1.ApplicationDesiredStateStopped,
+			initialWorkloadStatus:  StatusRunning,
+			health:                 "unhealthy",
+			expectedWorkloadStatus: StatusUnhealthy,
+			expectedRequiresHealth: true,
+			expectedReady:          "0/1",
+			expectedAppStatus:      v1beta1.ApplicationStatusStopping,
+			expectedSummary:        v1beta1.ApplicationsSummaryStatusDegraded,
+		},
+		{
+			name:                   "When compose app receives health_status it should leave workload unchanged",
+			appType:                v1beta1.AppTypeCompose,
+			initialWorkloadStatus:  StatusRunning,
+			health:                 "unhealthy",
+			expectedWorkloadStatus: StatusRunning,
+			expectedRequiresHealth: false,
+			expectedReady:          "1/1",
+			expectedAppStatus:      v1beta1.ApplicationStatusRunning,
+			expectedSummary:        v1beta1.ApplicationsSummaryStatusHealthy,
+		},
+		{
+			name:                   "When quadlet app receives health_status it should leave workload unchanged",
+			appType:                v1beta1.AppTypeQuadlet,
+			initialWorkloadStatus:  StatusRunning,
+			health:                 "unhealthy",
+			expectedWorkloadStatus: StatusRunning,
+			expectedRequiresHealth: false,
+			expectedReady:          "1/1",
+			expectedAppStatus:      v1beta1.ApplicationStatusRunning,
+			expectedSummary:        v1beta1.ApplicationsSummaryStatusHealthy,
+		},
+		{
+			name:                   "When container app receives health_status it should leave workload unchanged",
+			appType:                v1beta1.AppTypeContainer,
+			initialWorkloadStatus:  StatusRunning,
+			health:                 "unhealthy",
+			expectedWorkloadStatus: StatusRunning,
+			expectedRequiresHealth: false,
+			expectedReady:          "1/1",
+			expectedAppStatus:      v1beta1.ApplicationStatusRunning,
+			expectedSummary:        v1beta1.ApplicationsSummaryStatusHealthy,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			require := require.New(t)
+			log := log.NewPrefixLogger("test")
+			monitor := &PodmanMonitor{
+				apps: make(map[string]Application),
+				log:  log,
+			}
+
+			app := createTestApplicationWithType(require, appName, v1beta1.ApplicationStatusPreparing, v1beta1.CurrentProcessUsername, tc.appType)
+			if tc.desiredState != "" {
+				app.SetDesiredState(tc.desiredState)
+			}
+			app.AddWorkload(&Workload{
+				Name:   containerName,
+				Status: tc.initialWorkloadStatus,
+			})
+			monitor.apps[app.ID()] = app
+
+			event := mockPodmanHealthEvent(appName, v1beta1.CurrentProcessUsername, service, tc.health)
+			monitor.handleEvent(t.Context(), event)
+
+			workload, ok := app.Workload(containerName)
+			require.True(ok)
+			require.Equal(tc.expectedWorkloadStatus, workload.Status)
+			require.Equal(tc.expectedRequiresHealth, workload.RequiresHealth)
+
+			status, summary, err := app.Status()
+			require.NoError(err)
+			require.Equal(tc.expectedReady, status.Ready)
+			require.Equal(tc.expectedAppStatus, status.Status)
+			require.Equal(tc.expectedSummary, summary.Status)
+		})
+	}
+
+	t.Run("When health_status event ID does not match tracked container it should leave workload unchanged", func(t *testing.T) {
+		require := require.New(t)
+		monitor := &PodmanMonitor{
+			apps: make(map[string]Application),
+			log:  log.NewPrefixLogger("test"),
+		}
+		app := createTestApplicationWithType(require, appName, v1beta1.ApplicationStatusPreparing, v1beta1.CurrentProcessUsername, v1beta1.AppTypeVm)
+		app.AddWorkload(&Workload{
+			ID:     "current-container-id",
+			Name:   containerName,
+			Status: StatusRunning,
+		})
+		monitor.apps[app.ID()] = app
+
+		event := mockPodmanHealthEvent(appName, v1beta1.CurrentProcessUsername, service, "unhealthy")
+		event.ID = "stale-container-id"
+		monitor.handleEvent(t.Context(), event)
+
+		workload, ok := app.Workload(containerName)
+		require.True(ok)
+		require.Equal(StatusRunning, workload.Status)
+	})
+}
+
+// TestVMHealthGatedCrashLoopSequence covers: after health_status=starting,
+// subsequent start events must not report Healthy while the VM crash-loops.
+func TestVMHealthGatedCrashLoopSequence(t *testing.T) {
+	require := require.New(t)
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	const (
+		appName = "test-vm"
+		service = "virt-launcher-compute"
+	)
+	containerName := fmt.Sprintf("%s-container", service)
+
+	systemdMgr := systemd.NewMockManager(ctrl)
+	// LoadState and NRestarts both use Show. "0" is a valid NRestarts value and
+	// is not SystemdLoadStateNotFound, so both call sites accept it.
+	systemdMgr.EXPECT().Show(gomock.Any(), gomock.Any(), gomock.Any()).
+		Return([]string{"0"}, nil).AnyTimes()
+
+	tmpDir := t.TempDir()
+	rw := fileio.NewReadWriter(
+		fileio.NewReader(fileio.WithReaderRootDir(tmpDir)),
+		fileio.NewWriter(fileio.WithWriterRootDir(tmpDir)),
+	)
+	testLog := log.NewPrefixLogger("test")
+	podman := client.NewPodman(testLog, executer.NewMockExecuter(ctrl), rw, util.NewPollConfig())
+	var podmanFactory client.PodmanFactory = func(_ v1beta1.Username) (*client.Podman, error) { return podman, nil }
+	var systemdFactory systemd.ManagerFactory = func(_ v1beta1.Username) (systemd.Manager, error) { return systemdMgr, nil }
+	var rwFactory fileio.ReadWriterFactory = func(_ v1beta1.Username) (fileio.ReadWriter, error) { return rw, nil }
+
+	monitor := NewPodmanMonitor(testLog, podmanFactory, systemdFactory, "", rwFactory)
+	app := createTestApplicationWithType(require, appName, v1beta1.ApplicationStatusPreparing, v1beta1.CurrentProcessUsername, v1beta1.AppTypeVm)
+	monitor.apps[app.ID()] = app
+
+	assertSummary := func(ready string, appStatus v1beta1.ApplicationStatusType, summary v1beta1.ApplicationsSummaryStatusType) {
+		t.Helper()
+		status, sum, err := app.Status()
+		require.NoError(err)
+		require.Equal(ready, status.Ready)
+		require.Equal(appStatus, status.Status)
+		require.Equal(summary, sum.Status)
+	}
+
+	start1 := mockPodmanEventSuccess(appName, v1beta1.CurrentProcessUsername, service, "start")
+	start1.ID = "container-id-1"
+	monitor.handleEvent(t.Context(), start1)
+	assertSummary("1/1", v1beta1.ApplicationStatusRunning, v1beta1.ApplicationsSummaryStatusHealthy)
+
+	starting := mockPodmanHealthEvent(appName, v1beta1.CurrentProcessUsername, service, "starting")
+	starting.ID = "container-id-1"
+	monitor.handleEvent(t.Context(), starting)
+	workload, ok := app.Workload(containerName)
+	require.True(ok)
+	require.True(workload.RequiresHealth)
+	require.Equal(StatusUnhealthy, workload.Status)
+	assertSummary("0/1", v1beta1.ApplicationStatusRunning, v1beta1.ApplicationsSummaryStatusDegraded)
+
+	died := mockPodmanEventError(appName, v1beta1.CurrentProcessUsername, service, "died", 2)
+	died.ID = "container-id-1"
+	monitor.handleEvent(t.Context(), died)
+	assertSummary("0/1", v1beta1.ApplicationStatusError, v1beta1.ApplicationsSummaryStatusError)
+
+	// Crash-loop restart: bare start must not restore Healthy.
+	start2 := mockPodmanEventSuccess(appName, v1beta1.CurrentProcessUsername, service, "start")
+	start2.ID = "container-id-2"
+	monitor.handleEvent(t.Context(), start2)
+	workload, ok = app.Workload(containerName)
+	require.True(ok)
+	require.True(workload.RequiresHealth)
+	require.Equal(StatusUnhealthy, workload.Status)
+	require.Equal("container-id-2", workload.ID)
+	assertSummary("0/1", v1beta1.ApplicationStatusRunning, v1beta1.ApplicationsSummaryStatusDegraded)
+
+	starting2 := mockPodmanHealthEvent(appName, v1beta1.CurrentProcessUsername, service, "starting")
+	starting2.ID = "container-id-2"
+	monitor.handleEvent(t.Context(), starting2)
+	assertSummary("0/1", v1beta1.ApplicationStatusRunning, v1beta1.ApplicationsSummaryStatusDegraded)
+
+	healthy := mockPodmanHealthEvent(appName, v1beta1.CurrentProcessUsername, service, "healthy")
+	healthy.ID = "container-id-2"
+	monitor.handleEvent(t.Context(), healthy)
+	assertSummary("1/1", v1beta1.ApplicationStatusRunning, v1beta1.ApplicationsSummaryStatusHealthy)
 }
 
 func createMockPodmanEvent(name string, username v1beta1.Username, service, status string, exitCode int) client.PodmanEvent {
@@ -1316,4 +1587,320 @@ func TestReduceActions_Consistency(t *testing.T) {
 		require.Equal([]string{"z", "m", "a", "f"}, ids,
 			"ordering should be consistent on iteration %d", i)
 	}
+}
+
+func TestPodmanMonitorResolveConsole(t *testing.T) {
+	newMonitor := func(t *testing.T) (*PodmanMonitor, *executer.MockExecuter, *gomock.Controller) {
+		t.Helper()
+		ctrl := gomock.NewController(t)
+		testLog := log.NewPrefixLogger("test")
+		tmpDir := t.TempDir()
+		readWriter := fileio.NewReadWriter(
+			fileio.NewReader(fileio.WithReaderRootDir(tmpDir)),
+			fileio.NewWriter(fileio.WithWriterRootDir(tmpDir)),
+		)
+		execMock := executer.NewMockExecuter(ctrl)
+		podman := client.NewPodman(testLog, execMock, readWriter, util.NewPollConfig())
+		systemdMgr := systemd.NewMockManager(ctrl)
+		systemdMgr.EXPECT().AddExclusions(gomock.Any()).AnyTimes()
+		systemdMgr.EXPECT().RemoveExclusions(gomock.Any()).AnyTimes()
+		var podmanFactory client.PodmanFactory = func(_ v1beta1.Username) (*client.Podman, error) { return podman, nil }
+		var systemdFactory systemd.ManagerFactory = func(_ v1beta1.Username) (systemd.Manager, error) { return systemdMgr, nil }
+		var rwFactory fileio.ReadWriterFactory = func(_ v1beta1.Username) (fileio.ReadWriter, error) { return readWriter, nil }
+		m := NewPodmanMonitor(testLog, podmanFactory, systemdFactory, "", rwFactory)
+		return m, execMock, ctrl
+	}
+
+	t.Run("When the app is not tracked it should return errConsoleAppNotFound", func(t *testing.T) {
+		require := require.New(t)
+		m, _, ctrl := newMonitor(t)
+		defer ctrl.Finish()
+		_, err := m.resolveConsole("unknown-app", "serial")
+		require.ErrorIs(err, errConsoleAppNotFound)
+	})
+
+	t.Run("When the app is a non-VM type it should return an unsupported error", func(t *testing.T) {
+		require := require.New(t)
+		m, _, ctrl := newMonitor(t)
+		defer ctrl.Finish()
+		app := createTestApplicationWithType(require, "compose-app", v1beta1.ApplicationStatusRunning, v1beta1.CurrentProcessUsername, v1beta1.AppTypeCompose)
+		err := m.Ensure(t.Context(), app)
+		require.NoError(err)
+		_, err = m.resolveConsole("compose-app", "serial")
+		require.Error(err)
+		require.Contains(err.Error(), "only VM apps support console")
+	})
+
+	t.Run("When the app is a VM but consoleType is unsupported it should return an error", func(t *testing.T) {
+		require := require.New(t)
+		m, _, ctrl := newMonitor(t)
+		defer ctrl.Finish()
+		app := createTestVMApplication(require, "my-vm", v1beta1.ApplicationStatusRunning, v1beta1.CurrentProcessUsername)
+		err := m.Ensure(t.Context(), app)
+		require.NoError(err)
+		_, err = m.resolveConsole("my-vm", "shell")
+		require.Error(err)
+		require.Contains(err.Error(), "unsupported console type")
+	})
+
+	t.Run("When the app is VM serial with a running workload it should return a session that execs into the serial socket", func(t *testing.T) {
+		require := require.New(t)
+		m, execMock, ctrl := newMonitor(t)
+		defer ctrl.Finish()
+		app := createTestVMApplication(require, "my-vm", v1beta1.ApplicationStatusRunning, v1beta1.CurrentProcessUsername)
+		err := m.Ensure(t.Context(), app)
+		require.NoError(err)
+		// The workload name comes from podman events and is the authoritative runtime name.
+		app.AddWorkload(&Workload{Name: "systemd-my-vm-compute", Status: StatusRunning})
+
+		// Asserting only NotNil would still pass if console-type routing regressed to
+		// always return the same session type. Assert the VNC-specific observable
+		// behavior instead: the underlying exec targets the serial socket, not the VNC one.
+		execMock.EXPECT().ExecuteWithContext(gomock.Any(), "podman", "exec", "systemd-my-vm-compute", "sh", "-c", gomock.Any()).
+			Return("", "", 0).Times(1)
+		execMock.EXPECT().CommandContext(gomock.Any(), "podman", "exec", "-i", "systemd-my-vm-compute", "nc", "-U", "/var/run/kubevirt-private/default/virt-serial0").
+			DoAndReturn(func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+				return exec.CommandContext(ctx, "cat")
+			})
+
+		sess, err := m.resolveConsole("my-vm", "serial")
+		require.NoError(err)
+		require.NotNil(sess)
+
+		streamClient := appconsole.NewMockRouterService_StreamClient(ctrl)
+		streamClient.EXPECT().Recv().Return(nil, io.EOF).AnyTimes()
+		streamClient.EXPECT().Send(gomock.Any()).Return(nil).AnyTimes()
+		streamClient.EXPECT().CloseSend().Return(nil).AnyTimes()
+		sess.Run(t.Context(), streamClient)
+	})
+
+	t.Run("When the app is VM serial with no running workload it should return an error", func(t *testing.T) {
+		require := require.New(t)
+		m, _, ctrl := newMonitor(t)
+		defer ctrl.Finish()
+		app := createTestVMApplication(require, "my-vm", v1beta1.ApplicationStatusRunning, v1beta1.CurrentProcessUsername)
+		err := m.Ensure(t.Context(), app)
+		require.NoError(err)
+		_, err = m.resolveConsole("my-vm", "serial")
+		require.Error(err)
+		require.ErrorIs(err, appconsole.ErrAppNotReady)
+		require.Contains(err.Error(), "may not be ready yet")
+	})
+
+	t.Run("When the app is VM serial with only an exited compute workload it should return ErrAppNotReady", func(t *testing.T) {
+		require := require.New(t)
+		m, _, ctrl := newMonitor(t)
+		defer ctrl.Finish()
+		app := createTestVMApplication(require, "my-vm", v1beta1.ApplicationStatusRunning, v1beta1.CurrentProcessUsername)
+		err := m.Ensure(t.Context(), app)
+		require.NoError(err)
+		app.AddWorkload(&Workload{Name: "systemd-my-vm-compute", Status: StatusExited})
+		app.AddWorkload(&Workload{Name: "systemd-my-vm-infra", Status: StatusRunning})
+
+		_, err = m.resolveConsole("my-vm", "serial")
+		require.Error(err)
+		require.ErrorIs(err, appconsole.ErrAppNotReady)
+		require.Contains(err.Error(), `app "my-vm"`)
+	})
+
+	t.Run("When the app is VM vnc with a running workload it should return a session that execs into the VNC socket", func(t *testing.T) {
+		require := require.New(t)
+		m, execMock, ctrl := newMonitor(t)
+		defer ctrl.Finish()
+		app := createTestVMApplication(require, "my-vm", v1beta1.ApplicationStatusRunning, v1beta1.CurrentProcessUsername)
+		err := m.Ensure(t.Context(), app)
+		require.NoError(err)
+		app.AddWorkload(&Workload{Name: "systemd-my-vm-compute", Status: StatusRunning})
+
+		// Asserting only NotNil would still pass if console-type routing regressed to
+		// always return the serial session. Assert the VNC-specific observable behavior
+		// instead: the underlying exec targets the VNC socket, not the serial one.
+		execMock.EXPECT().ExecuteWithContext(gomock.Any(), "podman", "exec", "systemd-my-vm-compute", "sh", "-c", gomock.Any()).
+			Return("", "", 0).Times(1)
+		execMock.EXPECT().CommandContext(gomock.Any(), "podman", "exec", "-i", "systemd-my-vm-compute", "nc", "-U", "/var/run/kubevirt-private/default/virt-vnc").
+			DoAndReturn(func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+				return exec.CommandContext(ctx, "cat")
+			})
+
+		sess, err := m.resolveConsole("my-vm", "vnc")
+		require.NoError(err)
+		require.NotNil(sess)
+
+		streamClient := appconsole.NewMockRouterService_StreamClient(ctrl)
+		streamClient.EXPECT().Recv().Return(nil, io.EOF).AnyTimes()
+		streamClient.EXPECT().Send(gomock.Any()).Return(nil).AnyTimes()
+		streamClient.EXPECT().CloseSend().Return(nil).AnyTimes()
+		sess.Run(t.Context(), streamClient)
+	})
+
+	t.Run("When the app is VM vnc with no running workload it should return an error", func(t *testing.T) {
+		require := require.New(t)
+		m, _, ctrl := newMonitor(t)
+		defer ctrl.Finish()
+		app := createTestVMApplication(require, "my-vm", v1beta1.ApplicationStatusRunning, v1beta1.CurrentProcessUsername)
+		err := m.Ensure(t.Context(), app)
+		require.NoError(err)
+		_, err = m.resolveConsole("my-vm", "vnc")
+		require.Error(err)
+		require.ErrorIs(err, appconsole.ErrAppNotReady)
+		require.Contains(err.Error(), "may not be ready yet")
+	})
+}
+
+func TestPodmanMonitorLifecycleDispatch(t *testing.T) {
+	const appName = "my-app"
+
+	appID := lifecycle.GenerateAppID(appName, v1beta1.CurrentProcessUsername)
+	targetName := appID + "-flightctl-quadlet-app.target"
+
+	testCases := []struct {
+		name       string
+		appType    v1beta1.AppType
+		operation  func(m *PodmanMonitor, appID string) error
+		setupMocks func(*systemd.MockManager)
+		wantErr    bool
+	}{
+		{
+			name:    "When StopApp is called for a quadlet app it should stop the target and reset failed services",
+			appType: v1beta1.AppTypeQuadlet,
+			operation: func(m *PodmanMonitor, appID string) error {
+				return m.StopApp(context.Background(), appID)
+			},
+			setupMocks: func(m *systemd.MockManager) {
+				svc := appID + "-app.service"
+				m.EXPECT().ListUnitsByMatchPattern(gomock.Any(), []string{targetName}).Return(
+					[]client.SystemDUnitListEntry{{Unit: targetName, LoadState: "loaded"}}, nil)
+				m.EXPECT().ListDependencies(gomock.Any(), targetName).Return([]string{svc}, nil)
+				m.EXPECT().Stop(gomock.Any(), targetName).Return(nil)
+				units := []client.SystemDUnitListEntry{
+					{Unit: svc, LoadState: "loaded", ActiveState: string(v1beta1.SystemdActiveStateInactive), SubState: "dead"},
+				}
+				m.EXPECT().ListUnitsByMatchPattern(gomock.Any(), []string{svc}).Return(units, nil)
+				m.EXPECT().Stop(gomock.Any(), svc).Return(nil)
+				m.EXPECT().ResetFailed(gomock.Any(), svc).Return(nil)
+			},
+		},
+		{
+			name:    "When StopApp is called for a container app it should stop via quadlet handler and reset failed services",
+			appType: v1beta1.AppTypeContainer,
+			operation: func(m *PodmanMonitor, appID string) error {
+				return m.StopApp(context.Background(), appID)
+			},
+			setupMocks: func(m *systemd.MockManager) {
+				svc := appID + "-app.service"
+				m.EXPECT().ListUnitsByMatchPattern(gomock.Any(), []string{targetName}).Return(
+					[]client.SystemDUnitListEntry{{Unit: targetName, LoadState: "loaded"}}, nil)
+				m.EXPECT().ListDependencies(gomock.Any(), targetName).Return([]string{svc}, nil)
+				m.EXPECT().Stop(gomock.Any(), targetName).Return(nil)
+				units := []client.SystemDUnitListEntry{
+					{Unit: svc, LoadState: "loaded", ActiveState: string(v1beta1.SystemdActiveStateInactive), SubState: "dead"},
+				}
+				m.EXPECT().ListUnitsByMatchPattern(gomock.Any(), []string{svc}).Return(units, nil)
+				m.EXPECT().Stop(gomock.Any(), svc).Return(nil)
+				m.EXPECT().ResetFailed(gomock.Any(), svc).Return(nil)
+			},
+		},
+		{
+			name:    "When StartApp is called for a quadlet app it should start the target",
+			appType: v1beta1.AppTypeQuadlet,
+			operation: func(m *PodmanMonitor, appID string) error {
+				return m.StartApp(context.Background(), appID)
+			},
+			setupMocks: func(m *systemd.MockManager) {
+				m.EXPECT().Start(gomock.Any(), targetName).Return(nil)
+			},
+		},
+		{
+			name:    "When RestartApp is called for a quadlet app it should restart the target",
+			appType: v1beta1.AppTypeQuadlet,
+			operation: func(m *PodmanMonitor, appID string) error {
+				return m.RestartApp(context.Background(), appID, 1)
+			},
+			setupMocks: func(m *systemd.MockManager) {
+				m.EXPECT().Restart(gomock.Any(), targetName).Return(nil)
+			},
+		},
+		{
+			name:    "When StopApp is called for a VM app it should stop via quadlet handler and reset failed services",
+			appType: v1beta1.AppTypeVm,
+			operation: func(m *PodmanMonitor, appID string) error {
+				return m.StopApp(context.Background(), appID)
+			},
+			setupMocks: func(m *systemd.MockManager) {
+				svc := appID + "-virt-launcher-compute.service"
+				m.EXPECT().ListUnitsByMatchPattern(gomock.Any(), []string{targetName}).Return(
+					[]client.SystemDUnitListEntry{{Unit: targetName, LoadState: "loaded"}}, nil)
+				m.EXPECT().ListDependencies(gomock.Any(), targetName).Return([]string{svc}, nil)
+				m.EXPECT().Stop(gomock.Any(), targetName).Return(nil)
+				units := []client.SystemDUnitListEntry{
+					{Unit: svc, LoadState: "loaded", ActiveState: string(v1beta1.SystemdActiveStateFailed), SubState: "failed"},
+				}
+				m.EXPECT().ListUnitsByMatchPattern(gomock.Any(), []string{svc}).Return(units, nil)
+				m.EXPECT().Stop(gomock.Any(), svc).Return(nil)
+				m.EXPECT().ResetFailed(gomock.Any(), svc).Return(nil)
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			require := require.New(t)
+			testLog := log.NewPrefixLogger("test")
+			testLog.SetLevel(logrus.DebugLevel)
+
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+
+			mockExec := executer.NewMockExecuter(ctrl)
+			systemdMgr := systemd.NewMockManager(ctrl)
+			tc.setupMocks(systemdMgr)
+
+			tmpDir := t.TempDir()
+			rw := fileio.NewReadWriter(
+				fileio.NewReader(fileio.WithReaderRootDir(tmpDir)),
+				fileio.NewWriter(fileio.WithWriterRootDir(tmpDir)),
+			)
+			podman := client.NewPodman(testLog, mockExec, rw, util.NewPollConfig())
+
+			var podmanFactory client.PodmanFactory = func(user v1beta1.Username) (*client.Podman, error) {
+				return podman, nil
+			}
+			var systemdFactory systemd.ManagerFactory = func(user v1beta1.Username) (systemd.Manager, error) {
+				return systemdMgr, nil
+			}
+			var rwFactory fileio.ReadWriterFactory = func(username v1beta1.Username) (fileio.ReadWriter, error) {
+				return rw, nil
+			}
+
+			monitor := NewPodmanMonitor(testLog, podmanFactory, systemdFactory, "", rwFactory)
+
+			// Wire up a test app in the monitor's apps map
+			volumeManager, err := provider.NewVolumeManager(testLog, appName, tc.appType, v1beta1.CurrentProcessUsername, nil)
+			require.NoError(err)
+			app := &application{
+				id: appID,
+				status: &v1beta1.DeviceApplicationStatus{
+					Name:    appName,
+					AppType: tc.appType,
+				},
+				volume: volumeManager,
+			}
+			monitor.apps[app.ID()] = app
+
+			err = tc.operation(monitor, appID)
+			if tc.wantErr {
+				require.Error(err)
+			} else {
+				require.NoError(err)
+			}
+		})
+	}
+
+	t.Run("When StopApp is called for an unknown appID it should return ErrAppNotFound", func(t *testing.T) {
+		require := require.New(t)
+		testLog := log.NewPrefixLogger("test")
+		monitor := NewPodmanMonitor(testLog, nil, nil, "", nil)
+		err := monitor.StopApp(context.Background(), "nonexistent-id")
+		require.ErrorIs(err, errors.ErrAppNotFound)
+	})
 }

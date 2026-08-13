@@ -24,6 +24,10 @@ flightctl login <server_url> [flags]
 
 * `-t, --token <token>` - Bearer token for authentication
 
+#### Credential File
+
+* `--credentials-file <path>` - Path to a JSON file containing credentials (`token`, `username`, `password`). Takes precedence over flags and environment variables.
+
 #### Provider-Based Authentication
 
 * `--provider <name>` - Name of the authentication provider to use
@@ -45,6 +49,14 @@ flightctl login <server_url> [flags]
 #### Other Flags
 
 * `-h, --help` - Display help
+
+#### Environment Variables
+
+* `FLIGHTCTL_TOKEN` - Bearer token (used when `--token` is not set)
+* `FLIGHTCTL_USERNAME` - Username (used when `-u` is not set)
+* `FLIGHTCTL_PASSWORD` - Password (used when `-p` is not set)
+
+Precedence: `--credentials-file` > CLI flags > environment variables. See [Logging in Non-Interactively](../using/cli/logging-in.md#logging-in-non-interactively-automation-and-scripting).
 
 ### Configuration File
 
@@ -305,9 +317,196 @@ flightctl get devices --cve-id CVE-2023-44487 --selector region=us-west
 
 ---
 
+## flightctl app start
+
+Start an application running on a device, or on every device owned by a fleet.
+
+### Synopsis
+
+```shell
+flightctl app start (device/NAME | fleet/NAME) --name APP [flags]
+```
+
+### Arguments
+
+* `device/NAME` or `fleet/NAME` - Target device or fleet
+
+### Flags
+
+* `--name <app_name>` - Application name to control (required)
+* `-y, --yes` - Skip the confirmation prompt
+
+### Description
+
+Requests that the named application be started on the target device, or on every device owned by the target fleet.
+
+If the application is already started, the request still succeeds; the application stays running and no restart is performed. Starting on a fleet applies to every current member device and to devices that join the fleet later. A later start or stop issued directly against a device takes precedence for that device over the fleet-wide setting.
+
+### Examples
+
+```shell
+# Start an application on a single device
+flightctl app start device/my-device --name my-app
+
+# Start an application on every device in a fleet
+flightctl app start fleet/my-fleet --name my-app
+
+# Skip the confirmation prompt
+flightctl app start device/my-device --name my-app --yes
+```
+
+### Exit Status
+
+* `0` - Success
+* Non-zero - Error
+
+---
+
+## flightctl app stop
+
+Stop an application running on a device, or on every device owned by a fleet.
+
+### Synopsis
+
+```shell
+flightctl app stop (device/NAME | fleet/NAME) --name APP [flags]
+```
+
+### Arguments
+
+* `device/NAME` or `fleet/NAME` - Target device or fleet
+
+### Flags
+
+* `--name <app_name>` - Application name to control (required)
+* `-y, --yes` - Skip the confirmation prompt
+
+### Description
+
+Requests that the named application be stopped on the target device, or on every device owned by the target fleet.
+
+If the application is already stopped, the request still succeeds; the application stays stopped. Stopping on a fleet applies to every current member device and to devices that join the fleet later. A later start or stop issued directly against a device takes precedence for that device over the fleet-wide setting.
+
+### Examples
+
+```shell
+# Stop an application on a single device
+flightctl app stop device/my-device --name my-app
+
+# Stop an application on every device in a fleet
+flightctl app stop fleet/my-fleet --name my-app
+
+# Skip the confirmation prompt
+flightctl app stop device/my-device --name my-app --yes
+```
+
+### Exit Status
+
+* `0` - Success
+* Non-zero - Error
+
+---
+
+## flightctl app restart
+
+Restart an application running on a device.
+
+### Synopsis
+
+```shell
+flightctl app restart device/NAME --name APP [flags]
+```
+
+### Arguments
+
+* `device/NAME` - Target device
+
+### Flags
+
+* `--name <app_name>` - Application name to control (required)
+* `-y, --yes` - Skip the confirmation prompt
+
+### Description
+
+Requests that the named application be restarted on the target device. Restart is only supported on individual devices; fleets are not supported.
+
+The command can be issued whether or not the application is currently running. A restart only takes effect while the application is supposed to be running; if the application has been stopped, the request still succeeds but no restart is performed.
+
+### Examples
+
+```shell
+# Restart an application on a device
+flightctl app restart device/my-device --name my-app
+```
+
+### Exit Status
+
+* `0` - Success
+* Non-zero - Error
+
+---
+
+## flightctl app console
+
+Connect a console to a VM application running on a device through the server.
+
+### Synopsis
+
+```shell
+flightctl app console device/NAME --name APP --type serial|vnc [flags]
+```
+
+### Arguments
+
+* `device/NAME` - Target device
+
+### Flags
+
+* `--name <app_name>` - Application name to open a console for (required)
+* `--type <serial|vnc>` - Console type (required)
+* `--tty` - Allocate a remote pseudo terminal
+* `--notty` - Don't allocate a remote pseudo terminal (mutually exclusive with `--tty`)
+* `--exposed-port <port>` - Local TCP port for the VNC port-forward (`0` = random ephemeral port; only valid with `--type vnc`)
+* `--force` - Take over an already-active console session of the same `--type` for the same `--name`, disconnecting it
+
+### Description
+
+Only devices can be targeted; fleets are not supported. Requires a remote access service configured in the client config, which is set automatically by `flightctl login`.
+
+A `serial` console bridges stdin/stdout over a WebSocket connection to the device's agent, the same way as `flightctl console`; use `~.` to disconnect.
+
+A `vnc` console opens a local TCP listener and bridges a single VNC viewer connection through the agent to the application's VNC server. The session ends once that viewer disconnects; run the command again to start a new session.
+
+Only one console session of a given type (serial or VNC) is allowed per application at a time; a serial and a VNC session may be open on the same application simultaneously. If a console session of the same type for the same application is already active, the command fails with a conflict error unless `--force` is passed, which disconnects that same-type session.
+
+### Examples
+
+```shell
+# Connect to an application's serial console
+flightctl app console device/my-device --name my-app --type serial
+
+# Connect to an application's VNC console
+flightctl app console device/my-device --name my-app --type vnc
+
+# Request a specific local port for the VNC port-forward
+flightctl app console device/my-device --name my-app --type vnc --exposed-port 5900
+
+# Take over an already-active console session
+flightctl app console device/my-device --name my-app --type serial --force
+```
+
+### Exit Status
+
+* `0` - Success
+* Non-zero - Error
+
+---
+
 ## See Also
 
 * [Using the CLI](../using/cli/overview.md)
 * [Logging in to the Service](../using/cli/logging-in.md)
+* [Managing Application Lifecycle](../using/managing-devices.md#managing-application-lifecycle)
+* [Accessing a VM Application Console](../using/managing-devices.md#accessing-a-vm-application-console)
 * [Managing Image Builds and Exports](../using/managing-image-builds.md)
 * [Viewing Vulnerabilities](../using/viewing-vulnerabilities.md)

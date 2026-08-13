@@ -3,6 +3,7 @@ package backup
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -29,6 +30,8 @@ const (
 	// dbDefaultName and dbDefaultPort are the well-known values used by the FlightCtl Helm chart.
 	dbDefaultName = "flightctl"
 	dbDefaultPort = 5432
+	// encryptionKeySecretName is the Kubernetes Secret containing the data-at-rest encryption key.
+	encryptionKeySecretName = "flightctl-encryption-key"
 )
 
 // requiredPKISecretNames lists PKI/TLS Secrets that must exist in every deployment.
@@ -47,8 +50,8 @@ var requiredPKISecretNames = []string{
 // Controlled by Helm values: ui.enabled, cliArtifacts.enabled, alertmanagerProxy.enabled.
 // Missing secrets are silently skipped.
 var optionalPKISecretNames = []string{
-	"flightctl-ui-server-tls",          // ui.enabled
-	"flightctl-ui-certs",               // ui.enabled
+	"flightctl-ui-server-tls",            // ui.enabled
+	"flightctl-ui-certs",                 // ui.enabled
 	"flightctl-cli-artifacts-server-tls", // cliArtifacts.enabled
 	"flightctl-alertmanager-proxy-certs", // alertmanagerProxy.enabled
 }
@@ -181,18 +184,47 @@ func (k *KubernetesDeployer) getSecretStringValue(ctx context.Context, ns, name,
 }
 
 // BackupDatabase backs up the PostgreSQL database using pg_dump via Kubernetes client-go.
-// Credentials are read from the flightctl-db-app-secret Kubernetes Secret in internalNamespace.
-// If that Secret does not exist, the database is assumed to be external and ErrExternalDatabase
-// is returned without creating a backup.
+// First checks if a Helm-managed flightctl-db Deployment exists to determine if the database
+// is builtin or external. For builtin databases, credentials are read from the
+// flightctl-db-app-secret Kubernetes Secret and pg_dump is executed in the database pod.
+// For external databases, returns ErrExternalDatabase without creating a backup.
 func (k *KubernetesDeployer) BackupDatabase(ctx context.Context, outputDir string) error {
-	// Extract DB credentials from the cluster Secret.  A missing Secret means
-	// the DB is externally managed; any other error is propagated.
-	dbUser, err := k.getSecretStringValue(ctx, k.internalNamespace, dbAppSecretName, dbUserKey)
+	clientset, err := k.resolveClientset()
+	if err != nil {
+		return err
+	}
+
+	namespace := k.internalNamespace
+	k.log.Debugf("Using namespace for DB: %s", namespace)
+
+	// Check if this is an external or builtin database by looking for the Helm-managed
+	// flightctl-db Deployment (authoritative check - works even with user-provided Secrets).
+	deployment, err := clientset.AppsV1().Deployments(namespace).Get(ctx, "flightctl-db", metav1.GetOptions{})
 	if err != nil {
 		if apierrors.IsNotFound(err) {
+			// No Deployment → external database
+			k.log.Infof("No flightctl-db Deployment found - assuming external database")
 			return ErrExternalDatabase
 		}
-		return fmt.Errorf("failed to get database credentials: %w", err)
+		// Unexpected error checking Deployment
+		return fmt.Errorf("failed to check for database Deployment: %w", err)
+	}
+
+	// Deployment exists - verify it's Helm-managed (builtin DB)
+	managedBy, ok := deployment.Labels["app.kubernetes.io/managed-by"]
+	if !ok || managedBy != "Helm" {
+		// Deployment exists but not Helm-managed → external database
+		k.log.Infof("flightctl-db Deployment exists but is not Helm-managed - assuming external database")
+		return ErrExternalDatabase
+	}
+
+	// Helm-managed Deployment exists → builtin database, proceed with backup
+	k.log.Debugf("Found Helm-managed flightctl-db Deployment - proceeding with builtin database backup")
+
+	// Extract DB credentials from the cluster Secret
+	dbUser, err := k.getSecretStringValue(ctx, k.internalNamespace, dbAppSecretName, dbUserKey)
+	if err != nil {
+		return fmt.Errorf("failed to get database user: %w", err)
 	}
 	dbPassword, err := k.getSecretStringValue(ctx, k.internalNamespace, dbAppSecretName, dbPasswordKey)
 	if err != nil {
@@ -201,20 +233,11 @@ func (k *KubernetesDeployer) BackupDatabase(ctx context.Context, outputDir strin
 
 	// Create db directory
 	dbDir := filepath.Join(outputDir, "db")
-	if err := os.MkdirAll(dbDir, 0755); err != nil {
+	if err = os.MkdirAll(dbDir, 0755); err != nil {
 		return fmt.Errorf("failed to create db directory: %w", err)
 	}
 
-	// Use internal namespace for finding DB pod (defaults to namespace if not set)
-	namespace := k.internalNamespace
-	k.log.Debugf("Using namespace for DB pod: %s", namespace)
-
 	labelSelector := "flightctl.service=flightctl-db"
-
-	clientset, err := k.resolveClientset()
-	if err != nil {
-		return err
-	}
 
 	// List pods with label selector
 	pods, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
@@ -226,7 +249,8 @@ func (k *KubernetesDeployer) BackupDatabase(ctx context.Context, outputDir strin
 	}
 
 	if len(pods.Items) == 0 {
-		return fmt.Errorf("database pod not found in namespace %s with label %s", namespace, labelSelector)
+		// Builtin DB configured but pod is missing → error
+		return fmt.Errorf("database pod not found in namespace %s with label %s (builtin database configured but pod unavailable - incomplete backup would result)", namespace, labelSelector)
 	}
 
 	config, err := k.resolveRestConfig()
@@ -301,7 +325,7 @@ func (k *KubernetesDeployer) BackupDatabase(ctx context.Context, outputDir strin
 
 // BackupPKI backs up PKI materials by exporting all PKI/TLS Secrets to YAML files.
 // Writes one YAML file per Secret to <outputDir>/pki/<secretName>.yaml.
-// All YAML files are created with pkiFileMode permissions (contain sensitive data).
+// All YAML files are created with sensitiveDataFileMode permissions (contain sensitive data).
 func (k *KubernetesDeployer) BackupPKI(ctx context.Context, outputDir string) error {
 	namespace := k.namespace
 	k.log.Infof("Starting PKI backup from namespace %s...", namespace)
@@ -319,7 +343,7 @@ func (k *KubernetesDeployer) BackupPKI(ctx context.Context, outputDir string) er
 
 	pkiDir := filepath.Join(outputDir, "pki")
 
-	if err := os.MkdirAll(pkiDir, pkiDirMode); err != nil {
+	if err := os.MkdirAll(pkiDir, sensitiveDataDirMode); err != nil {
 		return fmt.Errorf("failed to create PKI output directory: %w", err)
 	}
 
@@ -354,7 +378,7 @@ func (k *KubernetesDeployer) BackupPKI(ctx context.Context, outputDir string) er
 		}
 
 		yamlPath := filepath.Join(pkiDir, secretName+".yaml")
-		if err := os.WriteFile(yamlPath, yamlBytes, pkiFileMode); err != nil {
+		if err := os.WriteFile(yamlPath, yamlBytes, sensitiveDataFileMode); err != nil {
 			return fmt.Errorf("failed to write Secret YAML %s: %w", secretName, err)
 		}
 		backedUp++
@@ -374,6 +398,57 @@ func (k *KubernetesDeployer) BackupPKI(ctx context.Context, outputDir string) er
 
 	k.log.Infof("PKI backup completed. Backed up %d Secrets to %s", backedUp, pkiDir)
 
+	success = true
+	return nil
+}
+
+// BackupEncryptionKeys backs up the data-at-rest encryption key Secret.
+// Writes the Secret as YAML to <outputDir>/encryption/flightctl-encryption-key.yaml.
+// A missing Secret is logged as a warning and does not return an error,
+// so the operator knows encrypted fields will be unrecoverable from this backup.
+func (k *KubernetesDeployer) BackupEncryptionKeys(ctx context.Context, outputDir string) (retErr error) {
+	namespace := k.namespace
+	k.log.Infof("Starting encryption key backup from namespace %s...", namespace)
+
+	clientset, err := k.resolveClientset()
+	if err != nil {
+		return err
+	}
+
+	secret, err := clientset.CoreV1().Secrets(namespace).Get(ctx, encryptionKeySecretName, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		k.log.Warnf("Encryption key Secret %q not found — skipping. If this deployment uses data-at-rest encryption, encrypted database fields will be unrecoverable from this backup.", encryptionKeySecretName)
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("failed to get encryption key Secret %q from namespace %s: %w", encryptionKeySecretName, namespace, err)
+	}
+
+	encDir := filepath.Join(outputDir, "encryption")
+	if err := os.MkdirAll(encDir, sensitiveDataDirMode); err != nil {
+		return fmt.Errorf("failed to create encryption output directory: %w", err)
+	}
+
+	// Clean up encryption directory on error to avoid leaving partial sensitive data on disk.
+	success := false
+	defer func() {
+		if !success {
+			if cleanupErr := os.RemoveAll(encDir); cleanupErr != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("failed to clean up partial encryption backup at %s: %w", encDir, cleanupErr))
+			}
+		}
+	}()
+
+	yamlBytes, err := yaml.Marshal(secret)
+	if err != nil {
+		return fmt.Errorf("failed to marshal encryption key Secret to YAML: %w", err)
+	}
+
+	yamlPath := filepath.Join(encDir, encryptionKeySecretName+".yaml")
+	if err := os.WriteFile(yamlPath, yamlBytes, sensitiveDataFileMode); err != nil {
+		return fmt.Errorf("failed to write encryption key Secret YAML: %w", err)
+	}
+
+	k.log.Infof("Encryption key backup completed: %s", yamlPath)
 	success = true
 	return nil
 }
@@ -399,7 +474,7 @@ func (k *KubernetesDeployer) BackupPKI(ctx context.Context, outputDir string) er
 // Returns error if no Helm release Secrets are found or if multiple are found without an explicit release name.
 func (k *KubernetesDeployer) BackupConfig(ctx context.Context, outputDir string) error {
 	configDir := filepath.Join(outputDir, "config")
-	if err := os.MkdirAll(configDir, pkiDirMode); err != nil {
+	if err := os.MkdirAll(configDir, sensitiveDataDirMode); err != nil {
 		return fmt.Errorf("failed to create config directory: %w", err)
 	}
 
@@ -428,7 +503,7 @@ func (k *KubernetesDeployer) BackupConfig(ctx context.Context, outputDir string)
 	}
 
 	helmSecretPath := filepath.Join(configDir, fmt.Sprintf("helm-release-%s.yaml", releaseName))
-	if err := os.WriteFile(helmSecretPath, yamlBytes, pkiFileMode); err != nil {
+	if err := os.WriteFile(helmSecretPath, yamlBytes, sensitiveDataFileMode); err != nil {
 		return fmt.Errorf("failed to write Helm Secret YAML %s: %w", helmSecretPath, err)
 	}
 

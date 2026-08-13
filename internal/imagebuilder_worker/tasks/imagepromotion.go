@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/flightctl/flightctl/internal/consts"
 	coredomain "github.com/flightctl/flightctl/internal/domain"
 	"github.com/flightctl/flightctl/internal/flterrors"
 	"github.com/flightctl/flightctl/internal/imagebuilder_api/domain"
@@ -210,7 +209,6 @@ func (c *Consumer) transitionToPublishing(ctx context.Context, orgID uuid.UUID, 
 		baseURI = extractBaseURIWorker(imageBuild.Status.ImageReference)
 	}
 
-	internalCtx := context.WithValue(ctx, consts.InternalRequestCtxKey, true)
 	discriminator, _ := promotion.Spec.Target.Discriminator()
 	var publishErr error
 
@@ -220,13 +218,13 @@ func (c *Consumer) transitionToPublishing(ctx context.Context, orgID uuid.UUID, 
 		if err != nil {
 			return c.transitionToFailed(ctx, orgID, promotion, domain.ImagePromotionConditionReasonFailed, "invalid target: "+err.Error())
 		}
-		publishErr = c.createNewCatalogItem(internalCtx, orgID, target, references, baseURI)
+		publishErr = c.createNewCatalogItem(ctx, orgID, target, references, baseURI)
 	case string(domain.ImagePromotionTargetTypeExistingCatalogItem):
 		target, err := promotion.Spec.Target.AsExistingCatalogItemTarget()
 		if err != nil {
 			return c.transitionToFailed(ctx, orgID, promotion, domain.ImagePromotionConditionReasonFailed, "invalid target: "+err.Error())
 		}
-		publishErr = c.appendVersionToCatalogItem(internalCtx, orgID, target, references, baseURI)
+		publishErr = c.appendVersionToCatalogItem(ctx, orgID, target, references, baseURI)
 	default:
 		publishErr = fmt.Errorf("unknown target type: %s", discriminator)
 	}
@@ -240,7 +238,7 @@ func (c *Consumer) transitionToPublishing(ctx context.Context, orgID uuid.UUID, 
 
 // executeAmendmentPublish patches an existing CatalogItemVersion with new artifact refs.
 func (c *Consumer) executeAmendmentPublish(ctx context.Context, orgID uuid.UUID, promotion *domain.ImagePromotion, imageBuild *domain.ImageBuild, newFormats []domain.ExportFormatType) error {
-	newReferences := make(map[string]string)
+	newReferences := make(map[coredomain.CatalogItemArtifactType]string)
 	resolvedExports := make(map[string]string)
 
 	for _, format := range newFormats {
@@ -259,7 +257,7 @@ func (c *Consumer) executeAmendmentPublish(ctx context.Context, orgID uuid.UUID,
 		if ref == "" {
 			return c.transitionToAmendmentFailed(ctx, orgID, promotion, fmt.Sprintf("ImageExport for format %s has no manifest digest", format))
 		}
-		newReferences[string(artifactType)] = ref
+		newReferences[artifactType] = ref
 		if export.Metadata.Name != nil {
 			resolvedExports[string(format)] = *export.Metadata.Name
 		}
@@ -270,7 +268,6 @@ func (c *Consumer) executeAmendmentPublish(ctx context.Context, orgID uuid.UUID,
 		baseURI = extractBaseURIWorker(imageBuild.Status.ImageReference)
 	}
 
-	internalCtx := context.WithValue(ctx, consts.InternalRequestCtxKey, true)
 	discriminator, _ := promotion.Spec.Target.Discriminator()
 
 	var catalogName, itemName, version string
@@ -291,7 +288,7 @@ func (c *Consumer) executeAmendmentPublish(ctx context.Context, orgID uuid.UUID,
 		return c.transitionToAmendmentFailed(ctx, orgID, promotion, fmt.Sprintf("unknown target type: %s", discriminator))
 	}
 
-	if err := c.patchCatalogItemVersion(internalCtx, orgID, catalogName, itemName, version, newReferences, baseURI); err != nil {
+	if err := c.patchCatalogItemVersion(ctx, orgID, catalogName, itemName, version, newReferences, baseURI); err != nil {
 		return c.transitionToAmendmentFailed(ctx, orgID, promotion, err.Error())
 	}
 
@@ -299,8 +296,8 @@ func (c *Consumer) executeAmendmentPublish(ctx context.Context, orgID uuid.UUID,
 }
 
 // patchCatalogItemVersion adds new artifact references to an existing CatalogItemVersion.
-func (c *Consumer) patchCatalogItemVersion(ctx context.Context, orgID uuid.UUID, catalogName, itemName, version string, newRefs map[string]string, baseURI string) error {
-	existing, err := c.mainStore.Catalog().GetItem(ctx, orgID, catalogName, itemName)
+func (c *Consumer) patchCatalogItemVersion(ctx context.Context, orgID uuid.UUID, catalogName, itemName, version string, newRefs map[coredomain.CatalogItemArtifactType]string, baseURI string) error {
+	existing, err := c.catalogStore.GetItem(ctx, orgID, catalogName, itemName)
 	if err != nil {
 		return fmt.Errorf("failed to get CatalogItem %s: %w", itemName, err)
 	}
@@ -308,14 +305,14 @@ func (c *Consumer) patchCatalogItemVersion(ctx context.Context, orgID uuid.UUID,
 	for artifactType := range newRefs {
 		found := false
 		for _, a := range existing.Spec.Artifacts {
-			if string(a.Type) == artifactType {
+			if a.Type == artifactType {
 				found = true
 				break
 			}
 		}
 		if !found {
 			existing.Spec.Artifacts = append(existing.Spec.Artifacts, coredomain.CatalogItemArtifact{
-				Type: coredomain.CatalogItemArtifactType(artifactType),
+				Type: artifactType,
 				Uri:  baseURI,
 			})
 		}
@@ -329,7 +326,7 @@ func (c *Consumer) patchCatalogItemVersion(ctx context.Context, orgID uuid.UUID,
 		}
 		found = true
 		if v.References == nil {
-			v.References = make(map[string]string)
+			v.References = make(map[coredomain.CatalogItemArtifactType]string)
 		}
 		qualifiedRefs := qualifyReferencesForURIMismatchWorker(newRefs, existing.Spec.Artifacts, baseURI)
 		for artifactType, ref := range qualifiedRefs {
@@ -344,7 +341,7 @@ func (c *Consumer) patchCatalogItemVersion(ctx context.Context, orgID uuid.UUID,
 		return fmt.Errorf("target CatalogItem version %q not found", version)
 	}
 
-	_, _, err = c.mainStore.Catalog().CreateOrUpdateItem(ctx, orgID, catalogName, existing)
+	_, _, err = c.catalogStore.CreateOrUpdateItem(ctx, orgID, catalogName, existing)
 	if err != nil {
 		return fmt.Errorf("failed to patch CatalogItem: %w", err)
 	}
@@ -352,7 +349,7 @@ func (c *Consumer) patchCatalogItemVersion(ctx context.Context, orgID uuid.UUID,
 }
 
 // createNewCatalogItem creates a brand new CatalogItem via the core service layer.
-func (c *Consumer) createNewCatalogItem(ctx context.Context, orgID uuid.UUID, target domain.NewCatalogItemTarget, references map[string]string, baseURI string) error {
+func (c *Consumer) createNewCatalogItem(ctx context.Context, orgID uuid.UUID, target domain.NewCatalogItemTarget, references map[coredomain.CatalogItemArtifactType]string, baseURI string) error {
 	artifacts := referencesToArtifactsWorker(references, baseURI)
 	version := coredomain.CatalogItemVersion{
 		Version:    target.Version,
@@ -361,26 +358,30 @@ func (c *Consumer) createNewCatalogItem(ctx context.Context, orgID uuid.UUID, ta
 		Readme:     target.Readme,
 	}
 	systemCategory := coredomain.CatalogItemCategorySystem
+	itemSpec := coredomain.CatalogItemSpec{
+		Type:      coredomain.CatalogItemTypeOS,
+		Category:  &systemCategory,
+		Artifacts: artifacts,
+		Versions:  []coredomain.CatalogItemVersion{version},
+	}
+	if target.DisplayName != nil {
+		itemSpec.DisplayName = target.DisplayName
+	}
 	item := coredomain.CatalogItem{
 		Metadata: coredomain.CatalogItemMeta{
 			Name: lo.ToPtr(target.CatalogItemName),
 		},
-		Spec: coredomain.CatalogItemSpec{
-			Type:      coredomain.CatalogItemTypeOS,
-			Category:  &systemCategory,
-			Artifacts: artifacts,
-			Versions:  []coredomain.CatalogItemVersion{version},
-		},
+		Spec: itemSpec,
 	}
 
-	_, err := c.mainStore.Catalog().CreateItem(ctx, orgID, target.CatalogName, &item)
+	_, err := c.catalogStore.CreateItem(ctx, orgID, target.CatalogName, &item)
 	if err != nil {
 		if errors.Is(err, flterrors.ErrDuplicateName) {
 			// The item already exists. Check whether our specific version+references are
 			// already present, which means a previous attempt wrote it before crashing.
 			// References are deterministic (derived from immutable build/export digests),
 			// so a match unambiguously identifies our own previous write.
-			existing, getErr := c.mainStore.Catalog().GetItem(ctx, orgID, target.CatalogName, target.CatalogItemName)
+			existing, getErr := c.catalogStore.GetItem(ctx, orgID, target.CatalogName, target.CatalogItemName)
 			if getErr == nil {
 				for _, v := range existing.Spec.Versions {
 					if v.Version == target.Version && referencesEqualWorker(v.References, references) {
@@ -398,8 +399,8 @@ func (c *Consumer) createNewCatalogItem(ctx context.Context, orgID uuid.UUID, ta
 }
 
 // appendVersionToCatalogItem appends a version entry to an existing CatalogItem.
-func (c *Consumer) appendVersionToCatalogItem(ctx context.Context, orgID uuid.UUID, target domain.ExistingCatalogItemTarget, references map[string]string, baseURI string) error {
-	existing, err := c.mainStore.Catalog().GetItem(ctx, orgID, target.CatalogName, target.CatalogItemName)
+func (c *Consumer) appendVersionToCatalogItem(ctx context.Context, orgID uuid.UUID, target domain.ExistingCatalogItemTarget, references map[coredomain.CatalogItemArtifactType]string, baseURI string) error {
+	existing, err := c.catalogStore.GetItem(ctx, orgID, target.CatalogName, target.CatalogItemName)
 	if err != nil {
 		return fmt.Errorf("failed to get CatalogItem %s: %w", target.CatalogItemName, err)
 	}
@@ -458,7 +459,7 @@ func (c *Consumer) appendVersionToCatalogItem(ctx context.Context, orgID uuid.UU
 	}
 	existing.Spec.Versions = append(existing.Spec.Versions, newVersion)
 
-	_, _, err = c.mainStore.Catalog().CreateOrUpdateItem(ctx, orgID, target.CatalogName, existing)
+	_, _, err = c.catalogStore.CreateOrUpdateItem(ctx, orgID, target.CatalogName, existing)
 	if err != nil {
 		return fmt.Errorf("failed to update CatalogItem: %w", err)
 	}
@@ -466,8 +467,8 @@ func (c *Consumer) appendVersionToCatalogItem(ctx context.Context, orgID uuid.UU
 }
 
 // resolveArtifactReferences builds the references map and resolvedExport names per format.
-func (c *Consumer) resolveArtifactReferences(ctx context.Context, orgID uuid.UUID, promotion *domain.ImagePromotion, imageBuild *domain.ImageBuild) (map[string]string, map[string]string, error) {
-	references := make(map[string]string)
+func (c *Consumer) resolveArtifactReferences(ctx context.Context, orgID uuid.UUID, promotion *domain.ImagePromotion, imageBuild *domain.ImageBuild) (map[coredomain.CatalogItemArtifactType]string, map[string]string, error) {
+	references := make(map[coredomain.CatalogItemArtifactType]string)
 	resolvedExports := make(map[string]string)
 
 	containerRef := ""
@@ -477,7 +478,7 @@ func (c *Consumer) resolveArtifactReferences(ctx context.Context, orgID uuid.UUI
 	if containerRef == "" {
 		return nil, nil, fmt.Errorf("ImageBuild %s has no image reference", promotion.Spec.Source.ImageBuildRef)
 	}
-	references[string(coredomain.CatalogItemArtifactTypeContainer)] = containerRef
+	references[coredomain.CatalogItemArtifactTypeContainer] = containerRef
 
 	if promotion.Spec.Source.ExportFormats != nil {
 		for _, format := range *promotion.Spec.Source.ExportFormats {
@@ -499,7 +500,7 @@ func (c *Consumer) resolveArtifactReferences(ctx context.Context, orgID uuid.UUI
 			if ref == "" {
 				return nil, nil, fmt.Errorf("ImageExport %s for format %s has no manifest digest", *export.Metadata.Name, format)
 			}
-			references[string(artifactType)] = ref
+			references[artifactType] = ref
 			resolvedExports[string(format)] = *export.Metadata.Name
 		}
 	}
@@ -747,11 +748,11 @@ func resolveExportRefWorker(export *domain.ImageExport) string {
 	return ""
 }
 
-func referencesToArtifactsWorker(references map[string]string, baseURI string) []coredomain.CatalogItemArtifact {
+func referencesToArtifactsWorker(references map[coredomain.CatalogItemArtifactType]string, baseURI string) []coredomain.CatalogItemArtifact {
 	artifacts := make([]coredomain.CatalogItemArtifact, 0, len(references))
 	for artifactType := range references {
 		artifacts = append(artifacts, coredomain.CatalogItemArtifact{
-			Type: coredomain.CatalogItemArtifactType(artifactType),
+			Type: artifactType,
 			Uri:  baseURI,
 		})
 	}
@@ -760,13 +761,13 @@ func referencesToArtifactsWorker(references map[string]string, baseURI string) [
 
 // qualifyReferencesForURIMismatchWorker returns a copy of refs where, for any artifact type whose
 // existing URI differs from baseURI, the short reference is expanded to a fully-qualified reference.
-func qualifyReferencesForURIMismatchWorker(refs map[string]string, existingArtifacts []coredomain.CatalogItemArtifact, baseURI string) map[string]string {
-	artifactURIs := make(map[string]string, len(existingArtifacts))
+func qualifyReferencesForURIMismatchWorker(refs map[coredomain.CatalogItemArtifactType]string, existingArtifacts []coredomain.CatalogItemArtifact, baseURI string) map[coredomain.CatalogItemArtifactType]string {
+	artifactURIs := make(map[coredomain.CatalogItemArtifactType]string, len(existingArtifacts))
 	for _, a := range existingArtifacts {
-		artifactURIs[string(a.Type)] = a.Uri
+		artifactURIs[a.Type] = a.Uri
 	}
 
-	result := make(map[string]string, len(refs))
+	result := make(map[coredomain.CatalogItemArtifactType]string, len(refs))
 	for artifactType, ref := range refs {
 		existingURI, ok := artifactURIs[artifactType]
 		if ok && existingURI != baseURI && existingURI != "" {
@@ -787,7 +788,7 @@ func qualifyReferencesForURIMismatchWorker(refs map[string]string, existingArtif
 }
 
 // referencesEqualWorker returns true when both maps contain identical key/value pairs.
-func referencesEqualWorker(a, b map[string]string) bool {
+func referencesEqualWorker(a, b map[coredomain.CatalogItemArtifactType]string) bool {
 	if len(a) != len(b) {
 		return false
 	}

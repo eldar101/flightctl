@@ -119,8 +119,32 @@ func (h *Harness) CreateOrUpdateTestFleet(testFleetName string, fleetSpecOrSelec
 		return fmt.Errorf("first parameter must be either FleetSpec or LabelSelector")
 	}
 
-	_, err := h.Client.ReplaceFleetWithResponse(h.Context, testFleetName, testFleet)
-	return err
+	resp, err := h.Client.ReplaceFleetWithResponse(h.Context, testFleetName, testFleet)
+	if err != nil {
+		return fmt.Errorf("replace fleet %q: %w", testFleetName, err)
+	}
+	// Replace creates with 201 or updates with 200; anything else is a failed apply.
+	if resp.StatusCode() != 200 && resp.StatusCode() != 201 {
+		statusMessage := string(resp.Body)
+		switch {
+		case resp.JSON400 != nil:
+			statusMessage = resp.JSON400.Message
+		case resp.JSON401 != nil:
+			statusMessage = resp.JSON401.Message
+		case resp.JSON403 != nil:
+			statusMessage = resp.JSON403.Message
+		case resp.JSON404 != nil:
+			statusMessage = resp.JSON404.Message
+		case resp.JSON409 != nil:
+			statusMessage = resp.JSON409.Message
+		case resp.JSON429 != nil:
+			statusMessage = resp.JSON429.Message
+		case resp.JSON503 != nil:
+			statusMessage = resp.JSON503.Message
+		}
+		return fmt.Errorf("unexpected status creating/updating fleet %s: %d: %s", testFleetName, resp.StatusCode(), statusMessage)
+	}
+	return nil
 }
 
 // CreateFleetWithSelector creates a fleet with the specified label selector and empty device spec.
@@ -140,6 +164,38 @@ func (h *Harness) CreateTestFleetWithConfig(testFleetName string, testFleetSelec
 	}
 	err := h.CreateOrUpdateTestFleet(testFleetName, testFleetSelector, testFleetSpec)
 	return err
+}
+
+// CreateFleetWithLabelConfig creates a fleet that selects devices by a single label key/value
+// and applies the given config providers.
+func (h *Harness) CreateFleetWithLabelConfig(fleetName, labelKey string, configs ...v1beta1.ConfigProviderSpec) error {
+	selector := v1beta1.LabelSelector{MatchLabels: &map[string]string{labelKey: fleetName}}
+	deviceSpec := v1beta1.DeviceSpec{
+		Config: &configs,
+	}
+	return h.CreateOrUpdateTestFleet(fleetName, selector, deviceSpec)
+}
+
+// CreateFleetAndEnrollDevice creates a fleet with the given config providers, enrolls a device
+// with a matching label, waits for it to become UpToDate, and returns the device ID and initial
+// rendered version. Returns an error if any step fails.
+func (h *Harness) CreateFleetAndEnrollDevice(fleetName, labelKey string, configs ...v1beta1.ConfigProviderSpec) (string, int, error) {
+	if err := h.CreateFleetWithLabelConfig(fleetName, labelKey, configs...); err != nil {
+		return "", 0, fmt.Errorf("failed to create fleet %s: %w", fleetName, err)
+	}
+
+	deviceID, _ := h.EnrollAndWaitForOnlineStatus(map[string]string{labelKey: fleetName})
+	if deviceID == "" {
+		return "", 0, fmt.Errorf("enrolled device ID is empty for fleet %s", fleetName)
+	}
+
+	initialVersion, err := h.GetCurrentDeviceRenderedVersion(deviceID)
+	if err != nil {
+		return "", 0, fmt.Errorf("failed to get rendered version for device %s: %w", deviceID, err)
+	}
+
+	logrus.Infof("Fleet %s: device %s enrolled with initial rendered version %d", fleetName, deviceID, initialVersion)
+	return deviceID, initialVersion, nil
 }
 
 func (h *Harness) DeleteFleet(testFleetName string) error {
@@ -339,4 +395,19 @@ func (h *Harness) WaitForFleetCount(params *v1beta1.ListFleetsParams, expectedCo
 		return len(resp.JSON200.Items), nil
 	}, timeout, polling).Should(Equal(expectedCount),
 		fmt.Sprintf("Expected %d fleets matching params", expectedCount))
+}
+
+// CountTemplateVersions returns the number of template versions for a fleet.
+func (h *Harness) CountTemplateVersions(fleetName string) (int, error) {
+	resp, err := h.Client.ListTemplateVersionsWithResponse(h.Context, fleetName, &v1beta1.ListTemplateVersionsParams{})
+	if err != nil {
+		return 0, fmt.Errorf("failed to list template versions for fleet %s: %w", fleetName, err)
+	}
+	if resp == nil {
+		return 0, fmt.Errorf("nil response listing template versions for fleet %s", fleetName)
+	}
+	if resp.JSON200 == nil {
+		return 0, fmt.Errorf("unexpected status %d listing template versions for fleet %s", resp.StatusCode(), fleetName)
+	}
+	return len(resp.JSON200.Items), nil
 }

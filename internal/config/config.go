@@ -25,14 +25,17 @@ const (
 type Config struct {
 	Database               *dbConfig                  `json:"database,omitempty"`
 	Service                *svcConfig                 `json:"service,omitempty"`
+	RemoteAccessService    *RemoteAccessServiceConfig `json:"remoteAccessService,omitempty"`
 	ImageBuilderService    *ImageBuilderServiceConfig `json:"imageBuilderService,omitempty"`
 	ImageBuilderWorker     *imageBuilderWorkerConfig  `json:"imageBuilderWorker,omitempty"`
+	Worker                 *workerConfig              `json:"worker,omitempty"`
 	KV                     *kvConfig                  `json:"kv,omitempty"`
 	Alertmanager           *alertmanagerConfig        `json:"alertmanager,omitempty"`
 	Auth                   *authConfig                `json:"auth,omitempty"`
 	Metrics                *metricsConfig             `json:"metrics,omitempty"`
 	CA                     *ca.Config                 `json:"ca,omitempty"`
 	Tracing                *TracingConfig             `json:"tracing,omitempty"`
+	Profiling              *ProfilingConfig           `json:"profiling,omitempty"`
 	GitOps                 *gitOpsConfig              `json:"gitOps,omitempty"`
 	CryptoPolicy           *CryptoPolicyConfig        `json:"cryptoPolicy,omitempty"`
 	Periodic               *periodicConfig            `json:"periodic,omitempty"`
@@ -40,6 +43,7 @@ type Config struct {
 	TelemetryGateway       *telemetryGatewayConfig    `json:"telemetrygateway,omitempty"`
 	VulnerabilityReporting *VulnerabilityConfig       `json:"vulnerabilityReporting,omitempty"`
 	DependenciesSync       *DependenciesSyncConfig    `json:"dependenciesSync,omitempty"`
+	Encryption             *EncryptionConfig          `json:"encryption,omitempty"`
 }
 
 // CryptoPolicyConfig contains cryptographic policy configuration for all protocols.
@@ -165,6 +169,49 @@ type ImageBuilderServiceConfig struct {
 	RateLimit             *RateLimitConfig `json:"rateLimit,omitempty"`
 	HealthChecks          *HealthChecks    `json:"healthChecks,omitempty"`
 	DeleteCancelTimeout   util.Duration    `json:"deleteCancelTimeout,omitempty"`
+}
+
+// RemoteAccessServiceConfig holds configuration specific to the flightctl-remote-access service.
+type RemoteAccessServiceConfig struct {
+	Address               string        `json:"address,omitempty"`
+	AgentEndpointAddress  string        `json:"agentEndpointAddress,omitempty"`
+	LogLevel              string        `json:"logLevel,omitempty"`
+	DisableTLS            bool          `json:"disableTLS,omitempty"`
+	HttpReadTimeout       util.Duration `json:"httpReadTimeout,omitempty"`
+	HttpReadHeaderTimeout util.Duration `json:"httpReadHeaderTimeout,omitempty"`
+	HttpWriteTimeout      util.Duration `json:"httpWriteTimeout,omitempty"`
+	HttpIdleTimeout       util.Duration `json:"httpIdleTimeout,omitempty"`
+	HttpMaxHeaderBytes    int           `json:"httpMaxHeaderBytes,omitempty"`
+	// RateLimit configures rate limiting for the WebSocket console endpoint.
+	// Defaults to 100 requests/minute; set to nil or Enabled=false to disable.
+	RateLimit    *RateLimitConfig `json:"rateLimit,omitempty"`
+	HealthChecks *HealthChecks    `json:"healthChecks,omitempty"`
+}
+
+// NewDefaultRemoteAccessServiceConfig returns a default remote-access service configuration.
+func NewDefaultRemoteAccessServiceConfig() *RemoteAccessServiceConfig {
+	return &RemoteAccessServiceConfig{
+		Address:               ":3444",
+		AgentEndpointAddress:  ":7444",
+		LogLevel:              "info",
+		DisableTLS:            false,
+		HttpReadTimeout:       util.Duration(5 * time.Minute),
+		HttpReadHeaderTimeout: util.Duration(5 * time.Minute),
+		HttpWriteTimeout:      util.Duration(5 * time.Minute),
+		HttpIdleTimeout:       util.Duration(5 * time.Minute),
+		HttpMaxHeaderBytes:    32 * 1024, // 32KB
+		RateLimit: &RateLimitConfig{
+			Enabled:  true,
+			Requests: 100,
+			Window:   util.Duration(time.Minute),
+		},
+		HealthChecks: &HealthChecks{
+			Enabled:          true,
+			ReadinessPath:    "/readyz",
+			LivenessPath:     "/healthz",
+			ReadinessTimeout: util.Duration(2 * time.Second),
+		},
+	}
 }
 
 // serviceImageConfig holds image and skip-TLS settings for a single builder image (podman or bootc-image-builder).
@@ -356,6 +403,63 @@ func (c *imageBuilderWorkerConfig) EffectiveSyftImage() string {
 // EffectiveSyftSkipTLSVerify returns whether to skip TLS verification when pulling the Syft image.
 func (c *imageBuilderWorkerConfig) EffectiveSyftSkipTLSVerify() bool {
 	return c != nil && c.ServiceImages != nil && c.ServiceImages.Syft != nil && c.ServiceImages.Syft.SkipTLSVerify
+}
+
+const DefaultVirtLauncherImage = "quay.io/kubevirt/virt-launcher:v1.9.0"
+
+// workerConfig holds configuration for the flightctl-worker service.
+type workerConfig struct {
+	VmRender *vmRenderConfig `json:"vmRender,omitempty"`
+}
+
+// vmRenderConfig holds options for converting VmApplications to Quadlet units
+// via vm-to-quadlet.
+type vmRenderConfig struct {
+	LauncherImage    string `json:"launcherImage,omitempty"`
+	PasstWorkarounds *bool  `json:"passtWorkarounds,omitempty"`
+}
+
+// NewDefaultWorkerConfig returns the default flightctl-worker configuration.
+func NewDefaultWorkerConfig() *workerConfig {
+	passt := false
+	return &workerConfig{
+		VmRender: &vmRenderConfig{
+			LauncherImage:    DefaultVirtLauncherImage,
+			PasstWorkarounds: &passt,
+		},
+	}
+}
+
+// EffectiveVmLauncherImage returns the virt-launcher image used for VM render.
+func (c *Config) EffectiveVmLauncherImage() string {
+	if c == nil || c.Worker == nil {
+		return DefaultVirtLauncherImage
+	}
+	return c.Worker.EffectiveLauncherImage()
+}
+
+// EffectiveVmPasstWorkarounds returns whether passt workarounds are enabled for VM render.
+func (c *Config) EffectiveVmPasstWorkarounds() bool {
+	if c == nil || c.Worker == nil {
+		return false
+	}
+	return c.Worker.EffectivePasstWorkarounds()
+}
+
+// EffectiveLauncherImage returns the virt-launcher image (config override or default).
+func (c *workerConfig) EffectiveLauncherImage() string {
+	if c != nil && c.VmRender != nil && c.VmRender.LauncherImage != "" {
+		return c.VmRender.LauncherImage
+	}
+	return DefaultVirtLauncherImage
+}
+
+// EffectivePasstWorkarounds returns whether passt workarounds are enabled (default false).
+func (c *workerConfig) EffectivePasstWorkarounds() bool {
+	if c != nil && c.VmRender != nil && c.VmRender.PasstWorkarounds != nil {
+		return *c.VmRender.PasstWorkarounds
+	}
+	return false
 }
 
 // IsSBOMEnabled returns whether SBOM generation is enabled.
@@ -561,6 +665,58 @@ type TracingConfig struct {
 	Insecure bool   `json:"insecure,omitempty"`
 }
 
+// ProfilingConfig selects how continuous/on-demand profiling is started.
+// pprof and pyroscope are independent; either, both, or neither may be enabled.
+type ProfilingConfig struct {
+	Pprof     *PprofProfilingConfig     `json:"pprof,omitempty"`
+	Pyroscope *PyroscopeProfilingConfig `json:"pyroscope,omitempty"`
+}
+
+// PprofProfilingConfig starts the loopback-only Go net/http/pprof server.
+type PprofProfilingConfig struct {
+	Enabled bool `json:"enabled,omitempty"`
+	// Port is the loopback TCP port for /debug/pprof (127.0.0.1 only).
+	// If unset or zero, each process uses its own default (see docs). Do not set
+	// a shared port when multiple services run on one host — they would conflict.
+	Port int `json:"port,omitempty"`
+}
+
+// PyroscopeProfilingConfig pushes profiles to a Grafana Pyroscope server.
+type PyroscopeProfilingConfig struct {
+	Enabled bool `json:"enabled,omitempty"`
+	// ServerAddress is required when enabled (e.g. "http://pyroscope:4040").
+	ServerAddress string `json:"serverAddress,omitempty"`
+	// ApplicationName overrides the process name sent to Pyroscope. When empty,
+	// each binary uses its own default (e.g. "flightctl-worker").
+	ApplicationName string `json:"applicationName,omitempty"`
+	// BasicAuthUser / BasicAuthPassword are optional (e.g. Grafana Cloud).
+	BasicAuthUser     string           `json:"basicAuthUser,omitempty"`
+	BasicAuthPassword api.SecureString `json:"basicAuthPassword,omitempty"`
+	// TenantID is optional multi-tenant Pyroscope header.
+	TenantID string `json:"tenantID,omitempty"`
+}
+
+// PprofProfilingEnabled reports whether the loopback pprof server should start.
+func (c *Config) PprofProfilingEnabled() bool {
+	return c != nil && c.Profiling != nil && c.Profiling.Pprof != nil && c.Profiling.Pprof.Enabled
+}
+
+// PprofProfilingPort returns the configured pprof port, or defaultPort when unset.
+func (c *Config) PprofProfilingPort(defaultPort int) int {
+	if c != nil && c.Profiling != nil && c.Profiling.Pprof != nil && c.Profiling.Pprof.Port > 0 {
+		return c.Profiling.Pprof.Port
+	}
+	return defaultPort
+}
+
+// PyroscopeProfilingConfig returns the pyroscope block when enabled, otherwise nil.
+func (c *Config) PyroscopeProfilingConfig() *PyroscopeProfilingConfig {
+	if c == nil || c.Profiling == nil || c.Profiling.Pyroscope == nil || !c.Profiling.Pyroscope.Enabled {
+		return nil
+	}
+	return c.Profiling.Pyroscope
+}
+
 type gitOpsConfig struct {
 	// IgnoreResourceUpdates lists JSON pointer paths that should be ignored
 	// when comparing desired vs. live resources during GitOps sync.
@@ -577,6 +733,12 @@ type periodicTaskConfig struct {
 
 type periodicTasksConfig struct {
 	ResourceSync periodicTaskConfig `json:"resourceSync,omitempty"`
+	// DependencySync overrides the interval for both the dependency-sync-git and
+	// dependency-sync-http periodic tasks (see DefaultDependencySyncTaskInterval).
+	DependencySync periodicTaskConfig `json:"dependencySync,omitempty"`
+	// RepositoryTester overrides the interval for the repository-tester periodic task,
+	// which probes Repository resources and sets their Accessible condition.
+	RepositoryTester periodicTaskConfig `json:"repositoryTester,omitempty"`
 }
 
 type periodicConfig struct {
@@ -679,6 +841,20 @@ type telemetryGatewayForwardTLS struct {
 	KeyFile               string `json:"keyFile,omitempty"`
 }
 
+// EncryptionKeyConfig defines a single encryption key with its identifier and file path.
+type EncryptionKeyConfig struct {
+	ID   string `json:"id"`
+	Path string `json:"path"`
+}
+
+// EncryptionConfig holds encryption-at-rest key configuration.
+// Keys lists all available keys (for rotation support); ActiveKeyID selects which
+// key is used for new encryptions. Old keys remain available for decryption.
+type EncryptionConfig struct {
+	Keys        []EncryptionKeyConfig `json:"keys"`
+	ActiveKeyID string                `json:"activeKeyID"`
+}
+
 type ConfigOption func(*Config)
 
 func WithTracingEnabled() ConfigOption {
@@ -774,6 +950,10 @@ func CertificateDir() string {
 	return filepath.Join(ConfigDir(), "certs")
 }
 
+func EncryptionDir() string {
+	return filepath.Join(ConfigDir(), "encryption")
+}
+
 func NewDefault(opts ...ConfigOption) *Config {
 	c := &Config{
 		Database: &dbConfig{
@@ -815,8 +995,10 @@ func NewDefault(opts ...ConfigOption) *Config {
 			},
 			// Rate limiting is disabled by default - set RateLimit to enable
 		},
+		RemoteAccessService: NewDefaultRemoteAccessServiceConfig(),
 		ImageBuilderService: NewDefaultImageBuilderServiceConfig(),
 		ImageBuilderWorker:  NewDefaultImageBuilderWorkerConfig(),
+		Worker:              NewDefaultWorkerConfig(),
 		KV: &kvConfig{
 			Hostname: "localhost",
 			Port:     6379,
@@ -888,6 +1070,15 @@ func NewDefault(opts ...ConfigOption) *Config {
 		},
 		Auth: &authConfig{
 			DynamicProviderCacheTTL: util.Duration(5 * time.Second),
+		},
+		Encryption: &EncryptionConfig{
+			Keys: []EncryptionKeyConfig{
+				{
+					ID:   "default",
+					Path: filepath.Join(EncryptionDir(), "key"),
+				},
+			},
+			ActiveKeyID: "default",
 		},
 	}
 	c.CA = ca.NewDefault(CertificateDir())

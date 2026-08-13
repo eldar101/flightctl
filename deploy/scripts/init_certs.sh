@@ -3,7 +3,11 @@ set -euo pipefail
 
 CONFIG_FILE="/etc/flightctl/service-config.yaml"
 CERT_DIR="/etc/flightctl/pki"
+ENCRYPTION_DIR="/etc/flightctl/encryption"
 YAML_HELPER="/usr/share/flightctl/yaml_helpers.py"
+
+# Generate encryption key unconditionally (independent of certificate method)
+/usr/share/flightctl/generate-encryption-key.sh --encryption-dir "$ENCRYPTION_DIR"
 
 CERT_METHOD=$(python3 "$YAML_HELPER" extract .global.generateCertificates "$CONFIG_FILE")
 if [ "$CERT_METHOD" = "builtin" ]; then
@@ -99,6 +103,17 @@ grafana_sans=(
 )
 grafana_sans+=("${host_ips[@]}")
 
+# Remote Access certificate SANs
+remote_access_sans=(
+    "remote-access.$base_domain"
+    "$base_domain"
+    "$hostname_short"
+    "$hostname_fqdn"
+    "flightctl-remote-access"
+    "localhost"
+)
+remote_access_sans+=("${host_ips[@]}")
+
 # Build the certificate generation command
 cert_gen_args=("--cert-dir" "$CERT_DIR")
 
@@ -120,6 +135,10 @@ done
 
 for san in "${grafana_sans[@]}"; do
     cert_gen_args+=("--grafana-san" "$san")
+done
+
+for san in "${remote_access_sans[@]}"; do
+    cert_gen_args+=("--remote-access-san" "$san")
 done
 
 # Generate certificates

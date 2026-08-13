@@ -15,7 +15,7 @@ import (
 	"github.com/samber/lo"
 )
 
-var _ = Describe("VM Agent Helm Application Tests", Ordered, func() {
+var _ = Describe("VM Agent Helm Application Tests", Ordered, Label("microshift"), func() {
 	var (
 		harness        *e2e.Harness
 		services       *auxiliary.Services
@@ -542,6 +542,20 @@ image-pruning:
 			By("Remove the quadlet app")
 			err = harness.UpdateDeviceAndWaitForVersion(deviceId, func(device *v1beta1.Device) {
 				device.Spec.Applications = &[]v1beta1.ApplicationProviderSpec{}
+			})
+			Expect(err).ToNot(HaveOccurred())
+
+			By("Trigger an additional prune cycle to handle CRI images that failed removal while pods were terminating")
+			time.Sleep(util.SPECK_UPDATE_DELAY)
+			pruneRetryConfig, err := e2e.NewInlineConfigSpec("prune-retry", []v1beta1.FileSpec{
+				{
+					Content: "# triggers an additional reconciliation and prune cycle\n",
+					Path:    "/etc/flightctl/conf.d/prune-retry-trigger",
+				},
+			})
+			Expect(err).ToNot(HaveOccurred())
+			err = harness.UpdateDeviceAndWaitForVersion(deviceId, func(device *v1beta1.Device) {
+				device.Spec.Config = &[]v1beta1.ConfigProviderSpec{pruningConfig, pruneRetryConfig}
 			})
 			Expect(err).ToNot(HaveOccurred())
 

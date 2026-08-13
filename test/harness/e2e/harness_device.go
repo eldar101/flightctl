@@ -303,7 +303,9 @@ func BuildAppSpec(appName string, appType v1beta1.AppType, provider any) (v1beta
 		app := v1beta1.ContainerApplication{
 			AppType: appType,
 			Name:    &appName,
-			Image:   imageSpec.Image,
+		}
+		if err := app.FromImageApplicationProviderSpec(imageSpec); err != nil {
+			return v1beta1.ApplicationProviderSpec{}, err
 		}
 		var appSpec v1beta1.ApplicationProviderSpec
 		if err := appSpec.FromContainerApplication(app); err != nil {
@@ -318,7 +320,9 @@ func BuildAppSpec(appName string, appType v1beta1.AppType, provider any) (v1beta
 		app := v1beta1.HelmApplication{
 			AppType: appType,
 			Name:    &appName,
-			Image:   imageSpec.Image,
+		}
+		if err := app.FromImageApplicationProviderSpec(imageSpec); err != nil {
+			return v1beta1.ApplicationProviderSpec{}, err
 		}
 		var appSpec v1beta1.ApplicationProviderSpec
 		if err := appSpec.FromHelmApplication(app); err != nil {
@@ -1181,4 +1185,25 @@ func (h *Harness) DecommissionDevice(deviceName string) (string, error) {
 		return "", fmt.Errorf("device name is empty")
 	}
 	return h.CLI("decommission", "devices/"+deviceName)
+}
+
+// GetDeviceConfigRefFingerprint returns the fingerprint for a specific config provider
+// from the device's DependencySync status. Returns empty string if not found.
+func (h *Harness) GetDeviceConfigRefFingerprint(deviceID, configProviderName string) (string, error) {
+	if deviceID == "" {
+		return "", fmt.Errorf("deviceID is empty")
+	}
+	device, err := h.GetDevice(deviceID)
+	if err != nil {
+		return "", err
+	}
+	if device.Status == nil || device.Status.DependencySync == nil || device.Status.DependencySync.ConfigRefs == nil {
+		return "", nil
+	}
+	for _, ref := range *device.Status.DependencySync.ConfigRefs {
+		if ref.ConfigProviderName == configProviderName && ref.Fingerprint != nil && *ref.Fingerprint != "" {
+			return *ref.Fingerprint, nil
+		}
+	}
+	return "", nil
 }

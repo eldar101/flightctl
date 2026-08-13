@@ -17,7 +17,7 @@ Flight Control API server validates Kubernetes service account tokens by:
 Flight Control provides the following standard ClusterRoles out-of-the-box:
 
 - **`flightctl-admin-<namespace>`** - Full access to all Flight Control resources
-- **`flightctl-operator-<namespace>`** - CRUD operations on devices, fleets, resourcesyncs, repositories; imagebuilds (including cancel and logs); imageexports (including cancel, download, and logs)
+- **`flightctl-operator-<namespace>`** - CRUD operations on devices, fleets, resourcesyncs, repositories; application lifecycle (start/stop/restart); device and application console; imagebuilds (including cancel and logs); imageexports (including cancel, download, and logs)
 - **`flightctl-viewer-<namespace>`** - Read-only access to devices, fleets, resourcesyncs, organizations; imagebuilds and imageexports (including logs, but no download)
 - **`flightctl-installer-<namespace>`** - Access to enrollmentrequests, certificate signing requests; view imagebuilds and imageexports; download imageexports
 
@@ -140,6 +140,8 @@ flightctl login https://flightctl.example.com --token=$TOKEN
 ```
 
 **Note:** When creating RoleBindings for users or service accounts, remember to reference the namespace-specific ClusterRole names (e.g., `flightctl-admin-<namespace>`) in the RoleBinding's `roleRef.name` field.
+
+> **Tip:** For automation and scripting, you can use the `FLIGHTCTL_TOKEN` environment variable or `--credentials-file` instead of passing `--token` on the command line. This avoids exposing the token in process arguments. See [Logging in Non-Interactively](../../using/cli/logging-in.md#logging-in-non-interactively-automation-and-scripting).
 
 ## Related Documentation
 

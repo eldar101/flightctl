@@ -53,6 +53,7 @@ type Publisher interface {
 	Watch() Watcher
 	SetClient(client.Management)
 	SetOnConflictPausedInvalidator(LastStatusInvalidator)
+	ResetVersion(version string)
 }
 
 type publisher struct {
@@ -81,6 +82,12 @@ func newPublisher(deviceName string,
 		deviceNotFoundHandler: deviceNotFoundHandler,
 		log:                   log,
 	}
+}
+
+func (n *publisher) ResetVersion(version string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.lastKnownVersion = version
 }
 
 func (n *publisher) getRenderedFromManagementAPIWithRetry(
@@ -216,7 +223,7 @@ func (n *publisher) pollAndPublish(ctx context.Context) {
 		n.log.Infof("New spec version received: %s -> %s", n.lastKnownVersion, newVersion)
 		n.lastKnownVersion = newVersion
 	} else {
-		n.log.Warnf("Received spec version %s is not greater than last known version %s, skipping...", newVersion, n.lastKnownVersion)
+		n.log.Debugf("Received rendered device with unchanged version %s (last known: %s)", newVersion, n.lastKnownVersion)
 	}
 
 	// notify all watchers of the new device spec

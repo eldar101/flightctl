@@ -64,6 +64,8 @@ func WithDisableRedirectFollowing() imagebuilderclient.ClientOption {
 type Config struct {
 	Service             Service  `json:"service"`
 	ImageBuilderService *Service `json:"imageBuilderService,omitempty"`
+	// RemoteAccessService holds the URL and TLS config for connecting to flightctl-remote-access.
+	RemoteAccessService *Service `json:"remoteAccessService,omitempty"`
 	AuthInfo            AuthInfo `json:"authentication"`
 	Organization        string   `json:"organization,omitempty"`
 
@@ -162,6 +164,16 @@ func (c *Config) Equal(c2 *Config) bool {
 		// Both non-nil, use Equal method
 		return false
 	}
+	// Compare RemoteAccessService pointer field
+	if c.RemoteAccessService == nil && c2.RemoteAccessService == nil {
+		// Both nil, continue with other fields
+	} else if c.RemoteAccessService == nil || c2.RemoteAccessService == nil {
+		// One nil, one not nil => not equal
+		return false
+	} else if !c.RemoteAccessService.Equal(c2.RemoteAccessService) {
+		// Both non-nil, use Equal method
+		return false
+	}
 	return c.Service.Equal(&c2.Service) && c.AuthInfo.Equal(&c2.AuthInfo) && c.Organization == c2.Organization
 }
 
@@ -238,6 +250,9 @@ func (c *Config) DeepCopy() *Config {
 	}
 	if c.ImageBuilderService != nil {
 		copied.ImageBuilderService = c.ImageBuilderService.DeepCopy()
+	}
+	if c.RemoteAccessService != nil {
+		copied.RemoteAccessService = c.RemoteAccessService.DeepCopy()
 	}
 	return copied
 }
@@ -379,6 +394,15 @@ func (c *Client) Stop() {
 func NewTestClient(clientWithResponses *client.ClientWithResponses) *Client {
 	return &Client{
 		ClientWithResponses: clientWithResponses,
+	}
+}
+
+// NewTestClientWithV1Alpha1 creates a Client for testing purposes with both
+// v1beta1 and v1alpha1 clients pre-configured. This should only be used in tests.
+func NewTestClientWithV1Alpha1(clientWithResponses *client.ClientWithResponses, v1alpha1 *v1alpha1client.ClientWithResponses) *Client {
+	return &Client{
+		ClientWithResponses: clientWithResponses,
+		v1alpha1:            v1alpha1,
 	}
 }
 
@@ -583,6 +607,14 @@ func (c *Config) GetImageBuilderServer() string {
 	return ""
 }
 
+// GetRemoteAccessServer returns the flightctl-remote-access server URL if configured, empty string otherwise.
+func (c *Config) GetRemoteAccessServer() string {
+	if c.RemoteAccessService != nil && c.RemoteAccessService.Server != "" {
+		return c.RemoteAccessService.Server
+	}
+	return ""
+}
+
 // NewHTTPClientFromConfig returns a new HTTP Client from the given config.
 // It uses the config's Service.Server to derive the TLS ServerName for SNI.
 func NewHTTPClientFromConfig(config *Config) (*http.Client, error) {
@@ -618,6 +650,7 @@ func NewHTTPClientForServer(config *Config, serverURL string, versionOpts ...ver
 	// Configure transport for HTTP/2 support
 	transport := &http.Transport{
 		TLSClientConfig: tlsConfig,
+		Proxy:           http.ProxyFromEnvironment,
 		// Enable HTTP/2
 		ForceAttemptHTTP2: true,
 	}

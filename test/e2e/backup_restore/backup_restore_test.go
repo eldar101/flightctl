@@ -12,17 +12,16 @@ import (
 	"time"
 
 	"github.com/flightctl/flightctl/api/core/v1beta1"
-	"github.com/flightctl/flightctl/test/e2e/infra"
 	"github.com/flightctl/flightctl/test/e2e/infra/setup"
 	"github.com/flightctl/flightctl/test/harness/e2e"
 	"github.com/flightctl/flightctl/test/login"
 	testutil "github.com/flightctl/flightctl/test/util"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"golang.org/x/sync/errgroup"
 )
 
 const (
-	// 84934: fleet and device labels
 	backupRestoreFleetName = "backup-restore-fleet"
 	devYesLabel            = "dev"
 	devYesValue            = "yes"
@@ -34,41 +33,73 @@ var _ = Describe("Service backup and restore", Label("backup-restore"), func() {
 
 	BeforeEach(func() {
 		harness = e2e.GetWorkerHarness()
-		_, err := login.LoginToAPIWithToken(harness)
-		Expect(err).ToNot(HaveOccurred())
+		Eventually(func() error {
+			_, err := login.LoginToAPIWithToken(harness)
+			return err
+		}, testutil.DURATION_TIMEOUT, testutil.POLLING).Should(Succeed(), "API should become responsive for login")
 		br = newBackupRestore(harness, setup.GetDefaultProviders())
 	})
 
 	// full backup/restore flow with 3 ERs, fleet, post-backup changes, and resume.
 	Context("All flightctl resources can be resumed after a backup and restore", func() {
-		It("3 ERs, fleet rollout, backup, restore, then verify states and resume", Label("84934", "sanity", "slow"), func() {
+		It("3 ERs, fleet rollout, backup, restore, then verify states and resume", Label("89141", "sanity", "slow", e2e.NeedVMLabel), func() {
+			if reason := backupRestoreExternalDBSkipReason(); reason != "" {
+				Skip(reason)
+			}
 			// --- Setup: 3 ERs (2 approved, 1 unapproved) ---
 			By("Setting up 3 VMs and enrollment requests (2 approved with different labels, 1 unapproved)")
 			ctx := harness.GetTestContext()
 
-			// Main harness already has VM from BeforeEach (workerID). Create two more harnesses with VMs 1001, 1002.
+			// Main harness already has VM from BeforeEach (workerID). Create two more harnesses with
+			// VMs 1001, 1002. Each involves a full cold VM boot + pristine snapshot creation (~110-150s)
+			// keyed on its own worker ID, with no shared state beyond the VM pool's map (see
+			// VMPool.GetVMForWorker in vm_pool.go, which only holds its mutex for the map access, not
+			// for the boot itself) - so run the two setups concurrently instead of paying both costs
+			// sequentially.
 			workerID2 := GinkgoParallelProcess()*100 + 1
-			harness2, err := e2e.NewTestHarnessWithVMPool(ctx, workerID2)
-			Expect(err).ToNot(HaveOccurred())
-			harness2.SetTestContext(harness.GetTestContext())
-			Expect(harness2.SetupVMFromPoolAndStartAgent(workerID2)).To(Succeed())
-			DeferCleanup(func() {
-				harness2.PrintAgentLogsIfFailed()
-				harness2.CaptureDeploymentLogsIfFailed()
-				err := harness2.CleanUpAllTestResources()
-				Expect(err).ToNot(HaveOccurred(), "harness2 cleanup")
-			})
 			workerID3 := GinkgoParallelProcess()*100 + 2
-			harness3, err := e2e.NewTestHarnessWithVMPool(ctx, workerID3)
-			Expect(err).ToNot(HaveOccurred())
-			harness3.SetTestContext(harness.GetTestContext())
-			Expect(harness3.SetupVMFromPoolAndStartAgent(workerID3)).To(Succeed())
-			DeferCleanup(func() {
-				harness3.PrintAgentLogsIfFailed()
-				harness3.CaptureDeploymentLogsIfFailed()
-				err := harness3.CleanUpAllTestResources()
-				Expect(err).ToNot(HaveOccurred(), "harness3 cleanup")
+			var harness2, harness3 *e2e.Harness
+			g, _ := errgroup.WithContext(ctx)
+			g.Go(func() error {
+				var err error
+				harness2, err = e2e.NewTestHarnessWithVMPool(ctx, workerID2)
+				if err != nil {
+					return err
+				}
+				harness2.SetTestContext(harness.GetTestContext())
+				return harness2.SetupVMFromPoolAndStartAgent(workerID2)
 			})
+			g.Go(func() error {
+				var err error
+				harness3, err = e2e.NewTestHarnessWithVMPool(ctx, workerID3)
+				if err != nil {
+					return err
+				}
+				harness3.SetTestContext(harness.GetTestContext())
+				return harness3.SetupVMFromPoolAndStartAgent(workerID3)
+			})
+			setupErr := g.Wait()
+			// Register cleanup for whichever harnesses came up, regardless of the other's outcome,
+			// mirroring the sequential code's "only clean up what was actually set up" behavior. A
+			// harness can be non-nil but only partially set up (NewTestHarnessWithVMPool succeeded,
+			// SetupVMFromPoolAndStartAgent failed), so key cleanup on non-nil rather than full readiness.
+			if harness2 != nil {
+				DeferCleanup(func() {
+					harness2.PrintAgentLogsIfFailed()
+					harness2.CaptureDeploymentLogsIfFailed()
+					err := harness2.CleanUpAllTestResources()
+					Expect(err).ToNot(HaveOccurred(), "harness2 cleanup")
+				})
+			}
+			if harness3 != nil {
+				DeferCleanup(func() {
+					harness3.PrintAgentLogsIfFailed()
+					harness3.CaptureDeploymentLogsIfFailed()
+					err := harness3.CleanUpAllTestResources()
+					Expect(err).ToNot(HaveOccurred(), "harness3 cleanup")
+				})
+			}
+			Expect(setupErr).ToNot(HaveOccurred())
 			// Device 1: approved with dev=yes (will be in fleet)
 			device1ID, _ := harness.EnrollAndWaitForOnlineStatus(map[string]string{devYesLabel: devYesValue})
 			Expect(device1ID).NotTo(BeEmpty())
@@ -105,9 +136,9 @@ var _ = Describe("Service backup and restore", Label("backup-restore"), func() {
 
 			// --- Step 2: Create backup archive (service has rvAtBackup) ---
 			By("Step 2: Creating backup archive (service RV=rvAtBackup)")
-			archivePath, cleanup, err := br.RunFlightCtlBackup()
-			Expect(err).ToNot(HaveOccurred(), "backup must succeed (build with: make flightctl-backup)")
-			defer cleanup()
+			backupDir := GinkgoT().TempDir()
+			archivePath, _, err := br.RunFlightCtlBackup(backupDir)
+			Expect(err).ToNot(HaveOccurred(), "backup must succeed")
 
 			// --- Step 3: Update fleet to OS v3 + inline config (new RV) ---
 			var rvAfterUpdate int
@@ -138,19 +169,23 @@ var _ = Describe("Service backup and restore", Label("backup-restore"), func() {
 			}, testutil.LONGTIMEOUT)
 			Expect(rvAfterUpdate).To(BeNumerically(">", rvAtBackup), "step 4: new RV must be greater than previous")
 
-			// --- Step 5: Restore from backup; flightctl-restore handles service stop/start ---
-			By("Step 5: Restoring from backup (flightctl-restore stops services, restores DB, starts services)")
+			// --- Step 5: Restore from backup archive (do not restart device); service back to RV=N ---
+			By("Step 5: Restoring from backup archive (flightctl-restore handles service stop/start)")
 			defer func() {
-				// Safety net: ensure services are up even if the restore binary is killed before its own deferred start.
-				_ = br.ScaleUpFlightCtlServices()
+				Expect(br.VerifyAllServicesRunning()).To(Succeed(), "all services must be running after restore cleanup")
 			}()
-			Expect(br.RunFlightCtlRestore(archivePath)).To(Succeed(), "flightctl-restore must succeed (build with: make flightctl-restore)")
+			Expect(br.RunFlightCtlRestoreFromArchive(archivePath)).To(Succeed(), "flightctl-restore must succeed")
 
-			By("Waiting for API server to be responsive after scale up")
+			By("Verifying all services were restarted by the restore binary")
+			Eventually(func() error {
+				return br.VerifyAllServicesRunning()
+			}, testutil.TIMEOUT_5M, testutil.POLLING).Should(Succeed(), "All 8 services must be running after restore")
+
+			By("Waiting for API server to be responsive after restore")
 			Eventually(func() error {
 				_, err := harness.Client.GetDeviceWithResponse(harness.Context, device1ID)
 				return err
-			}, testutil.TIMEOUT_5M, testutil.POLLING).Should(Succeed(), "API server must respond after scale up")
+			}, testutil.TIMEOUT_5M, testutil.POLLING).Should(Succeed(), "API server must respond after restore")
 
 			// --- Step 6: Service RV=rvAtBackup (restored), device RV=rvAfterUpdate (> rvAtBackup) → ConflictPaused ---
 			By("Step 6: Waiting for devices to reach AwaitingReconnect or ConflictPaused or Online")
@@ -272,7 +307,10 @@ var _ = Describe("Service backup and restore", Label("backup-restore"), func() {
 		})
 
 		// 84938: Backup taken while device update is in progress; after restore, device version <= server → AwaitingReconnect then Online (no ConflictPaused).
-		It("backup during update in progress, restore then devices reach Online", Label("84938", "slow"), func() {
+		It("backup during update in progress, restore then devices reach Online", Label("89194", "slow", e2e.NeedVMLabel), func() {
+			if reason := backupRestoreExternalDBSkipReason(); reason != "" {
+				Skip(reason)
+			}
 			ctx := harness.GetTestContext()
 
 			workerID2 := GinkgoParallelProcess()*100 + 1
@@ -308,23 +346,26 @@ var _ = Describe("Service backup and restore", Label("backup-restore"), func() {
 			Expect(err).ToNot(HaveOccurred())
 			Expect(harness.CreateOrUpdateTestFleet(backupRestoreFleetName, selector, deviceSpecV3)).To(Succeed())
 			// Verify device is still on v2 (update not yet applied) so backup truly occurs while update is in progress.
-			archivePath, cleanup, err := br.RunFlightCtlBackup()
-			Expect(err).ToNot(HaveOccurred(), "backup must succeed (build with: make flightctl-backup)")
-			defer cleanup()
+			backupDir := GinkgoT().TempDir()
+			archivePath, _, err := br.RunFlightCtlBackup(backupDir)
+			Expect(err).ToNot(HaveOccurred(), "backup must succeed")
 
 			By("Restore process: flightctl-restore (handles service stop/start internally)")
 			defer func() {
-				// Safety net: ensure services are up even if the restore binary is killed before its own deferred start.
-				_ = br.ScaleUpFlightCtlServices()
+				Expect(br.VerifyAllServicesRunning()).To(Succeed(), "all services must be running after restore cleanup")
 			}()
-			Expect(br.RunFlightCtlRestore(archivePath)).To(Succeed(), "flightctl-restore must succeed (build with: make flightctl-restore)")
-			Expect(br.ScaleUpFlightCtlServices()).To(Succeed())
+			Expect(br.RunFlightCtlRestoreFromArchive(archivePath)).To(Succeed(), "flightctl-restore must succeed")
 
-			By("Waiting for API server to be responsive after scale up")
+			By("Verifying all services were restarted by the restore binary")
+			Eventually(func() error {
+				return br.VerifyAllServicesRunning()
+			}, testutil.TIMEOUT_5M, testutil.POLLING).Should(Succeed(), "All 8 services must be running after restore")
+
+			By("Waiting for API server to be responsive after restore")
 			Eventually(func() error {
 				_, err := harness.Client.GetDeviceWithResponse(harness.Context, device1ID)
 				return err
-			}, testutil.TIMEOUT_5M, testutil.POLLING).Should(Succeed(), "API server must respond after scale up")
+			}, testutil.TIMEOUT_5M, testutil.POLLING).Should(Succeed(), "API server must respond after restore")
 
 			By("84938: Devices should move to AwaitingReconnect then Online (device version <= server, no ConflictPaused)")
 			harness.WaitForDeviceContents(device1ID, "device 1 AwaitingReconnect or Online", func(device *v1beta1.Device) bool {
@@ -352,26 +393,3 @@ var _ = Describe("Service backup and restore", Label("backup-restore"), func() {
 		})
 	})
 })
-
-// motdInlineConfigProviderSpec returns a ConfigProviderSpec that writes content to /etc/motd (per test plan 4.1).
-func motdInlineConfigProviderSpec() v1beta1.ConfigProviderSpec {
-	mode := 0644
-	inline := v1beta1.InlineConfigProviderSpec{
-		Inline: []v1beta1.FileSpec{{
-			Path:    "/etc/motd",
-			Mode:    &mode,
-			Content: "backup-restore-e2e\n",
-		}},
-		Name: "motd-inline",
-	}
-	var spec v1beta1.ConfigProviderSpec
-	if err := spec.FromInlineConfigProviderSpec(inline); err != nil {
-		panic(err)
-	}
-	return spec
-}
-
-// newBackupRestore returns a BackupRestore for running the backup/restore binaries.
-func newBackupRestore(harness *e2e.Harness, p *infra.Providers) *e2e.BackupRestore {
-	return harness.NewBackupRestore(p)
-}

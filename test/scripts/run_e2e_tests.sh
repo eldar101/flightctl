@@ -105,7 +105,7 @@ case "${E2E_ENVIRONMENT}" in
             echo "Using local Quadlet host: ${QUADLET_HOST} (set E2E_SSH_HOST for remote Quadlet)"
         fi
         export QUADLET_HOST
-        API_ENDPOINT="https://${QUADLET_HOST}:3443"
+        API_ENDPOINT="https://${QUADLET_HOST}"
         echo "Using Quadlet API endpoint: ${API_ENDPOINT}"
         ;;
     *)
@@ -202,7 +202,7 @@ if [[ "${GINKGO_TOTAL_NODES}" -gt 1 ]]; then
     echo "Node ${GINKGO_NODE} will run the following tests:"
     cat "${NODE_TESTS}"
 
-    FOCUS_PATTERN=$(sed 's/[[\.*^$()+?{|\\]/\\&/g' "${NODE_TESTS}" | sed 's/.*/^&$/' | paste -sd '|')
+    FOCUS_PATTERN=$(sed 's/[[\.*^$()+?{|\\]/\\&/g' "${NODE_TESTS}" | paste -sd '|')
     echo "Focus pattern for node ${GINKGO_NODE}: ${FOCUS_PATTERN}"
     GINKGO_FOCUS="${FOCUS_PATTERN}"
 

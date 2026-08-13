@@ -18,7 +18,7 @@ Flight Control uses the following standard roles for authorization:
 - **`flightctl-admin`** - Full access to all resources within an organization
   - **Note:** This role cannot be set directly. Users automatically receive this role when they are set as AAP super admin
 - **`flightctl-org-admin`** - Full access to all resources within a specific organization
-- **`flightctl-operator`** - CRUD operations on devices, fleets, resourcesyncs, repositories; imagebuilds (including cancel and logs); imageexports (including cancel, download, and logs)
+- **`flightctl-operator`** - CRUD operations on devices, fleets, resourcesyncs, repositories; application lifecycle (start/stop/restart); device and application console; imagebuilds (including cancel and logs); imageexports (including cancel, download, and logs)
 - **`flightctl-viewer`** - Read-only access to all resources; imagebuilds and imageexports (including logs, but no download)
 - **`flightctl-installer`** - Access to get and approve enrollmentrequests, manage certificate signing requests; view imagebuilds and imageexports; download imageexports
 
@@ -200,13 +200,14 @@ Configure the OAuth application with these settings:
 - **Redirect URIs:** Set to:
 
   ```bash
-  https://your-flightctl-base-domain:443/callback http://127.0.0.1/callback
+  https://your-flightctl-base-domain:443/callback http://localhost:8080/callback http://127.0.0.1:8080/callback
   ```
 
-Note: The redirect URIs should be a space delimited list. Two URIs are required:
+Note: The redirect URIs should be a space delimited list. Three URIs are required:
 
 - A URL to your UI with a /callback path appended. The default base domain and port combo is `https://your-flightctl-base-domain:443/callback`, but if you have different routing configured you will need to update the URL accordingly. Make sure to replace your-flightctl-base-domain with your actual domain.
-- A URL to `http://127.0.0.1/callback` to ensure login sessions using the CLI work
+- A URL to `http://localhost:8080/callback` to ensure login sessions using the CLI work with the default callback port
+- A URL to `http://127.0.0.1:8080/callback` to ensure loopback-only environments using the CLI work with the default callback port
 
 #### Step 4: Obtain client credentials
 

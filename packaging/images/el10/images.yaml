@@ -45,9 +45,17 @@ imagebuilder-api:
 imagebuilder-worker:
   image: quay.io/flightctl/flightctl-imagebuilder-worker-el10
   tag: latest
+# grafana and prometheus MUST remain here: packaging/rpm/flightctl.spec invokes
+# `flightctl-standalone render quadlets` with this file to populate
+# {{ .Grafana.Image }}:{{ .Grafana.Tag }} and {{ .Prometheus.Image }}:{{ .Prometheus.Tag }}
+# in the quadlet .container templates. Removing them breaks the RPM build.
+#
+# The flightctl-mirror-images tool excludes these entries at parse time (observabilityOnlyImages
+# in parser.go) because they belong to the optional flightctl-observability stack.
+# Mirror them manually for air-gapped deployments — see deploying-observability-linux.md.
 grafana:
   image: quay.io/ceph/grafana
-  tag: "9.4.10"
+  tag: 12.0.2
 prometheus:
   image: quay.io/prometheus/prometheus
   tag: "v2.43.1"
@@ -56,4 +64,7 @@ telemetry-gateway:
   tag: latest
 userinfo-proxy:
   image: quay.io/flightctl/flightctl-userinfo-proxy-el10
+  tag: latest
+remote-access:
+  image: quay.io/flightctl/flightctl-remote-access-el10
   tag: latest

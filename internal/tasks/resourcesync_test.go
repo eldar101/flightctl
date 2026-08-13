@@ -5,20 +5,22 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/flightctl/flightctl/api/core/v1alpha1"
 	"github.com/flightctl/flightctl/internal/domain"
-	"github.com/flightctl/flightctl/internal/service"
+	fleetservice "github.com/flightctl/flightctl/internal/service/fleet"
 	"github.com/google/uuid"
+	"github.com/samber/lo"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
 )
 
 func TestResourceSync_GetRepositoryAndValidateAccess_NilResourceSync(t *testing.T) {
 	// Create a minimal ResourceSync instance with nil dependencies
-	var serviceHandler service.Service
 	log := logrus.New()
 
-	resourceSync := NewResourceSync(serviceHandler, log, nil, nil)
+	resourceSync := NewResourceSync(nil, nil, nil, nil, log, nil, nil)
 
 	// Test with nil ResourceSync
 	testOrgId := uuid.New()
@@ -31,10 +33,9 @@ func TestResourceSync_GetRepositoryAndValidateAccess_NilResourceSync(t *testing.
 
 func TestResourceSync_ParseFleetsFromResources_ValidResources(t *testing.T) {
 	// Create a minimal ResourceSync instance with nil dependencies
-	var serviceHandler service.Service
 	log := logrus.New()
 
-	resourceSync := NewResourceSync(serviceHandler, log, nil, nil)
+	resourceSync := NewResourceSync(nil, nil, nil, nil, log, nil, nil)
 
 	// Create valid resources
 	resources := []GenericResourceMap{
@@ -71,10 +72,9 @@ func TestResourceSync_ParseFleetsFromResources_ValidResources(t *testing.T) {
 
 func TestResourceSync_ParseFleetsFromResources_SkipsNonFleetKinds(t *testing.T) {
 	// Create a minimal ResourceSync instance with nil dependencies
-	var serviceHandler service.Service
 	log := logrus.New()
 
-	resourceSync := NewResourceSync(serviceHandler, log, nil, nil)
+	resourceSync := NewResourceSync(nil, nil, nil, nil, log, nil, nil)
 
 	// Create resources with non-Fleet kinds -- these should be silently skipped
 	resources := []GenericResourceMap{
@@ -342,11 +342,10 @@ func TestRemoveIgnoredFields_WithLeadingSlash(t *testing.T) {
 
 func TestResourceSync_WithIgnoredFields(t *testing.T) {
 	// Test ResourceSync with ignored fields configuration
-	var serviceHandler service.Service
 	log := logrus.New()
 
 	ignorePaths := []string{"metadata/labels/environment", "status"}
-	resourceSync := NewResourceSync(serviceHandler, log, nil, ignorePaths)
+	resourceSync := NewResourceSync(nil, nil, nil, nil, log, nil, ignorePaths)
 
 	// Create resources with fields that should be ignored
 	resources := []GenericResourceMap{
@@ -414,9 +413,8 @@ func TestFilterByKind(t *testing.T) {
 }
 
 func TestParseCatalogs_Valid(t *testing.T) {
-	var serviceHandler service.Service
 	log := logrus.New()
-	rs := NewResourceSync(serviceHandler, log, nil, nil)
+	rs := NewResourceSync(nil, nil, nil, nil, log, nil, nil)
 
 	resources := []GenericResourceMap{
 		{
@@ -436,9 +434,8 @@ func TestParseCatalogs_Valid(t *testing.T) {
 }
 
 func TestParseCatalogs_DuplicateNames(t *testing.T) {
-	var serviceHandler service.Service
 	log := logrus.New()
-	rs := NewResourceSync(serviceHandler, log, nil, nil)
+	rs := NewResourceSync(nil, nil, nil, nil, log, nil, nil)
 
 	resources := []GenericResourceMap{
 		{
@@ -461,9 +458,8 @@ func TestParseCatalogs_DuplicateNames(t *testing.T) {
 }
 
 func TestParseCatalogs_SkipsNonCatalogKinds(t *testing.T) {
-	var serviceHandler service.Service
 	log := logrus.New()
-	rs := NewResourceSync(serviceHandler, log, nil, nil)
+	rs := NewResourceSync(nil, nil, nil, nil, log, nil, nil)
 
 	resources := []GenericResourceMap{
 		{
@@ -478,9 +474,8 @@ func TestParseCatalogs_SkipsNonCatalogKinds(t *testing.T) {
 }
 
 func TestParseCatalogItems_Valid(t *testing.T) {
-	var serviceHandler service.Service
 	log := logrus.New()
-	rs := NewResourceSync(serviceHandler, log, nil, nil)
+	rs := NewResourceSync(nil, nil, nil, nil, log, nil, nil)
 
 	resources := []GenericResourceMap{
 		{
@@ -496,7 +491,7 @@ func TestParseCatalogItems_Valid(t *testing.T) {
 					{Type: domain.CatalogItemArtifactTypeContainer, Uri: "quay.io/prometheus/node-exporter"},
 				},
 				Versions: []domain.CatalogItemVersion{
-					{Version: "1.8.2", References: map[string]string{"container": "v1.8.2"}, Channels: []string{"stable"}},
+					{Version: "1.8.2", References: map[v1alpha1.CatalogItemArtifactType]string{"container": "v1.8.2"}, Channels: []string{"stable"}},
 				},
 			}),
 		},
@@ -510,9 +505,8 @@ func TestParseCatalogItems_Valid(t *testing.T) {
 }
 
 func TestParseCatalogItems_MissingCatalog(t *testing.T) {
-	var serviceHandler service.Service
 	log := logrus.New()
-	rs := NewResourceSync(serviceHandler, log, nil, nil)
+	rs := NewResourceSync(nil, nil, nil, nil, log, nil, nil)
 
 	resources := []GenericResourceMap{
 		{
@@ -532,9 +526,8 @@ func TestParseCatalogItems_MissingCatalog(t *testing.T) {
 }
 
 func TestParseCatalogItems_DuplicateKey(t *testing.T) {
-	var serviceHandler service.Service
 	log := logrus.New()
-	rs := NewResourceSync(serviceHandler, log, nil, nil)
+	rs := NewResourceSync(nil, nil, nil, nil, log, nil, nil)
 
 	resources := []GenericResourceMap{
 		{
@@ -557,9 +550,8 @@ func TestParseCatalogItems_DuplicateKey(t *testing.T) {
 }
 
 func TestParseCatalogItems_SameNameDifferentCatalog(t *testing.T) {
-	var serviceHandler service.Service
 	log := logrus.New()
-	rs := NewResourceSync(serviceHandler, log, nil, nil)
+	rs := NewResourceSync(nil, nil, nil, nil, log, nil, nil)
 
 	resources := []GenericResourceMap{
 		{
@@ -616,7 +608,7 @@ func catalogItemSpecFixture() domain.CatalogItemSpec {
 			{Type: domain.CatalogItemArtifactTypeContainer, Uri: "quay.io/test/app"},
 		},
 		Versions: []domain.CatalogItemVersion{
-			{Version: "1.0.0", References: map[string]string{"container": "v1.0.0"}, Channels: []string{"stable"}},
+			{Version: "1.0.0", References: map[v1alpha1.CatalogItemArtifactType]string{"container": "v1.0.0"}, Channels: []string{"stable"}},
 		},
 	}
 }
@@ -633,6 +625,36 @@ func specToMap(t *testing.T, spec interface{}) map[string]interface{} {
 
 func strPtr(s string) *string {
 	return &s
+}
+
+// TestCreateOrUpdateMultiple_DoesNotMutateSourceTemplateMetadata guards against a shallow-copy
+// aliasing regression: fleetToUpdate := *resource copies Spec.Template.Metadata by pointer, so
+// sanitizing the copy must not also wipe the managed fields off the caller-owned resource.
+func TestCreateOrUpdateMultiple_DoesNotMutateSourceTemplateMetadata(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	fleetMock := fleetservice.NewMockService(ctrl)
+	fleetMock.EXPECT().
+		ReplaceFleet(gomock.Any(), gomock.Any(), "fleet1", gomock.Any(), false).
+		Return(&domain.Fleet{}, domain.StatusOK())
+
+	log := logrus.New()
+	rs := NewResourceSync(nil, fleetMock, nil, nil, log, nil, nil)
+
+	resource := &domain.Fleet{
+		Metadata: domain.ObjectMeta{Name: lo.ToPtr("fleet1")},
+	}
+	resource.Spec.Template.Metadata = &domain.ObjectMeta{
+		Owner:      lo.ToPtr("Fleet/other"),
+		Generation: lo.ToPtr(int64(3)),
+	}
+
+	err := rs.createOrUpdateMultiple(context.Background(), uuid.New(), lo.ToPtr("owner"), resource)
+	require.NoError(t, err)
+
+	require.Equal(t, "Fleet/other", lo.FromPtr(resource.Spec.Template.Metadata.Owner),
+		"sanitizing the copy must not clear Owner off the caller's original resource")
+	require.Equal(t, int64(3), lo.FromPtr(resource.Spec.Template.Metadata.Generation),
+		"sanitizing the copy must not clear Generation off the caller's original resource")
 }
 
 func TestIsValidFile(t *testing.T) {

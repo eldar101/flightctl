@@ -14,16 +14,23 @@ import (
 	"github.com/flightctl/flightctl/internal/instrumentation/metrics/worker"
 	"github.com/flightctl/flightctl/internal/instrumentation/tracing"
 	"github.com/flightctl/flightctl/internal/kvstore"
-	"github.com/flightctl/flightctl/internal/service"
+	catalogservice "github.com/flightctl/flightctl/internal/service/catalog"
+	dependencyrefservice "github.com/flightctl/flightctl/internal/service/dependencyref"
+	deviceservice "github.com/flightctl/flightctl/internal/service/device"
+	eventservice "github.com/flightctl/flightctl/internal/service/event"
+	fleetservice "github.com/flightctl/flightctl/internal/service/fleet"
+	repositoryservice "github.com/flightctl/flightctl/internal/service/repository"
+	templateversionservice "github.com/flightctl/flightctl/internal/service/templateversion"
 	"github.com/flightctl/flightctl/internal/worker_client"
 	"github.com/flightctl/flightctl/pkg/k8sclient"
 	"github.com/flightctl/flightctl/pkg/queues"
+	"github.com/google/uuid"
 	"github.com/samber/lo"
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel/attribute"
 )
 
-func dispatchTasks(serviceHandler service.Service, k8sClient k8sclient.K8SClient, kvStore kvstore.KVStore, cfg *config.Config, workerMetrics *worker.WorkerCollector) queues.ConsumeHandler {
+func dispatchTasks(fleetSvc fleetservice.Service, templateversionSvc templateversionservice.Service, deviceSvc deviceservice.Service, dependencyrefSvc dependencyrefservice.Service, repositorySvc repositoryservice.Service, catalogSvc catalogservice.Service, eventSvc eventservice.Service, k8sClient k8sclient.K8SClient, kvStore kvstore.KVStore, cfg *config.Config, workerMetrics *worker.WorkerCollector, encryptionMigrator *EncryptionMigrator, queuePublisher queues.QueueProducer) queues.ConsumeHandler {
 	return func(ctx context.Context, payload []byte, entryID string, consumer queues.QueueConsumer, log logrus.FieldLogger) error {
 		startTime := time.Now()
 
@@ -72,42 +79,56 @@ func dispatchTasks(serviceHandler service.Service, k8sClient k8sclient.K8SClient
 		if shouldRolloutFleet(ctx, eventWithOrgId.Event, log) {
 			taskName = "fleetRollout"
 			err = runTaskWithMetrics(taskName, workerMetrics, func() error {
-				return fleetRollout(ctx, eventWithOrgId.OrgId, eventWithOrgId.Event, serviceHandler, log)
+				return fleetRollout(ctx, eventWithOrgId.OrgId, eventWithOrgId.Event, fleetSvc, templateversionSvc, deviceSvc, dependencyrefSvc, log)
 			})
 			errorMessages = appendErrorMessage(errorMessages, taskName, err)
 		}
 		if shouldReconcileDeviceOwnership(ctx, eventWithOrgId.Event, log) {
 			taskName = "fleetSelectorMatching"
 			err = runTaskWithMetrics(taskName, workerMetrics, func() error {
-				return fleetSelectorMatching(ctx, eventWithOrgId.OrgId, eventWithOrgId.Event, serviceHandler, log)
+				return fleetSelectorMatching(ctx, eventWithOrgId.OrgId, eventWithOrgId.Event, deviceSvc, fleetSvc, log)
 			})
 			errorMessages = appendErrorMessage(errorMessages, taskName, err)
 		}
 		if shouldValidateFleet(ctx, eventWithOrgId.Event, log) {
 			taskName = "fleetValidation"
 			err = runTaskWithMetrics(taskName, workerMetrics, func() error {
-				return fleetValidate(ctx, eventWithOrgId.OrgId, eventWithOrgId.Event, serviceHandler, k8sClient, log)
+				return fleetValidate(ctx, eventWithOrgId.OrgId, eventWithOrgId.Event, fleetSvc, templateversionSvc, deviceSvc, repositorySvc, k8sClient, log)
 			})
 			errorMessages = appendErrorMessage(errorMessages, taskName, err)
 		}
 		if shouldPopulateDependencyRefs(ctx, eventWithOrgId.Event, log) {
 			taskName = "populateDependencyRefs"
 			err = runTaskWithMetrics(taskName, workerMetrics, func() error {
-				return populateDependencyRefs(ctx, eventWithOrgId.OrgId, eventWithOrgId.Event, serviceHandler, log)
+				return populateDependencyRefs(ctx, eventWithOrgId.OrgId, eventWithOrgId.Event, fleetSvc, deviceSvc, dependencyrefSvc, log)
 			})
 			errorMessages = appendErrorMessage(errorMessages, taskName, err)
 		}
 		if shouldRenderDevice(ctx, eventWithOrgId.Event, log) {
 			taskName = "deviceRender"
 			err = runTaskWithMetrics(taskName, workerMetrics, func() error {
-				return deviceRender(ctx, eventWithOrgId.OrgId, eventWithOrgId.Event, serviceHandler, k8sClient, kvStore, cfg, log)
+				return deviceRender(ctx, eventWithOrgId.OrgId, eventWithOrgId.Event, deviceSvc, repositorySvc, catalogSvc, k8sClient, kvStore, cfg, log)
 			})
 			errorMessages = appendErrorMessage(errorMessages, taskName, err)
 		}
 		if shouldUpdateRepositoryReferers(ctx, eventWithOrgId.Event, log) {
 			taskName = "repositoryUpdate"
 			err = runTaskWithMetrics(taskName, workerMetrics, func() error {
-				return repositoryUpdate(ctx, eventWithOrgId.OrgId, eventWithOrgId.Event, serviceHandler, log)
+				return repositoryUpdate(ctx, eventWithOrgId.OrgId, eventWithOrgId.Event, repositorySvc, eventSvc, log)
+			})
+			errorMessages = appendErrorMessage(errorMessages, taskName, err)
+		}
+		if shouldReconcileFleetApplicationLifecycle(ctx, eventWithOrgId.Event, log) {
+			taskName = "fleetApplicationLifecycle"
+			err = runTaskWithMetrics(taskName, workerMetrics, func() error {
+				return fleetApplicationLifecycle(ctx, eventWithOrgId.OrgId, eventWithOrgId.Event, fleetSvc, deviceSvc, eventSvc, log)
+			})
+			errorMessages = appendErrorMessage(errorMessages, taskName, err)
+		}
+		if shouldRunEncryptionMigration(eventWithOrgId.Event) {
+			taskName = "encryptionMigration"
+			err = runTaskWithMetrics(taskName, workerMetrics, func() error {
+				return runEncryptionMigrationBatch(ctx, eventWithOrgId.OrgId, eventWithOrgId.Event, encryptionMigrator, queuePublisher, log)
 			})
 			errorMessages = appendErrorMessage(errorMessages, taskName, err)
 		}
@@ -121,7 +142,7 @@ func dispatchTasks(serviceHandler service.Service, k8sClient k8sclient.K8SClient
 			// ensure emission even if processing ctx timed out
 			emitCtx, cancelEmit := context.WithTimeout(context.Background(), AckTimeout)
 			defer cancelEmit()
-			EmitInternalTaskFailedEvent(emitCtx, eventWithOrgId.OrgId, errorMessage, eventWithOrgId.Event, serviceHandler)
+			EmitInternalTaskFailedEvent(emitCtx, eventWithOrgId.OrgId, errorMessage, eventWithOrgId.Event, eventSvc)
 			returnErr = errors.New(errorMessage)
 		}
 
@@ -260,7 +281,7 @@ func shouldRenderDevice(ctx context.Context, event domain.Event, log logrus.Fiel
 		domain.EventReasonDependencyChangeDetected,
 		domain.EventReasonResourceCreated,
 		domain.EventReasonFleetRolloutDeviceSelected, domain.EventReasonDeviceConflictResolved,
-		domain.EventReasonDeviceDecommissioned}, event.Reason) {
+		domain.EventReasonDeviceDecommissioned, domain.EventReasonApplicationLifecycleChanged}, event.Reason) {
 		return true
 	}
 
@@ -283,6 +304,13 @@ func shouldRenderDevice(ctx context.Context, event domain.Event, log logrus.Fiel
 	return false
 }
 
+// shouldReconcileFleetApplicationLifecycle matches the event emitted by the fleet-scoped
+// stop/start APIs (see StopFleetApplication/StartFleetApplication) whenever the fleet-level
+// application lifecycle default changes, so it can be propagated to every member device.
+func shouldReconcileFleetApplicationLifecycle(ctx context.Context, event domain.Event, log logrus.FieldLogger) bool {
+	return event.InvolvedObject.Kind == domain.FleetKind && event.Reason == domain.EventReasonApplicationLifecycleChanged
+}
+
 func shouldUpdateRepositoryReferers(ctx context.Context, event domain.Event, log logrus.FieldLogger) bool {
 	// If a repository was updated, return true
 	if event.Reason == domain.EventReasonResourceUpdated && event.InvolvedObject.Kind == domain.RepositoryKind {
@@ -295,6 +323,66 @@ func shouldUpdateRepositoryReferers(ctx context.Context, event domain.Event, log
 	}
 
 	return false
+}
+
+func shouldRunEncryptionMigration(event domain.Event) bool {
+	return event.Reason == EventReasonEncryptionMigrationBatch
+}
+
+func runEncryptionMigrationBatch(ctx context.Context, orgID uuid.UUID, event domain.Event, migrator *EncryptionMigrator, publisher queues.QueueProducer, log logrus.FieldLogger) error {
+	if migrator == nil {
+		return fmt.Errorf("encryption migration: migrator is nil")
+	}
+	kind := event.InvolvedObject.Kind
+	if kind == "" {
+		return fmt.Errorf("encryption migration: event involvedObject.kind is required")
+	}
+	key := leaseKey(kind, orgID)
+	unlock, acquired, err := migrator.locker.TryLock(ctx, key)
+	if err != nil {
+		return err
+	}
+	if !acquired {
+		// Do not drop the chain: the holder may have raced with unlock, or keys may collide.
+		// Delay briefly to avoid a hot re-enqueue loop while another worker holds the lease.
+		log.Infof("encryption migration: %s org %s lease held by another worker; re-enqueueing after delay", kind, orgID)
+		enqueueEncryptionMigrationAfter(migrator.lifecycleCtx, publisher, kind, orgID, encryptionMigrationLeaseBusyDelay, log)
+		return nil
+	}
+	leaseHeld := true
+	defer func() {
+		if !leaseHeld {
+			return
+		}
+		if unlockErr := unlock(); unlockErr != nil {
+			log.WithError(unlockErr).Errorf("encryption migration: failed to release lease for %s org %s", kind, orgID)
+		}
+	}()
+
+	report, err := migrator.RunBatch(ctx, kind, orgID)
+	if err != nil {
+		return err
+	}
+	if report.Complete {
+		log.Infof("encryption migration: %s org %s idle (complete for active key %q)", kind, orgID, report.ActiveKeyID)
+		return nil
+	}
+	if report.RetryAfter > 0 {
+		log.Infof("encryption migration: scheduling %s org %s retry after %s", kind, orgID, report.RetryAfter.Round(time.Second))
+		enqueueEncryptionMigrationAfter(migrator.lifecycleCtx, publisher, kind, orgID, report.RetryAfter, log)
+		return nil
+	}
+	// Release before re-enqueue so another replica can acquire immediately.
+	if unlockErr := unlock(); unlockErr != nil {
+		return fmt.Errorf("encryption migration: release lease before re-enqueue for %s org %s: %w", kind, orgID, unlockErr)
+	}
+	leaseHeld = false
+	if err := EnqueueEncryptionMigration(ctx, publisher, kind, orgID); err != nil {
+		return err
+	}
+	log.Infof("encryption migration: re-enqueued %s org %s after batch scanned=%d updated=%d errors=%d",
+		kind, orgID, report.Scanned, report.Updated, report.Errors)
+	return nil
 }
 
 func hasUpdatedFields(details *domain.EventDetails, log logrus.FieldLogger, fields ...domain.ResourceUpdatedDetailsUpdatedFields) bool {
@@ -319,12 +407,20 @@ func hasUpdatedFields(details *domain.EventDetails, log logrus.FieldLogger, fiel
 
 func LaunchConsumers(ctx context.Context,
 	queuesProvider queues.Provider,
-	serviceHandler service.Service,
+	fleetSvc fleetservice.Service,
+	templateversionSvc templateversionservice.Service,
+	deviceSvc deviceservice.Service,
+	dependencyrefSvc dependencyrefservice.Service,
+	repositorySvc repositoryservice.Service,
+	catalogSvc catalogservice.Service,
+	eventSvc eventservice.Service,
 	k8sClient k8sclient.K8SClient,
 	kvStore kvstore.KVStore,
 	cfg *config.Config,
 	numConsumers, threadsPerConsumer int,
-	workerMetrics *worker.WorkerCollector) error {
+	workerMetrics *worker.WorkerCollector,
+	encryptionMigrator *EncryptionMigrator,
+	queuePublisher queues.QueueProducer) error {
 	totalConsumers := numConsumers * threadsPerConsumer
 
 	// Set active consumers metric
@@ -342,7 +438,7 @@ func LaunchConsumers(ctx context.Context,
 			return err
 		}
 		for j := 0; j != threadsPerConsumer; j++ {
-			if err = consumer.Consume(ctx, dispatchTasks(serviceHandler, k8sClient, kvStore, cfg, workerMetrics)); err != nil {
+			if err = consumer.Consume(ctx, dispatchTasks(fleetSvc, templateversionSvc, deviceSvc, dependencyrefSvc, repositorySvc, catalogSvc, eventSvc, k8sClient, kvStore, cfg, workerMetrics, encryptionMigrator, queuePublisher)); err != nil {
 				return err
 			}
 		}
