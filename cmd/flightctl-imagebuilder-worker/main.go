@@ -12,8 +12,12 @@ import (
 	"github.com/flightctl/flightctl/internal/crypto"
 	imagebuilderstore "github.com/flightctl/flightctl/internal/imagebuilder_api/store"
 	imagebuilderworker "github.com/flightctl/flightctl/internal/imagebuilder_worker"
+	"github.com/flightctl/flightctl/internal/instrumentation/encryption"
+	instpprof "github.com/flightctl/flightctl/internal/instrumentation/pprof"
+	"github.com/flightctl/flightctl/internal/instrumentation/profiling"
 	"github.com/flightctl/flightctl/internal/instrumentation/tracing"
 	"github.com/flightctl/flightctl/internal/kvstore"
+	canaryservice "github.com/flightctl/flightctl/internal/service/canary"
 	"github.com/flightctl/flightctl/internal/store"
 	"github.com/flightctl/flightctl/internal/util"
 	"github.com/flightctl/flightctl/pkg/log"
@@ -40,6 +44,11 @@ func main() {
 			log.Errorf("failed to shut down tracer: %v", err)
 		}
 	}()
+	profiling.Start(ctx, log, cfg, "flightctl-imagebuilder-worker", instpprof.DefaultPortImageBuilderWorker)
+
+	if err := encryption.InitGlobalEncryption(log, cfg); err != nil {
+		log.Fatalf("initializing encryption: %v", err)
+	}
 
 	log.Println("Initializing data store")
 	db, err := store.InitDB(cfg, log)
@@ -51,15 +60,14 @@ func main() {
 	imageBuilderStore := imagebuilderstore.NewStore(db, log.WithField("pkg", "imagebuilder-store"))
 	defer imageBuilderStore.Close()
 
-	// Main store for accessing Repository and EnrollmentRequest resources
-	mainStore := store.NewStore(db, log.WithField("pkg", "store"))
-	defer mainStore.Close()
+	if err := canaryservice.InitEncryption(ctx, db, log); err != nil {
+		log.Fatalf("initializing encryption canary store: %v", err)
+	}
 
 	ctx, cancel := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGHUP, syscall.SIGTERM, syscall.SIGQUIT)
 	defer cancel()
 
-	// Set internal request context values for worker operations
-	ctx = context.WithValue(ctx, consts.InternalRequestCtxKey, true)
+	// Set context values for worker operations
 	ctx = context.WithValue(ctx, consts.EventSourceComponentCtxKey, "flightctl-imagebuilder-worker")
 	ctx = context.WithValue(ctx, consts.EventActorCtxKey, "service:flightctl-imagebuilder-worker")
 
@@ -82,7 +90,7 @@ func main() {
 	}
 	caClient := crypto.NewCAClient(cfg.CA, ca)
 
-	server := imagebuilderworker.New(cfg, log, imageBuilderStore, mainStore, kvStore, provider, caClient)
+	server := imagebuilderworker.New(cfg, log, imageBuilderStore, db, kvStore, provider, caClient)
 	if err := server.Run(ctx); err != nil {
 		log.Fatalf("Error running server: %s", err)
 	}

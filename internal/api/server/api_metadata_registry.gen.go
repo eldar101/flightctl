@@ -11,20 +11,26 @@ const (
 	API_RESOURCE_AUTHPROVIDERS = "authproviders"
 	API_RESOURCE_CATALOGITEMS = "catalogitems"
 	API_RESOURCE_CATALOGS = "catalogs"
+	API_RESOURCE_CATALOGS_DEPLOYMENTS = "catalogs/deployments"
 	API_RESOURCE_CATALOGS_ITEMS = "catalogs/items"
 	API_RESOURCE_CERTIFICATESIGNINGREQUESTS = "certificatesigningrequests"
 	API_RESOURCE_CERTIFICATESIGNINGREQUESTS_APPROVAL = "certificatesigningrequests/approval"
 	API_RESOURCE_DEVICES = "devices"
+	API_RESOURCE_DEVICES_APPLICATIONS_CONSOLE = "devices/applications/console"
+	API_RESOURCE_DEVICES_APPLICATIONS_LIFECYCLE = "devices/applications/lifecycle"
+	API_RESOURCE_DEVICES_CONSOLE = "devices/console"
 	API_RESOURCE_DEVICES_DECOMMISSION = "devices/decommission"
 	API_RESOURCE_DEVICES_LASTSEEN = "devices/lastseen"
 	API_RESOURCE_DEVICES_RENDERED = "devices/rendered"
 	API_RESOURCE_DEVICES_RESUME = "devices/resume"
 	API_RESOURCE_DEVICES_STATUS = "devices/status"
+	API_RESOURCE_ENROLLMENTCONFIG = "enrollmentconfig"
 	API_RESOURCE_ENROLLMENTREQUESTS = "enrollmentrequests"
 	API_RESOURCE_ENROLLMENTREQUESTS_APPROVAL = "enrollmentrequests/approval"
 	API_RESOURCE_ENROLLMENTREQUESTS_STATUS = "enrollmentrequests/status"
 	API_RESOURCE_EVENTS = "events"
 	API_RESOURCE_FLEETS = "fleets"
+	API_RESOURCE_FLEETS_APPLICATIONS_LIFECYCLE = "fleets/applications/lifecycle"
 	API_RESOURCE_FLEETS_STATUS = "fleets/status"
 	API_RESOURCE_FLEETS_TEMPLATEVERSIONS = "fleets/templateversions"
 	API_RESOURCE_LABELS = "labels"
@@ -33,6 +39,7 @@ const (
 	API_RESOURCE_REPOSITORIES_CHECK_OCI_IMAGE = "repositories/check-oci-image"
 	API_RESOURCE_REPOSITORIES_CHECK_OCI_TAG = "repositories/check-oci-tag"
 	API_RESOURCE_RESOURCESYNCS = "resourcesyncs"
+	API_RESOURCE_VERSION = "version"
 	API_RESOURCE_VULNERABILITIES = "vulnerabilities"
 )
 const (
@@ -217,6 +224,14 @@ var APIMetadataMap = map[string]*apimetadata.EndpointMetadata{
 			{Version: "v1alpha1", DeprecatedAt: nil},
 		},
 	},
+	"GET:/catalogs/{catalog}/items/{name}/deployments": {
+		OperationID: "getCatalogItemDeployments",
+		Resource:    "catalogs/deployments",
+		Action:      "get",
+		Versions: []apimetadata.EndpointMetadataVersion{
+			{Version: "v1alpha1", DeprecatedAt: nil},
+		},
+	},
 	"DELETE:/catalogs/{name}": {
 		OperationID: "deleteCatalog",
 		Resource:    "catalogs",
@@ -385,6 +400,30 @@ var APIMetadataMap = map[string]*apimetadata.EndpointMetadata{
 			{Version: "v1beta1", DeprecatedAt: nil},
 		},
 	},
+	"POST:/devices/{name}/applications/{appname}/actions/restart": {
+		OperationID: "restartDeviceApplication",
+		Resource:    "devices/applications/lifecycle",
+		Action:      "update",
+		Versions: []apimetadata.EndpointMetadataVersion{
+			{Version: "v1beta1", DeprecatedAt: nil},
+		},
+	},
+	"POST:/devices/{name}/applications/{appname}/actions/start": {
+		OperationID: "startDeviceApplication",
+		Resource:    "devices/applications/lifecycle",
+		Action:      "update",
+		Versions: []apimetadata.EndpointMetadataVersion{
+			{Version: "v1beta1", DeprecatedAt: nil},
+		},
+	},
+	"POST:/devices/{name}/applications/{appname}/actions/stop": {
+		OperationID: "stopDeviceApplication",
+		Resource:    "devices/applications/lifecycle",
+		Action:      "update",
+		Versions: []apimetadata.EndpointMetadataVersion{
+			{Version: "v1beta1", DeprecatedAt: nil},
+		},
+	},
 	"PUT:/devices/{name}/decommission": {
 		OperationID: "decommissionDevice",
 		Resource:    "devices/decommission",
@@ -435,7 +474,7 @@ var APIMetadataMap = map[string]*apimetadata.EndpointMetadata{
 	},
 	"GET:/enrollmentconfig": {
 		OperationID: "getEnrollmentConfig",
-		Resource:    "",
+		Resource:    "enrollmentconfig",
 		Action:      "list",
 		Versions: []apimetadata.EndpointMetadataVersion{
 			{Version: "v1beta1", DeprecatedAt: nil},
@@ -601,6 +640,22 @@ var APIMetadataMap = map[string]*apimetadata.EndpointMetadata{
 			{Version: "v1beta1", DeprecatedAt: nil},
 		},
 	},
+	"POST:/fleets/{name}/applications/{appname}/actions/start": {
+		OperationID: "startFleetApplication",
+		Resource:    "fleets/applications/lifecycle",
+		Action:      "update",
+		Versions: []apimetadata.EndpointMetadataVersion{
+			{Version: "v1beta1", DeprecatedAt: nil},
+		},
+	},
+	"POST:/fleets/{name}/applications/{appname}/actions/stop": {
+		OperationID: "stopFleetApplication",
+		Resource:    "fleets/applications/lifecycle",
+		Action:      "update",
+		Versions: []apimetadata.EndpointMetadataVersion{
+			{Version: "v1beta1", DeprecatedAt: nil},
+		},
+	},
 	"GET:/fleets/{name}/status": {
 		OperationID: "getFleetStatus",
 		Resource:    "fleets/status",
@@ -755,7 +810,7 @@ var APIMetadataMap = map[string]*apimetadata.EndpointMetadata{
 	},
 	"GET:/version": {
 		OperationID: "getVersion",
-		Resource:    "",
+		Resource:    "version",
 		Action:      "list",
 		Versions: []apimetadata.EndpointMetadataVersion{
 			{Version: "v1beta1", DeprecatedAt: nil},
@@ -815,6 +870,22 @@ var APIMetadataMap = map[string]*apimetadata.EndpointMetadata{
 		Action:      "list",
 		Versions: []apimetadata.EndpointMetadataVersion{
 			{Version: "v1alpha1", DeprecatedAt: nil},
+		},
+	},
+	"GET:/ws/v1/devices/{name}/applications/{appname}/console": {
+		OperationID: "getDeviceApplicationConsole",
+		Resource:    "devices/applications/console",
+		Action:      "get",
+		Versions: []apimetadata.EndpointMetadataVersion{
+			{Version: "v1beta1", DeprecatedAt: nil},
+		},
+	},
+	"GET:/ws/v1/devices/{name}/console": {
+		OperationID: "getDeviceConsole",
+		Resource:    "devices/console",
+		Action:      "get",
+		Versions: []apimetadata.EndpointMetadataVersion{
+			{Version: "v1beta1", DeprecatedAt: nil},
 		},
 	},
 }

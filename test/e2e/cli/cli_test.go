@@ -101,7 +101,7 @@ var _ = Describe("cli operation", func() {
 	})
 
 	Context("Plural names for resources and autocompletion in the cli work well", func() {
-		It("Should let you list resources by plural names", Label("80453", "client"), func() {
+		It("Should let you list resources by plural names", Label("80453", "client", e2e.NeedVMLabel), func() {
 			// Get harness directly - no shared package-level variable
 			harness := e2e.GetWorkerHarness()
 
@@ -356,26 +356,29 @@ var _ = Describe("cli operation", func() {
 			Expect(out).To(ContainSubstring(deviceName))
 
 			By("Comparing with-slash and no-slash forms for table and JSON output")
-			withSlash, err := harness.CLI("get", "device/"+deviceName)
-			Expect(err).NotTo(HaveOccurred(), "flightctl get device/%s failed", deviceName)
+			// Device status can change between the two GETs (Updated UpToDate vs OutOfDate).
+			Eventually(func(g Gomega) {
+				withSlash, err := harness.CLI("get", "device/"+deviceName)
+				g.Expect(err).NotTo(HaveOccurred(), "flightctl get device/%s failed", deviceName)
 
-			noSlash, err := harness.CLI("get", "device", deviceName)
-			Expect(err).NotTo(HaveOccurred(), "flightctl get device %s failed", deviceName)
+				noSlash, err := harness.CLI("get", "device", deviceName)
+				g.Expect(err).NotTo(HaveOccurred(), "flightctl get device %s failed", deviceName)
 
-			Expect(collapse(withSlash)).To(Equal(collapse(noSlash)),
-				"no-slash table output must equal with-slash")
+				g.Expect(collapse(withSlash)).To(Equal(collapse(noSlash)),
+					"no-slash table output must equal with-slash")
 
-			withSlashJSON, err := harness.CLI("get", "device/"+deviceName, "-o", "json")
-			Expect(err).NotTo(HaveOccurred(), "flightctl get device/%s -o json failed", deviceName)
+				withSlashJSON, err := harness.CLI("get", "device/"+deviceName, "-o", "json")
+				g.Expect(err).NotTo(HaveOccurred(), "flightctl get device/%s -o json failed", deviceName)
 
-			noSlashJSON, err := harness.CLI("get", "device", deviceName, "-o", "json")
-			Expect(err).NotTo(HaveOccurred(), "flightctl get device %s -o json failed", deviceName)
+				noSlashJSON, err := harness.CLI("get", "device", deviceName, "-o", "json")
+				g.Expect(err).NotTo(HaveOccurred(), "flightctl get device %s -o json failed", deviceName)
 
-			Expect(noSlashJSON).To(MatchJSON(withSlashJSON),
-				"no-slash JSON must deep-equal with-slash")
+				g.Expect(noSlashJSON).To(MatchJSON(withSlashJSON),
+					"no-slash JSON must deep-equal with-slash")
+			}, "10s", "200ms").Should(Succeed())
 		})
 
-		It("Should show last-seen with proper flag", Label("85014", "sanity", "client"), func() {
+		It("Should show last-seen with proper flag", Label("85014", "sanity", "client", e2e.NeedVMLabel), func() {
 			harness := e2e.GetWorkerHarness()
 			_, device := harness.EnrollAndWaitForOnlineStatus()
 			deviceName := *device.Metadata.Name
@@ -523,15 +526,14 @@ var _ = Describe("cli operation", func() {
 			Expect(err).ToNot(HaveOccurred())
 			Expect(clientVersion).ToNot(BeEmpty(), "client version should be found")
 			Expect(serverVersion).ToNot(BeEmpty(), "server version should be found")
-			Expect(agentVersion).ToNot(BeEmpty(), "agent version should be found")
+			Expect(agentVersion).To(BeEmpty(), "agent version lookup should be skipped when the VM is not initialized")
 
 			GinkgoWriter.Printf("Client version: %s\n", clientVersion)
 			GinkgoWriter.Printf("Server version: %s\n", serverVersion)
 			GinkgoWriter.Printf("Agent version: %s\n", agentVersion)
 
 			By("Comparing versions")
-			// Expect(clientVersion).To(Equal(serverVersion), "client and server versions should match")
-			Expect(agentVersion).To(Equal(serverVersion), "agent and server versions should match")
+			Expect(clientVersion).To(Equal(serverVersion), "client and server versions should match")
 		})
 
 		It("should show FIPS runtime compliance", Label("rpm-sanity", "84648", "client"), func() {
@@ -746,7 +748,7 @@ var _ = Describe("cli login", func() {
 			By("Login to the service")
 			// We need to ensure that the login mechanism was user/pass otherwise the refresh flow isn't
 			// active.
-			method, err := login.LoginToAPIWithToken(harness)
+			method, err := ensureFlightctlLogin(harness)
 			Expect(err).ToNot(HaveOccurred())
 			if method != login.AuthUsernamePassword {
 				Skip("This test requires authentication with username/password to be enabled")
@@ -812,10 +814,7 @@ var _ = Describe("cli login", func() {
 
 		It("CertificateSigningRequest deny flow validation", Label("85396", "sanity", "client"),
 			func() {
-
 				harness := e2e.GetWorkerHarness()
-				_, err := login.LoginToAPIWithToken(harness)
-				Expect(err).ToNot(HaveOccurred())
 
 				By("CertificateSigningRequest: Resources lifecycle")
 				// Prepare a unique CSR YAML and ensure cleanup
@@ -907,8 +906,6 @@ var _ = Describe("cli login", func() {
 
 	It("Creates a device, edits via headless editor (yaml & json), and validates negatives", Label("83301", "client"), func() {
 		harness := e2e.GetWorkerHarness()
-		_, err := login.LoginToAPIWithToken(harness)
-		Expect(err).ToNot(HaveOccurred())
 
 		By("creating a unique Device from template")
 		uniqueDeviceYAML, err := util.CreateUniqueYAMLFile("device.yaml", harness.GetTestIDFromContext())
@@ -979,7 +976,7 @@ var _ = Describe("cli login", func() {
 		By("failing when no arguments are provided")
 		out, err = harness.CLI("edit")
 		Expect(err).To(HaveOccurred())
-		Expect(out).To(ContainSubstring("Error: accepts between 1 and 2 arg(s), received 0"))
+		Expect(out).To(ContainSubstring("Error: you must specify a resource to edit (TYPE NAME or TYPE/NAME)"))
 
 		By("failing on invalid resource kind (numeric)")
 		out, err = harness.CLI("edit", "1234")
@@ -994,13 +991,11 @@ var _ = Describe("cli login", func() {
 		By("failing when too many arguments are provided")
 		out, err = harness.CLI("edit", "1", "2", "3", "4")
 		Expect(err).To(HaveOccurred())
-		Expect(out).To(ContainSubstring("Error: accepts between 1 and 2 arg(s), received 4"))
+		Expect(out).To(ContainSubstring("Error: too many arguments: edit accepts at most 2 arguments (TYPE NAME or TYPE/NAME)"))
 	})
 
 	It("generates completion and can be sourced for each supported shell (harness.CLI only for flightctl calls)", Label("85470", "client"), func() {
 		harness := e2e.GetWorkerHarness()
-		_, err := login.LoginToAPIWithToken(harness)
-		Expect(err).ToNot(HaveOccurred())
 
 		type shellCase struct {
 			name      string

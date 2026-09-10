@@ -43,6 +43,13 @@ spec:
               configMapKeyRef:
                 name: flightctl-ui
                 key: FLIGHTCTL_SERVER_EXTERNAL
+          {{- if .Values.remoteAccess.enabled }}
+          - name: FLIGHTCTL_REMOTE_ACCESS_SERVER
+            valueFrom:
+              configMapKeyRef:
+                name: flightctl-ui
+                key: FLIGHTCTL_REMOTE_ACCESS_SERVER
+          {{- end }}
           {{- if .Values.cliArtifacts.enabled }}
           - name: FLIGHTCTL_CLI_ARTIFACTS_SERVER
             valueFrom:
@@ -98,9 +105,9 @@ spec:
                 name: flightctl-ui
                 key: IS_RHEM
           {{- if eq $enableMulticlusterExtensions "true" }}
-          image: {{ include "flightctl.ensureOsQualifiedImage" .Values.ui.image.pluginImage }}:{{ default .Chart.AppVersion .Values.ui.image.tag }}
+          image: {{ include "flightctl.ensureOsQualifiedImage" (dict "root" . "imageName" .Values.ui.image.pluginImage) }}:{{ default .Chart.AppVersion .Values.ui.image.tag }}
           {{- else }}
-          image: {{ include "flightctl.ensureOsQualifiedImage" .Values.ui.image.image }}:{{ default .Chart.AppVersion .Values.ui.image.tag }}
+          image: {{ include "flightctl.ensureOsQualifiedImage" (dict "root" . "imageName" .Values.ui.image.image) }}:{{ default .Chart.AppVersion .Values.ui.image.tag }}
           {{- end }}
           imagePullPolicy: {{ default .Values.global.imagePullPolicy .Values.ui.image.pullPolicy }}
           name: flightctl-ui

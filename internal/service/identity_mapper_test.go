@@ -3,11 +3,17 @@ package service
 import (
 	"context"
 	"errors"
+	"net/http"
 	"testing"
 
 	"github.com/flightctl/flightctl/internal/auth/common"
 	"github.com/flightctl/flightctl/internal/domain"
+	"github.com/flightctl/flightctl/internal/flterrors"
 	"github.com/flightctl/flightctl/internal/identity"
+	"github.com/flightctl/flightctl/internal/service/catalog"
+	svcommon "github.com/flightctl/flightctl/internal/service/common"
+	"github.com/flightctl/flightctl/internal/service/organization"
+	"github.com/flightctl/flightctl/internal/store"
 	"github.com/flightctl/flightctl/internal/store/model"
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
@@ -46,18 +52,139 @@ func (m *mockIdentity) GetIssuer() *identity.Issuer {
 	return nil
 }
 
-func createTestIdentityMapper(mockStore *TestStore) *IdentityMapper {
-	return NewIdentityMapper(mockStore, NewOrgProvisioner(mockStore, logrus.New()), logrus.New())
+// fakeOrganizationStore is a minimal in-memory organization.Service fake for
+// identity-mapper tests.
+type fakeOrganizationStore struct {
+	organization.Service
+	organizations []*model.Organization
+	err           error
+}
+
+func (s *fakeOrganizationStore) UpsertMany(ctx context.Context, orgs []*model.Organization) ([]*model.Organization, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	existingMap := make(map[string]*model.Organization)
+	for _, org := range s.organizations {
+		if org.ExternalID != "" {
+			existingMap[org.ExternalID] = org
+		}
+	}
+
+	var result []*model.Organization
+	for _, newOrg := range orgs {
+		if existing, found := existingMap[newOrg.ExternalID]; found {
+			result = append(result, existing)
+		} else {
+			if newOrg.ID == uuid.Nil {
+				newOrg.ID = uuid.New()
+			}
+			s.organizations = append(s.organizations, newOrg)
+			result = append(result, newOrg)
+		}
+	}
+
+	return result, nil
+}
+
+func (s *fakeOrganizationStore) List(ctx context.Context, listParams store.ListParams) ([]*model.Organization, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	return s.organizations, nil
+}
+
+func (s *fakeOrganizationStore) ListByExternalIDs(ctx context.Context, externalIDs []string) ([]*model.Organization, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	externalIDMap := make(map[string]bool)
+	for _, id := range externalIDs {
+		externalIDMap[id] = true
+	}
+
+	var result []*model.Organization
+	for _, org := range s.organizations {
+		if externalIDMap[org.ExternalID] {
+			result = append(result, org)
+		}
+	}
+
+	return result, nil
+}
+
+func (s *fakeOrganizationStore) ListByIDs(ctx context.Context, ids []string) ([]*model.Organization, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	idMap := make(map[string]bool)
+	for _, id := range ids {
+		idMap[id] = true
+	}
+
+	var result []*model.Organization
+	for _, org := range s.organizations {
+		if idMap[org.ID.String()] {
+			result = append(result, org)
+		}
+	}
+
+	return result, nil
+}
+
+// catalogKey scopes a catalog entry by organization and name.
+type catalogKey struct {
+	orgId uuid.UUID
+	name  string
+}
+
+// fakeCatalogStore is a minimal in-memory catalog.Service fake for OrgProvisioner tests.
+// Catalogs are scoped by (orgId, name) so different organizations remain distinct.
+type fakeCatalogStore struct {
+	catalog.Service
+	catalogs map[catalogKey]*domain.Catalog
+	getErr   error
+}
+
+func (s *fakeCatalogStore) GetCatalog(ctx context.Context, orgId uuid.UUID, name string) (*domain.Catalog, domain.Status) {
+	if s.getErr != nil {
+		return nil, svcommon.StoreErrorToApiStatus(s.getErr, false, domain.CatalogKind, &name)
+	}
+	if c, ok := s.catalogs[catalogKey{orgId: orgId, name: name}]; ok {
+		return c, domain.StatusOK()
+	}
+	return nil, svcommon.StoreErrorToApiStatus(flterrors.ErrResourceNotFound, false, domain.CatalogKind, &name)
+}
+
+func (s *fakeCatalogStore) CreateCatalog(ctx context.Context, orgId uuid.UUID, catalog domain.Catalog) (*domain.Catalog, domain.Status) {
+	if s.catalogs == nil {
+		s.catalogs = make(map[catalogKey]*domain.Catalog)
+	}
+	s.catalogs[catalogKey{orgId: orgId, name: *catalog.Metadata.Name}] = &catalog
+	return &catalog, domain.StatusCreated()
+}
+
+func createTestOrganizationModel(id uuid.UUID, externalID string, displayName string) *model.Organization {
+	return &model.Organization{
+		ID:          id,
+		ExternalID:  externalID,
+		DisplayName: displayName,
+	}
+}
+
+func createTestIdentityMapper(orgStore *fakeOrganizationStore, catalogStore *fakeCatalogStore) *IdentityMapper {
+	return NewIdentityMapper(orgStore, NewOrgProvisioner(catalogStore, logrus.New()), logrus.New())
 }
 
 func TestMapIdentityToDB_SuperAdmin_NoReportedOrgs(t *testing.T) {
-	mockStore := &TestStore{}
-	mapper := createTestIdentityMapper(mockStore)
+	orgStore := &fakeOrganizationStore{}
+	catalogStore := &fakeCatalogStore{catalogs: make(map[catalogKey]*domain.Catalog)}
+	mapper := createTestIdentityMapper(orgStore, catalogStore)
 
 	// Create existing organizations
 	org1 := createTestOrganizationModel(uuid.New(), "org-1", "Organization 1")
 	org2 := createTestOrganizationModel(uuid.New(), "org-2", "Organization 2")
-	setupMockStoreWithOrganizations(mockStore, []*model.Organization{org1, org2})
+	orgStore.organizations = []*model.Organization{org1, org2}
 
 	// Super admin with no reported organizations
 	identity := &mockIdentity{
@@ -77,13 +204,14 @@ func TestMapIdentityToDB_SuperAdmin_NoReportedOrgs(t *testing.T) {
 }
 
 func TestMapIdentityToDB_SuperAdmin_WithReportedOrgs_AllExist(t *testing.T) {
-	mockStore := &TestStore{}
-	mapper := createTestIdentityMapper(mockStore)
+	orgStore := &fakeOrganizationStore{}
+	catalogStore := &fakeCatalogStore{catalogs: make(map[catalogKey]*domain.Catalog)}
+	mapper := createTestIdentityMapper(orgStore, catalogStore)
 
 	// Create existing organizations
 	org1 := createTestOrganizationModel(uuid.New(), "org-1", "Organization 1")
 	org2 := createTestOrganizationModel(uuid.New(), "org-2", "Organization 2")
-	setupMockStoreWithOrganizations(mockStore, []*model.Organization{org1, org2})
+	orgStore.organizations = []*model.Organization{org1, org2}
 
 	// Super admin with reported organizations that already exist
 	identity := &mockIdentity{
@@ -105,12 +233,13 @@ func TestMapIdentityToDB_SuperAdmin_WithReportedOrgs_AllExist(t *testing.T) {
 }
 
 func TestMapIdentityToDB_SuperAdmin_WithNewReportedOrg(t *testing.T) {
-	mockStore := &TestStore{}
-	mapper := createTestIdentityMapper(mockStore)
+	orgStore := &fakeOrganizationStore{}
+	catalogStore := &fakeCatalogStore{catalogs: make(map[catalogKey]*domain.Catalog)}
+	mapper := createTestIdentityMapper(orgStore, catalogStore)
 
 	// Create existing organizations
 	org1 := createTestOrganizationModel(uuid.New(), "org-1", "Organization 1")
-	setupMockStoreWithOrganizations(mockStore, []*model.Organization{org1})
+	orgStore.organizations = []*model.Organization{org1}
 
 	// Super admin with a new organization to create
 	identity := &mockIdentity{
@@ -140,12 +269,12 @@ func TestMapIdentityToDB_SuperAdmin_WithNewReportedOrg(t *testing.T) {
 }
 
 func TestMapIdentityToDB_SuperAdmin_DatabaseError(t *testing.T) {
-	mockStore := &TestStore{}
-	mapper := createTestIdentityMapper(mockStore)
+	orgStore := &fakeOrganizationStore{}
+	catalogStore := &fakeCatalogStore{catalogs: make(map[catalogKey]*domain.Catalog)}
+	mapper := createTestIdentityMapper(orgStore, catalogStore)
 
 	// Setup store to return error
-	testError := errors.New("database connection failed")
-	setupMockStoreWithError(mockStore, testError)
+	orgStore.err = errors.New("database connection failed")
 
 	identity := &mockIdentity{
 		username:      "admin",
@@ -163,13 +292,14 @@ func TestMapIdentityToDB_SuperAdmin_DatabaseError(t *testing.T) {
 }
 
 func TestMapIdentityToDB_RegularUser_WithReportedOrgs(t *testing.T) {
-	mockStore := &TestStore{}
-	mapper := createTestIdentityMapper(mockStore)
+	orgStore := &fakeOrganizationStore{}
+	catalogStore := &fakeCatalogStore{catalogs: make(map[catalogKey]*domain.Catalog)}
+	mapper := createTestIdentityMapper(orgStore, catalogStore)
 
 	// Create existing organizations
 	org1 := createTestOrganizationModel(uuid.New(), "org-1", "Organization 1")
 	org2 := createTestOrganizationModel(uuid.New(), "org-2", "Organization 2")
-	setupMockStoreWithOrganizations(mockStore, []*model.Organization{org1, org2})
+	orgStore.organizations = []*model.Organization{org1, org2}
 
 	// Regular user (not super admin) with one reported organization
 	identity := &mockIdentity{
@@ -192,8 +322,9 @@ func TestMapIdentityToDB_RegularUser_WithReportedOrgs(t *testing.T) {
 }
 
 func TestMapIdentityToDB_RegularUser_NoOrganizations(t *testing.T) {
-	mockStore := &TestStore{}
-	mapper := createTestIdentityMapper(mockStore)
+	orgStore := &fakeOrganizationStore{}
+	catalogStore := &fakeCatalogStore{catalogs: make(map[catalogKey]*domain.Catalog)}
+	mapper := createTestIdentityMapper(orgStore, catalogStore)
 
 	// Regular user with no organizations
 	identity := &mockIdentity{
@@ -211,12 +342,13 @@ func TestMapIdentityToDB_RegularUser_NoOrganizations(t *testing.T) {
 }
 
 func TestIsMemberOf_SuperAdmin(t *testing.T) {
-	mockStore := &TestStore{}
-	mapper := createTestIdentityMapper(mockStore)
+	orgStore := &fakeOrganizationStore{}
+	catalogStore := &fakeCatalogStore{catalogs: make(map[catalogKey]*domain.Catalog)}
+	mapper := createTestIdentityMapper(orgStore, catalogStore)
 
 	org1 := createTestOrganizationModel(uuid.New(), "org-1", "Organization 1")
 	org2 := createTestOrganizationModel(uuid.New(), "org-2", "Organization 2")
-	setupMockStoreWithOrganizations(mockStore, []*model.Organization{org1, org2})
+	orgStore.organizations = []*model.Organization{org1, org2}
 
 	// Super admin should have access to all organizations
 	identity := &mockIdentity{
@@ -240,13 +372,14 @@ func TestIsMemberOf_SuperAdmin(t *testing.T) {
 }
 
 func TestGetUserOrganizations_SuperAdmin(t *testing.T) {
-	mockStore := &TestStore{}
-	mapper := createTestIdentityMapper(mockStore)
+	orgStore := &fakeOrganizationStore{}
+	catalogStore := &fakeCatalogStore{catalogs: make(map[catalogKey]*domain.Catalog)}
+	mapper := createTestIdentityMapper(orgStore, catalogStore)
 
 	org1 := createTestOrganizationModel(uuid.New(), "org-1", "Organization 1")
 	org2 := createTestOrganizationModel(uuid.New(), "org-2", "Organization 2")
 	org3 := createTestOrganizationModel(uuid.New(), "org-3", "Organization 3")
-	setupMockStoreWithOrganizations(mockStore, []*model.Organization{org1, org2, org3})
+	orgStore.organizations = []*model.Organization{org1, org2, org3}
 
 	// Super admin should get all organizations
 	identity := &mockIdentity{
@@ -266,91 +399,10 @@ func TestGetUserOrganizations_SuperAdmin(t *testing.T) {
 	require.Contains(t, result, org3)
 }
 
-// Add missing methods to DummyOrganization for proper testing
-func (s *DummyOrganization) UpsertMany(ctx context.Context, orgs []*model.Organization) ([]*model.Organization, error) {
-	if s.err != nil {
-		return nil, s.err
-	}
-	if s.organizations == nil {
-		s.organizations = &[]*model.Organization{}
-	}
-
-	// Simulate upsert: check if orgs exist by external ID, otherwise add them
-	existingMap := make(map[string]*model.Organization)
-	for _, org := range *s.organizations {
-		if org.ExternalID != "" {
-			existingMap[org.ExternalID] = org
-		}
-	}
-
-	var result []*model.Organization
-	for _, newOrg := range orgs {
-		if existing, found := existingMap[newOrg.ExternalID]; found {
-			result = append(result, existing)
-		} else {
-			if newOrg.ID == uuid.Nil {
-				newOrg.ID = uuid.New()
-			}
-			*s.organizations = append(*s.organizations, newOrg)
-			result = append(result, newOrg)
-		}
-	}
-
-	return result, nil
-}
-
-func (s *DummyOrganization) ListByExternalIDs(ctx context.Context, externalIDs []string) ([]*model.Organization, error) {
-	if s.err != nil {
-		return nil, s.err
-	}
-	if s.organizations == nil {
-		return []*model.Organization{}, nil
-	}
-
-	externalIDMap := make(map[string]bool)
-	for _, id := range externalIDs {
-		externalIDMap[id] = true
-	}
-
-	var result []*model.Organization
-	for _, org := range *s.organizations {
-		if externalIDMap[org.ExternalID] {
-			result = append(result, org)
-		}
-	}
-
-	return result, nil
-}
-
-func (s *DummyOrganization) ListByIDs(ctx context.Context, ids []string) ([]*model.Organization, error) {
-	if s.err != nil {
-		return nil, s.err
-	}
-	if s.organizations == nil {
-		return []*model.Organization{}, nil
-	}
-
-	idMap := make(map[string]bool)
-	for _, id := range ids {
-		idMap[id] = true
-	}
-
-	var result []*model.Organization
-	for _, org := range *s.organizations {
-		if idMap[org.ID.String()] {
-			result = append(result, org)
-		}
-	}
-
-	return result, nil
-}
-
 func TestMapIdentityToDB_RegularUser_NewOrg_CreatesDefaultCatalog(t *testing.T) {
-	mockStore := &TestStore{}
-	mapper := createTestIdentityMapper(mockStore)
-
-	// No pre-existing organizations
-	setupMockStoreWithOrganizations(mockStore, []*model.Organization{})
+	orgStore := &fakeOrganizationStore{}
+	catalogStore := &fakeCatalogStore{catalogs: make(map[catalogKey]*domain.Catalog)}
+	mapper := createTestIdentityMapper(orgStore, catalogStore)
 
 	identity := &mockIdentity{
 		username: "user",
@@ -369,19 +421,20 @@ func TestMapIdentityToDB_RegularUser_NewOrg_CreatesDefaultCatalog(t *testing.T) 
 	require.Equal(t, "org-new", result[0].ExternalID)
 
 	// Verify the default catalog was created for the new organization
-	catalog, err := mockStore.Catalog().Get(ctx, result[0].ID, domain.DefaultCatalogName)
-	require.NoError(t, err)
+	catalog, status := catalogStore.GetCatalog(ctx, result[0].ID, domain.DefaultCatalogName)
+	require.Equal(t, http.StatusOK, int(status.Code))
 	require.NotNil(t, catalog)
 	require.Equal(t, domain.DefaultCatalogName, *catalog.Metadata.Name)
 	require.Equal(t, domain.DefaultCatalogDisplayName, *catalog.Spec.DisplayName)
 }
 
 func TestMapIdentityToDB_RegularUser_ExistingOrg_DoesNotCreateDefaultCatalog(t *testing.T) {
-	mockStore := &TestStore{}
-	mapper := createTestIdentityMapper(mockStore)
+	orgStore := &fakeOrganizationStore{}
+	catalogStore := &fakeCatalogStore{catalogs: make(map[catalogKey]*domain.Catalog)}
+	mapper := createTestIdentityMapper(orgStore, catalogStore)
 
 	org1 := createTestOrganizationModel(uuid.New(), "org-1", "Organization 1")
-	setupMockStoreWithOrganizations(mockStore, []*model.Organization{org1})
+	orgStore.organizations = []*model.Organization{org1}
 
 	identity := &mockIdentity{
 		username: "user",
@@ -400,17 +453,18 @@ func TestMapIdentityToDB_RegularUser_ExistingOrg_DoesNotCreateDefaultCatalog(t *
 	require.Equal(t, org1.ID, result[0].ID)
 
 	// Verify no default catalog was created for the existing organization
-	_, err = mockStore.Catalog().Get(ctx, org1.ID, domain.DefaultCatalogName)
-	require.Error(t, err, "Default catalog should not be created for an existing organization")
+	_, status := catalogStore.GetCatalog(ctx, org1.ID, domain.DefaultCatalogName)
+	require.Equal(t, http.StatusNotFound, int(status.Code), "Default catalog should not be created for an existing organization")
 }
 
 func TestMapIdentityToDB_SuperAdmin_NewReportedOrg_CreatesDefaultCatalog(t *testing.T) {
-	mockStore := &TestStore{}
-	mapper := createTestIdentityMapper(mockStore)
+	orgStore := &fakeOrganizationStore{}
+	catalogStore := &fakeCatalogStore{catalogs: make(map[catalogKey]*domain.Catalog)}
+	mapper := createTestIdentityMapper(orgStore, catalogStore)
 
 	// One pre-existing organization
 	org1 := createTestOrganizationModel(uuid.New(), "org-1", "Organization 1")
-	setupMockStoreWithOrganizations(mockStore, []*model.Organization{org1})
+	orgStore.organizations = []*model.Organization{org1}
 
 	identity := &mockIdentity{
 		username: "admin",
@@ -438,26 +492,53 @@ func TestMapIdentityToDB_SuperAdmin_NewReportedOrg_CreatesDefaultCatalog(t *test
 	require.NotNil(t, newOrg, "New organization should be created")
 
 	// Verify the default catalog was created for the new organization
-	catalog, err := mockStore.Catalog().Get(ctx, newOrg.ID, domain.DefaultCatalogName)
-	require.NoError(t, err)
+	catalog, status := catalogStore.GetCatalog(ctx, newOrg.ID, domain.DefaultCatalogName)
+	require.Equal(t, http.StatusOK, int(status.Code))
 	require.NotNil(t, catalog)
 	require.Equal(t, domain.DefaultCatalogName, *catalog.Metadata.Name)
 	require.Equal(t, domain.DefaultCatalogDisplayName, *catalog.Spec.DisplayName)
 }
 
-func (s *DummyOrganization) GetByID(ctx context.Context, id uuid.UUID) (*model.Organization, error) {
-	if s.err != nil {
-		return nil, s.err
-	}
-	if s.organizations == nil {
-		return nil, errors.New("organization not found")
+func TestMapIdentityToDB_MultipleOrgs_CreatesDefaultCatalogForEach(t *testing.T) {
+	orgStore := &fakeOrganizationStore{}
+	catalogStore := &fakeCatalogStore{catalogs: make(map[catalogKey]*domain.Catalog)}
+	mapper := createTestIdentityMapper(orgStore, catalogStore)
+
+	identity := &mockIdentity{
+		username: "user",
+		uid:      "user-uid",
+		organizations: []common.ReportedOrganization{
+			{ID: "org-a", Name: "Organization A", IsInternalID: false},
+			{ID: "org-b", Name: "Organization B", IsInternalID: false},
+		},
+		isSuperAdmin: false,
 	}
 
-	for _, org := range *s.organizations {
-		if org.ID == id {
-			return org, nil
-		}
+	ctx := context.Background()
+	result, err := mapper.MapIdentityToDB(ctx, identity)
+
+	require.NoError(t, err)
+	require.Len(t, result, 2)
+
+	// Each organization should get its own default catalog.
+	for _, org := range result {
+		cat, status := catalogStore.GetCatalog(ctx, org.ID, domain.DefaultCatalogName)
+		require.Equal(t, http.StatusOK, int(status.Code), "org %s should have a default catalog", org.ExternalID)
+		require.NotNil(t, cat)
+		require.Equal(t, domain.DefaultCatalogName, *cat.Metadata.Name)
 	}
 
-	return nil, errors.New("organization not found")
+	// Verify the two catalogs are scoped to their own organization and both exist.
+	require.Len(t, catalogStore.catalogs, 2, "each org should have exactly one catalog entry")
+
+	// Cross-check: org-a's catalog should not be visible under org-b's ID.
+	orgA := result[0]
+	orgB := result[1]
+	if orgA.ExternalID == "org-b" {
+		orgA, orgB = orgB, orgA
+	}
+	_, statusCross := catalogStore.GetCatalog(ctx, orgA.ID, domain.DefaultCatalogName)
+	require.Equal(t, http.StatusOK, int(statusCross.Code))
+	_, statusCross = catalogStore.GetCatalog(ctx, orgB.ID, domain.DefaultCatalogName)
+	require.Equal(t, http.StatusOK, int(statusCross.Code))
 }

@@ -242,6 +242,10 @@ Usage: {{- $authType := include "flightctl.getEffectiveAuthType" . }}
   {{- print "http://flightctl-cli-artifacts:8090"}}
 {{- end }}
 
+{{- define "flightctl.getInternalRemoteAccessUrl" }}
+  {{- print "https://flightctl-remote-access:3444"}}
+{{- end }}
+
 {{- define "flightctl.getCliArtifactsUrl" }}
   {{- $baseDomain := (include "flightctl.getBaseDomain" . )}}
   {{- $scheme := (include "flightctl.getHttpScheme" . )}}
@@ -339,7 +343,7 @@ Parameters:
 {{- $sleep := .sleep | default $context.Values.dbSetup.wait.sleep | default 2 | int }}
 {{- $connectionTimeout := .connectionTimeout | default $context.Values.dbSetup.wait.connectionTimeout | default 3 | int }}
 - name: wait-for-database-{{ $userType }}
-  image: "{{ include "flightctl.ensureOsQualifiedImage" $context.Values.dbSetup.image.image }}:{{ default $context.Chart.AppVersion $context.Values.dbSetup.image.tag }}"
+  image: "{{ $context.Values.dbSetup.image.image }}:{{ default $context.Chart.AppVersion $context.Values.dbSetup.image.tag }}"
   imagePullPolicy: {{ default $context.Values.global.imagePullPolicy $context.Values.dbSetup.image.pullPolicy }}
   command:
   - /app/deploy/scripts/wait-for-database.sh
@@ -578,6 +582,70 @@ Usage: {{- include "flightctl.dbSslVolumes" . | nindent X }}
 {{- end }}
 {{- end }}
 
+{{- /*
+CA certificate volume mount for the Trustify vulnerability backend.
+Usage: {{- include "flightctl.vulnerabilityTrustifyCaVolumeMounts" . | nindent X }}
+*/}}
+{{- define "flightctl.vulnerabilityTrustifyCaVolumeMounts" -}}
+{{- $vuln := default dict .Values.vulnerabilityReporting }}
+{{- $trustify := default dict $vuln.trustify }}
+{{- if and (default false $vuln.enabled) $trustify.caCertConfigMapName }}
+- name: vuln-trustify-ca
+  mountPath: /etc/ssl/vulnerability/trustify
+  readOnly: true
+{{- end }}
+{{- end }}
+
+{{- /*
+CA certificate volume for the Trustify vulnerability backend.
+Usage: {{- include "flightctl.vulnerabilityTrustifyCaVolumes" . | nindent X }}
+*/}}
+{{- define "flightctl.vulnerabilityTrustifyCaVolumes" -}}
+{{- $vuln := default dict .Values.vulnerabilityReporting }}
+{{- $trustify := default dict $vuln.trustify }}
+{{- if and (default false $vuln.enabled) $trustify.caCertConfigMapName }}
+- name: vuln-trustify-ca
+  configMap:
+    name: {{ $trustify.caCertConfigMapName }}
+    items:
+    - key: ca-cert.pem
+      path: ca-cert.pem
+      mode: 0444
+{{- end }}
+{{- end }}
+
+{{- /*
+CA certificate volume mount for the Quay vulnerability backend.
+Usage: {{- include "flightctl.vulnerabilityQuayCaVolumeMounts" . | nindent X }}
+*/}}
+{{- define "flightctl.vulnerabilityQuayCaVolumeMounts" -}}
+{{- $vuln := default dict .Values.vulnerabilityReporting }}
+{{- $quay := default dict $vuln.quay }}
+{{- if and (default false $vuln.enabled) $quay.caCertConfigMapName }}
+- name: vuln-quay-ca
+  mountPath: /etc/ssl/vulnerability/quay
+  readOnly: true
+{{- end }}
+{{- end }}
+
+{{- /*
+CA certificate volume for the Quay vulnerability backend.
+Usage: {{- include "flightctl.vulnerabilityQuayCaVolumes" . | nindent X }}
+*/}}
+{{- define "flightctl.vulnerabilityQuayCaVolumes" -}}
+{{- $vuln := default dict .Values.vulnerabilityReporting }}
+{{- $quay := default dict $vuln.quay }}
+{{- if and (default false $vuln.enabled) $quay.caCertConfigMapName }}
+- name: vuln-quay-ca
+  configMap:
+    name: {{ $quay.caCertConfigMapName }}
+    items:
+    - key: ca-cert.pem
+      path: ca-cert.pem
+      mode: 0444
+{{- end }}
+{{- end }}
+
 {{- define "flightctl.dbAppUserSecret" -}}
 {{- if eq .Values.db.type "external" }}
   {{- .Values.db.external.applicationUserSecretName }}
@@ -729,6 +797,24 @@ Usage: {{- $result := include "flightctl.getImagebuilderApiDNSSans" . | fromJson
 {{- end }}
 
 {{- /*
+Get DNS SANs for remote-access agent server certificate
+Usage: {{- $result := include "flightctl.getRemoteAccessDNSSans" . | fromJson }}{{ $remoteAccessDNSSans := $result.sans }}
+*/}}
+{{- define "flightctl.getRemoteAccessDNSSans" }}
+  {{- $sans := list }}
+  {{- $baseDomain := include "flightctl.getBaseDomain" . }}
+  {{- $sans = append $sans (printf "remote-access.%s" $baseDomain) }}
+  {{- $sans = append $sans (printf "agent-remote-access.%s" $baseDomain) }}
+  {{- $sans = append $sans "flightctl-remote-access" }}
+  {{- $sans = append $sans "flightctl-remote-access-agent" }}
+  {{- $sans = append $sans (printf "flightctl-remote-access.%s" .Release.Namespace) }}
+  {{- $sans = append $sans (printf "flightctl-remote-access-agent.%s" .Release.Namespace) }}
+  {{- $sans = append $sans (printf "flightctl-remote-access.%s.svc.cluster.local" .Release.Namespace) }}
+  {{- $sans = append $sans (printf "flightctl-remote-access-agent.%s.svc.cluster.local" .Release.Namespace) }}
+  {{- dict "sans" $sans | toJson -}}
+{{- end }}
+
+{{- /*
 Auth configuration block helper.
 Outputs the auth configuration section for service config files.
 Usage: {{- include "flightctl.authConfig" . | nindent 4 }}
@@ -836,16 +922,79 @@ Ensure image names are OS-qualified for backward compatibility during helm upgra
 This helper migrates non-OS-qualified image names (from main branch) to OS-qualified names (PR branch).
 For example: quay.io/flightctl/flightctl-api -> quay.io/flightctl/flightctl-api-el9
 
-Usage: {{ include "flightctl.ensureOsQualifiedImage" .Values.api.image.image }}
+Usage: {{ include "flightctl.ensureOsQualifiedImage" (dict "root" . "imageName" .Values.api.image.image) }}
 */}}
 {{- define "flightctl.ensureOsQualifiedImage" -}}
-  {{- $imageName := . -}}
-  {{- /* Check if image already has OS suffix (-el9, -el10, -cs9, -cs10) */ -}}
-  {{- if or (hasSuffix "-el9" $imageName) (hasSuffix "-el10" $imageName) (hasSuffix "-cs9" $imageName) (hasSuffix "-cs10" $imageName) (hasSuffix "-rhel9" $imageName) (hasSuffix "-rhel10" $imageName) -}}
-    {{- /* Image already has OS suffix, use as-is */ -}}
-    {{- $imageName -}}
-  {{- else -}}
-    {{- /* Image lacks OS suffix, add default -el9 for backward compatibility */ -}}
-    {{- printf "%s-el9" $imageName -}}
+  {{- $root := .root -}}
+  {{- $imageName := .imageName -}}
+
+  {{- /* Apply only for upgrades */ -}}
+  {{- if $root.Release.IsUpgrade -}}
+    {{- if hasPrefix "quay.io/flightctl/" $imageName -}}
+      {{- if not (or (hasSuffix "-el9" $imageName) (hasSuffix "-el10" $imageName)) -}}
+        {{- $imageName = printf "%s-el9" $imageName -}}
+      {{- end -}}
+    {{- else if hasPrefix "registry.redhat.io/rhem/" $imageName -}}
+      {{- if not (or (hasSuffix "-rhel9" $imageName) (hasSuffix "-rhel10" $imageName)) -}}
+        {{- $imageName = printf "%s-rhel9" $imageName -}}
+      {{- end -}}
+    {{- end -}}
   {{- end -}}
+
+  {{- $imageName -}}
+{{- end -}}
+
+{{- /*
+Render optional profiling (pprof / pyroscope) from .Values.dev.profiling.
+Usage: {{ include "flightctl.profiling" . | nindent 4 }}
+*/}}
+{{- define "flightctl.profiling" -}}
+{{- $p := default dict (default dict .Values.dev).profiling -}}
+{{- $pprof := default dict $p.pprof -}}
+{{- $pyroscope := default dict $p.pyroscope -}}
+{{- if or (default false $pprof.enabled) (default false $pyroscope.enabled) }}
+profiling:
+{{- if default false $pprof.enabled }}
+    pprof:
+        enabled: true
+{{- if $pprof.port }}
+        port: {{ $pprof.port }}
+{{- end }}
+{{- end }}
+{{- if default false $pyroscope.enabled }}
+    pyroscope:
+        enabled: true
+        serverAddress: {{ $pyroscope.serverAddress }}
+{{- if $pyroscope.applicationName }}
+        applicationName: {{ $pyroscope.applicationName }}
+{{- end }}
+{{- if $pyroscope.basicAuthUser }}
+        basicAuthUser: {{ $pyroscope.basicAuthUser }}
+{{- end }}
+{{- if $pyroscope.basicAuthPassword }}
+        basicAuthPassword: {{ $pyroscope.basicAuthPassword }}
+{{- end }}
+{{- if $pyroscope.tenantID }}
+        tenantID: {{ $pyroscope.tenantID }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{- /*
+Render encryption-at-rest config from .Values.encryption.
+Usage: {{ include "flightctl.encryptionConfig" . | nindent 4 }}
+*/}}
+{{- define "flightctl.encryptionConfig" -}}
+{{- $enc := .Values.encryption | default dict -}}
+{{- $keys := $enc.keys | default list -}}
+{{- if or $keys $enc.activeKeyID -}}
+encryption:
+    activeKeyID: {{ $enc.activeKeyID | default "default" | quote }}
+    keys:
+    {{- range $keys }}
+        - id: {{ .id | quote }}
+          path: {{ printf "/root/.flightctl/encryption/%s" .file | quote }}
+    {{- end }}
+{{- end }}
 {{- end -}}

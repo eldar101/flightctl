@@ -82,7 +82,7 @@ A fleet's device template contains a device specification that gets applied to a
 
 For example, you could specify in a fleet's device template that all devices in the fleet shall run the OS image `quay.io/flightctl/rhel:9.5`. The Flight Control service would then roll out this specification to all devices in the fleet and the Flight Control agents would update the devices accordingly. The same would apply to the other specification items described in [Managing Devices](managing-devices.md).
 
-However, it would be impractical if *all* of a fleet's devices had to have the *exact same specification*. Flight Control therefore allows templates to contain placeholders that get filled in based on a device's name or label values. The syntax for these placeholders matches that of [Go templates](https://pkg.go.dev/text/template), but you may only use simple text or actions (no conditionals or loops, for example). You may reference anything under a device's metadata such as `{{ .metadata.labels.key }}` or `{{ .metadata.name }}`.
+However, it would be impractical if *all* of a fleet's devices had to have the *exact same specification*. Flight Control therefore allows templates to contain placeholders that get filled in based on a device's name or label values. The syntax for these placeholders matches that of [Go templates](https://pkg.go.dev/text/template). You may use simple text, actions, and conditionals (`if`/`else`/`else if` and `with`). Loops (`range`) and other control structures are not supported. You may reference a device's name with `{{ .metadata.name }}` and its labels with `{{ .metadata.labels.key }}`.
 
 We also provide some helper functions:
 
@@ -92,6 +92,15 @@ We also provide some helper functions:
 * `getOrDefault`: Return a default value if accessing a missing label. For example, `{{ getOrDefault .metadata.labels "key" "default" }}`.
 
 You can also combine helpers in pipelines, for example `{{ getOrDefault .metadata.labels "key" "default" | upper | replace " " "-" }}`.
+
+You can use conditionals to include content based on device metadata:
+
+* Use `if` to conditionally include content: `{{if .metadata.labels.env}}env: {{.metadata.labels.env}}{{end}}`
+* Use `else` for fallback content: `{{if .metadata.labels.env}}{{.metadata.labels.env}}{{else}}default{{end}}`
+* Use `else if` for multiple branches: `{{if eq .metadata.labels.env "prod"}}production{{else if eq .metadata.labels.env "staging"}}staging{{else}}development{{end}}`
+* Use `with` to conditionally scope into a value: `{{with .metadata.labels.region}}region: {{.}}{{else}}no region{{end}}`. Note that inside a `with` body the dot (`.`) is rebound to the scoped value. To access root fields, use `$`, for example: `{{with .metadata.labels.region}}region: {{.}} name: {{$.metadata.name}}{{end}}`
+
+The following comparison functions are available for use in conditionals: `eq` (equal), `ne` (not equal), `lt` (less than), `gt` (greater than), `le` (less or equal), `ge` (greater or equal), `and`, `or`, `not`.
 
 Note: Always make sure to use proper Go template syntax. For example, `{{ .metadata.labels.target-revision }}` is not valid because of the hyphen, and you would need to use something like `{{ index .metadata.labels "target-revision" }}` instead.
 
@@ -226,6 +235,53 @@ Note: Both the Role/ClusterRole and its corresponding RoleBinding/ClusterRoleBin
 ### Auto-syncing external dependencies
 
 Flight Control can automatically detect changes in referenced git repositories, HTTP endpoints, and Kubernetes secrets and create new template versions without manual intervention. For details on configuration, secret labeling, and troubleshooting, see [Auto-syncing External Dependencies](auto-syncing-dependencies.md).
+
+## Mixed image-mode and package-mode fleets
+
+Image-mode and package-mode devices can belong to the same fleet. Fleet
+assignment uses label selectors only; OS mode does not restrict which fleet a
+device can join. See [OS mode](managing-devices.md#os-mode) for how devices
+report `status.capabilities.osMode`.
+
+When a fleet device template does **not** set an OS target (`spec.os.image` or
+`spec.os.catalogItemRef`), both modes receive the same configuration and
+application targets. Package-mode and image-mode devices converge on those
+targets the same way.
+
+When a fleet device template **does** set an OS target, the service renders
+the full template — including the OS target — to every member device:
+
+* Image-mode devices apply the OS update and converge on the new template
+  version.
+* Package-mode devices reject the entire desired specification before
+  applying configuration or applications. They stay on the previously
+  committed specification and appear `OutOfDate` while the fleet template
+  still includes an OS target.
+
+See [Updating the OS](managing-devices.md#updating-the-os) for package-mode
+limits on OS targets.
+
+### Rollout batch behavior with package-mode devices
+
+If package-mode devices are included in a rollout batch for a fleet whose
+template sets an OS target, the batch can stall until the batch update
+times out. The default timeout is 24 hours
+(`rolloutPolicy.defaultUpdateTimeout`; see
+[Defining Rollout Policies](#defining-rollout-policies)). An `OutOfDate`
+status does not distinguish devices that are still rolling out from devices
+that cannot converge on the OS target.
+
+### Options when a mixed fleet includes an OS target
+
+Operators can use any of the following actions so package-mode devices can
+advance again:
+
+* Keep OS target rollouts in fleets that contain only image-mode devices, and
+  use a separate fleet without an OS target for shared configuration and
+  applications across both modes.
+* Remove the OS target from the fleet device template.
+* Move package-mode devices to a fleet whose template does not set an OS
+  target.
 
 ## Defining Rollout Policies
 

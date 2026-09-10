@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"maps"
 	"os"
@@ -80,11 +81,19 @@ type ApplicationSpec struct {
 	// Volume manager.
 	Volume VolumeManager
 
+	// Image is the resolved OCI image reference for the application.
+	Image string
+
 	// App-type-specific specs (only one will be set based on AppType)
 	ContainerApp *v1beta1.ContainerApplication
 	HelmApp      *v1beta1.HelmApplication
 	ComposeApp   *v1beta1.ComposeApplication
 	QuadletApp   *v1beta1.QuadletApplication
+
+	// Lifecycle intent from the desired spec. These fields do not affect
+	// installation decisions and are excluded from the install diff (isEqual).
+	DesiredState      v1beta1.ApplicationDesiredState
+	RestartGeneration int
 }
 
 func pullAuthPathForUser(username v1beta1.Username) string {
@@ -345,16 +354,17 @@ func ResolveImageAppName(appSpec *v1beta1.ApplicationProviderSpec) (string, erro
 		if err != nil {
 			return "", err
 		}
-		return app.Image, nil
+		imageSpec, err := app.AsImageApplicationProviderSpec()
+		if err != nil {
+			return "", err
+		}
+		return imageSpec.Image, nil
 	case v1beta1.AppTypeCompose:
 		app, err := (*appSpec).AsComposeApplication()
 		if err != nil {
 			return "", err
 		}
-		providerType, err := app.Type()
-		if err != nil {
-			return "", err
-		}
+		providerType := app.Type()
 		if providerType == v1beta1.ImageApplicationProviderType {
 			imageSpec, err := app.AsImageApplicationProviderSpec()
 			if err != nil {
@@ -368,10 +378,7 @@ func ResolveImageAppName(appSpec *v1beta1.ApplicationProviderSpec) (string, erro
 		if err != nil {
 			return "", err
 		}
-		providerType, err := app.Type()
-		if err != nil {
-			return "", err
-		}
+		providerType := app.Type()
 		if providerType == v1beta1.ImageApplicationProviderType {
 			imageSpec, err := app.AsImageApplicationProviderSpec()
 			if err != nil {
@@ -385,7 +392,11 @@ func ResolveImageAppName(appSpec *v1beta1.ApplicationProviderSpec) (string, erro
 		if err != nil {
 			return "", err
 		}
-		return helm.SanitizeReleaseName(app.Image)
+		imageSpec, err := app.AsImageApplicationProviderSpec()
+		if err != nil {
+			return "", err
+		}
+		return helm.SanitizeReleaseName(imageSpec.Image)
 	default:
 		return "", fmt.Errorf("%w: %s", errors.ErrUnsupportedAppType, appType)
 	}
@@ -410,20 +421,14 @@ func AppNeedsNestedExtraction(appSpec *v1beta1.ApplicationProviderSpec) (bool, e
 		if err != nil {
 			return false, err
 		}
-		providerType, err := composeApp.Type()
-		if err != nil {
-			return false, err
-		}
+		providerType := composeApp.Type()
 		return providerType == v1beta1.ImageApplicationProviderType, nil
 	case v1beta1.AppTypeQuadlet:
 		quadletApp, err := (*appSpec).AsQuadletApplication()
 		if err != nil {
 			return false, err
 		}
-		providerType, err := quadletApp.Type()
-		if err != nil {
-			return false, err
-		}
+		providerType := quadletApp.Type()
 		return providerType == v1beta1.ImageApplicationProviderType, nil
 	default:
 		return false, nil
@@ -444,13 +449,21 @@ func ResolveImageRef(appSpec *v1beta1.ApplicationProviderSpec) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		return app.Image, nil
+		imageSpec, err := app.AsImageApplicationProviderSpec()
+		if err != nil {
+			return "", err
+		}
+		return imageSpec.Image, nil
 	case v1beta1.AppTypeHelm:
 		app, err := (*appSpec).AsHelmApplication()
 		if err != nil {
 			return "", err
 		}
-		return app.Image, nil
+		imageSpec, err := app.AsImageApplicationProviderSpec()
+		if err != nil {
+			return "", err
+		}
+		return imageSpec.Image, nil
 	case v1beta1.AppTypeCompose:
 		app, err := (*appSpec).AsComposeApplication()
 		if err != nil {
@@ -843,9 +856,71 @@ func WithAppDataCache(cache map[string]*AppData) ParseOpt {
 	}
 }
 
-// isEqual compares two application providers and returns true if they are equal.
+// isEqual compares two application providers for installation equality.
+// Lifecycle intent fields (DesiredState, RestartGeneration) are excluded because
+// a change to them should not trigger a reinstall.
 func isEqual(a, b Provider) bool {
-	return reflect.DeepEqual(a.Spec(), b.Spec())
+	aSpec, bSpec := a.Spec(), b.Spec()
+	if aSpec == nil || bSpec == nil {
+		return aSpec == bSpec
+	}
+	as, bs := *aSpec, *bSpec
+	clearLifecycleFields(&as)
+	clearLifecycleFields(&bs)
+	return reflect.DeepEqual(as, bs)
+}
+
+// clearLifecycleFields zeroes DesiredState/RestartGeneration on the top-level spec and
+// nested app structs (including openapi union blobs) so lifecycle-only diffs stay on Ensure.
+func clearLifecycleFields(s *ApplicationSpec) {
+	s.DesiredState = ""
+	s.RestartGeneration = 0
+
+	if s.ContainerApp != nil {
+		app := *s.ContainerApp
+		stripLifecycleFromUnionApp(&app)
+		s.ContainerApp = &app
+	}
+	if s.ComposeApp != nil {
+		app := *s.ComposeApp
+		stripLifecycleFromUnionApp(&app)
+		s.ComposeApp = &app
+	}
+	if s.QuadletApp != nil {
+		app := *s.QuadletApp
+		stripLifecycleFromUnionApp(&app)
+		s.QuadletApp = &app
+	}
+	if s.HelmApp != nil {
+		app := *s.HelmApp
+		stripLifecycleFromUnionApp(&app)
+		s.HelmApp = &app
+	}
+}
+
+func stripLifecycleFromUnionApp[T any](app *T) {
+	if app == nil {
+		return
+	}
+	raw, err := json.Marshal(app)
+	if err != nil {
+		return
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return
+	}
+	delete(obj, "desiredState")
+	delete(obj, "restartGeneration")
+	raw, err = json.Marshal(obj)
+	if err != nil {
+		return
+	}
+	var cleaned T
+	if err := json.Unmarshal(raw, &cleaned); err != nil {
+		return
+	}
+	*app = cleaned
 }
 
 // AppData holds the extracted application data and cleanup function

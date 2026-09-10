@@ -85,6 +85,7 @@ type RendererConfig struct {
 	Api                ImageConfig `mapstructure:"api"`
 	Periodic           ImageConfig `mapstructure:"periodic"`
 	Worker             ImageConfig `mapstructure:"worker"`
+	DeltaWorker        ImageConfig `mapstructure:"delta-worker"`
 	AlertExporter      ImageConfig `mapstructure:"alert-exporter"`
 	CliArtifacts       ImageConfig `mapstructure:"cli-artifacts"`
 	AlertmanagerProxy  ImageConfig `mapstructure:"alertmanager-proxy"`
@@ -101,6 +102,7 @@ type RendererConfig struct {
 	TelemetryGateway   ImageConfig `mapstructure:"telemetry-gateway"`
 	UserinfoProxy      ImageConfig `mapstructure:"userinfo-proxy"`
 	Gateway            ImageConfig `mapstructure:"gateway"`
+	RemoteAccess       ImageConfig `mapstructure:"remote-access"`
 }
 
 func NewRendererConfig() *RendererConfig {
@@ -306,6 +308,7 @@ func (config *RendererConfig) ApplyFlightctlServicesTagOverride(log logrus.Field
 	config.Api.Tag = tag
 	config.Periodic.Tag = tag
 	config.Worker.Tag = tag
+	config.DeltaWorker.Tag = tag
 	config.AlertExporter.Tag = tag
 	config.CliArtifacts.Tag = tag
 	config.AlertmanagerProxy.Tag = tag
@@ -315,6 +318,8 @@ func (config *RendererConfig) ApplyFlightctlServicesTagOverride(log logrus.Field
 	config.ImagebuilderWorker.Tag = tag
 	config.TelemetryGateway.Tag = tag
 	config.UserinfoProxy.Tag = tag
+
+	config.RemoteAccess.Tag = tag
 
 	if config.FlightctlUiTagOverride {
 		// For release builds, UI tag must be overridden

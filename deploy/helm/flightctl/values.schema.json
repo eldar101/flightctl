@@ -48,7 +48,7 @@
         },
         "storageClassName": {
           "type": "string",
-          "description": "Storage class name for PVCs. Empty to use default."
+          "description": "Storage class name for PVCs. Empty to use default. Note: for a component that also sets volumeName or selector.matchLabels for static PV binding, leaving this empty makes the chart render storageClassName: \"\" for that PVC instead of omitting the field."
         },
         "imagePullSecretName": {
           "type": "string",
@@ -302,6 +302,18 @@
               "type": ["object", "null"],
               "description": "Additional labels for DB PVCs.",
               "additionalProperties": { "type": "string" }
+            },
+            "volumeName": { "type": "string", "description": "Name of a specific pre-provisioned PersistentVolume to bind this PVC to. Only takes effect when the PVC is first created — changing this on an already-bound PVC will make `helm upgrade` fail, because Kubernetes forbids mutating volumeName after creation. Leave empty for normal (dynamic or best-fit static) binding. Note: the target PV's capacity must be >= `storage.size` above, or binding will fail. Setting this (or selector.matchLabels below) also makes the chart render storageClassName: \"\" on this PVC when global.storageClassName is left empty, so a cluster-default StorageClass can't get injected and mismatch the target PV." },
+            "selector": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "matchLabels": {
+                  "type": "object",
+                  "additionalProperties": { "type": "string" },
+                  "description": "Label selector for binding this PVC to a pre-provisioned PersistentVolume by matching labels on the PV. Same immutability caveat as volumeName applies. Leave empty to disable label-based selection."
+                }
+              }
             }
           }
         },
@@ -374,6 +386,18 @@
           "type": ["object", "null"],
           "description": "Additional labels for Alert Manager PVCs.",
           "additionalProperties": { "type": "string" }
+        },
+        "volumeName": { "type": "string", "description": "Name of a specific pre-provisioned PersistentVolume to bind this PVC to. Only takes effect when the PVC is first created — changing this on an already-bound PVC will make `helm upgrade` fail, because Kubernetes forbids mutating volumeName after creation. Leave empty for normal (dynamic or best-fit static) binding. Note: the target PV's capacity must be >= the fixed `2Gi` this PVC requests, or binding will fail. Setting this (or selector.matchLabels below) also makes the chart render storageClassName: \"\" on this PVC when global.storageClassName is left empty, so a cluster-default StorageClass can't get injected and mismatch the target PV." },
+        "selector": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "matchLabels": {
+              "type": "object",
+              "additionalProperties": { "type": "string" },
+              "description": "Label selector for binding this PVC to a pre-provisioned PersistentVolume by matching labels on the PV. Same immutability caveat as volumeName applies. Leave empty to disable label-based selection."
+            }
+          }
         }
       }
     },
@@ -471,6 +495,55 @@
         "clusterLevelSecretAccess": {
           "type": "boolean",
           "description": "Allow worker to access cluster-level secrets for embedding in device configs"
+        },
+        "renderTimeout": {
+          "type": "string",
+          "description": "Time budget for a single device render operation including VM conversion and DB writes (default 60s)"
+        },
+        "vmRender": {
+          "type": "object",
+          "description": "VM application render options passed to vm-to-quadlet",
+          "additionalProperties": false,
+          "properties": {
+            "launcherImage": {
+              "type": "string",
+              "description": "virt-launcher image used when converting VmApplications to Quadlet units (leave empty to use the worker default)"
+            },
+            "launcherImages": {
+              "type": "object",
+              "description": "virt-launcher images keyed by os-release ID and major from status.systemInfo (e.g. \"rhel-9\", \"rhel-10\")",
+              "additionalProperties": { "type": "string" }
+            },
+            "passtWorkarounds": {
+              "type": "boolean",
+              "description": "Enable passt networking workarounds for older virt-launcher images"
+            }
+          }
+        }
+      }
+    },
+    "deltaWorker": {
+      "type": "object",
+      "description": "Delta-worker configuration",
+      "additionalProperties": false,
+      "properties": {
+        "image": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "image": { "type": "string", "description": "Delta-worker container image" },
+            "tag": { "type": "string", "description": "Delta-worker image tag" },
+            "pullPolicy": { "type": "string", "description": "Image pull policy for delta-worker container" }
+          }
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "resources": {
+          "type": "object",
+          "description": "Resource requests and limits for the delta-worker container",
+          "additionalProperties": true
         }
       }
     },
@@ -523,6 +596,77 @@
                   }
                 }
               }
+            },
+            "dependencySync": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "schedule": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "interval": { "type": "string", "description": "Interval for the dependency-sync-git and dependency-sync-http tasks" }
+                  }
+                }
+              }
+            },
+            "repositoryTester": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "schedule": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "interval": { "type": "string", "description": "Interval for the repository-tester task, which probes Repository resources and sets their Accessible condition" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "remoteAccess": {
+      "type": "object",
+      "description": "Remote access service configuration",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean", "description": "Enable remote access service" },
+        "logLevel": { "type": "string", "description": "Log level for the remote access service" },
+        "image": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "image": { "type": "string", "description": "Remote access container image" },
+            "tag": { "type": "string", "description": "Remote access image tag" },
+            "pullPolicy": { "type": "string", "description": "Image pull policy for remote access container" }
+          }
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "resources": {
+          "type": "object",
+          "description": "Resource requests and limits for the remote access container",
+          "additionalProperties": false,
+          "properties": {
+            "requests": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "cpu": { "type": "string" },
+                "memory": { "type": "string" }
+              }
+            },
+            "limits": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "cpu": { "type": "string" },
+                "memory": { "type": "string" }
+              }
             }
           }
         }
@@ -564,6 +708,15 @@
             "pullPolicy": { "type": "string", "description": "Image pull policy for Alertmanager proxy container" }
           }
         }
+      }
+    },
+    "ubiMinimal": {
+      "type": "object",
+      "description": "UBI minimal image used by init containers (e.g. alertmanager-proxy, test pods)",
+      "additionalProperties": false,
+      "properties": {
+        "image": { "type": "string", "description": "UBI minimal container image" },
+        "tag": { "type": "string", "description": "UBI minimal image tag" }
       }
     },
     "imageBuilderApi": {
@@ -617,6 +770,10 @@
           "type": "object",
           "description": "Builder images (podman, bootc-image-builder, syft) and skip-TLS options",
           "properties": {
+            "pullSecretName": {
+              "type": "string",
+              "description": "Secret name containing registry credentials (auth.json) for pulling builder service images. The secret must have a key named auth.json in podman/Docker auth format."
+            },
             "podman": {
               "type": "object",
               "properties": {
@@ -701,6 +858,48 @@
           "type": ["object", "null"],
           "description": "Additional labels for Telemetry gateway routes.",
           "additionalProperties": { "type": "string" }
+        },
+        "extraEnvs": {
+          "type": "array",
+          "description": "Extra environment variables for the telemetry gateway container. Use to inject secrets for forward header values via ${VAR} expansion.",
+          "items": { "type": "object" }
+        },
+        "extraVolumeMounts": {
+          "type": "array",
+          "description": "Extra volume mounts for the telemetry gateway container. Use to mount TLS certificates for mTLS forward connections.",
+          "items": { "type": "object" }
+        },
+        "extraVolumes": {
+          "type": "array",
+          "description": "Extra volumes for the telemetry gateway pod.",
+          "items": { "type": "object" }
+        },
+        "forward": {
+          "type": "object",
+          "description": "Forward telemetry to an upstream OTLP collector.",
+          "additionalProperties": false,
+          "properties": {
+            "endpoint": {
+              "type": "string",
+              "description": "Upstream OTLP endpoint. Use host:port for gRPC, http(s):// URL for OTLP/HTTP."
+            },
+            "headers": {
+              "type": "object",
+              "description": "Custom HTTP headers for authentication (OTLP/HTTP only).",
+              "additionalProperties": { "type": "string" }
+            },
+            "tls": {
+              "type": "object",
+              "description": "TLS configuration for the forward connection.",
+              "additionalProperties": false,
+              "properties": {
+                "insecureSkipTlsVerify": { "type": "boolean", "description": "Skip TLS certificate verification." },
+                "caFile": { "type": "string", "description": "Path to CA certificate file." },
+                "certFile": { "type": "string", "description": "Path to client certificate file (mTLS)." },
+                "keyFile": { "type": "string", "description": "Path to client key file (mTLS)." }
+              }
+            }
+          }
         }
       }
     },
@@ -791,6 +990,30 @@
         }
       }
     },
+    "encryption": {
+      "type": "object",
+      "description": "Encryption-at-rest key configuration for key rotation support",
+      "additionalProperties": false,
+      "properties": {
+        "activeKeyID": {
+          "type": "string",
+          "description": "Key ID used for new encryptions. Must match one of the IDs in the keys list."
+        },
+        "keys": {
+          "type": "array",
+          "description": "List of available encryption keys. Old keys remain available for decryption during rotation.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "file"],
+            "properties": {
+              "id": { "type": "string", "description": "Logical key identifier" },
+              "file": { "type": "string", "description": "Filename within the flightctl-encryption-key Secret" }
+            }
+          }
+        }
+      }
+    },
     "upgradeHooks": {
       "type": "object",
       "description": "Upgrade hooks configuration",
@@ -826,6 +1049,11 @@
       "properties": {
         "enabled": { "type": "boolean", "description": "Enable vulnerability integration (sync task + API endpoints)" },
         "syncInterval": { "type": "string", "description": "Sync interval for periodic Trustify fetch (e.g. \"15m\", \"1h\")" },
+        "backend": {
+          "type": "string",
+          "description": "Vulnerability scanning backend ('trustify' or 'quay'); leave empty to default to Trustify when a trustify config with a non-empty endpoint is present.",
+          "enum": ["", "trustify", "quay"]
+        },
         "trustify": {
           "type": "object",
           "description": "Trustify API connection details",
@@ -845,8 +1073,77 @@
                 "oidcIssuerUrl": { "type": "string", "description": "OIDC issuer URL for client-credentials mode" },
                 "secretName": { "type": "string", "description": "Name of the Kubernetes Secret containing 'client_id' and 'client_secret' keys" }
               }
-            }
+            },
+            "caFile": { "type": "string", "description": "Path to a CA bundle for verifying the Trustify server certificate. If unset, system roots are used." },
+            "caCertConfigMapName": { "type": "string", "description": "Name of a ConfigMap containing key 'ca-cert.pem' with the CA bundle for the Trustify server. When set, it is mounted and used instead of caFile." },
+            "skipTlsVerify": { "type": "boolean", "description": "Skip TLS certificate verification (insecure, for lab/air-gap only). Defaults to false." }
           }
+        },
+        "quay": {
+          "type": "object",
+          "description": "Quay Security API connection details",
+          "additionalProperties": false,
+          "properties": {
+            "endpoint": { "type": "string", "description": "Quay API base URL (e.g. \"https://quay.io\")" },
+            "secretName": { "type": "string", "description": "Name of the Kubernetes Secret containing the 'token' key for Quay Security API bearer authentication" },
+            "maxConcurrentRequests": { "type": "integer", "description": "Maximum number of concurrent Quay API requests. Defaults to 5 when unset.", "minimum": 0 },
+            "caFile": { "type": "string", "description": "Path to a CA bundle for verifying the Quay server certificate. If unset, system roots are used." },
+            "caCertConfigMapName": { "type": "string", "description": "Name of a ConfigMap containing key 'ca-cert.pem' with the CA bundle for the Quay server. When set, it is mounted and used instead of caFile." },
+            "skipTlsVerify": { "type": "boolean", "description": "Skip TLS certificate verification (insecure, for lab/air-gap only). Defaults to false." }
+          }
+        }
+      }
+    },
+    "deltaGeneration": {
+      "type": "object",
+      "description": "Default OCI write target for generated deltas when an organization has no deltaStorageTarget Repository",
+      "additionalProperties": false,
+      "properties": {
+        "defaultRepository": {
+          "type": "object",
+          "description": "Default repository used when the org has no deltaStorageTarget",
+          "additionalProperties": false,
+          "properties": {
+            "registry": { "type": "string", "description": "Registry hostname used as the login/CA host and as the prefix of the push path" },
+            "repository": { "type": "string", "description": "Optional repository path under registry (e.g. my-org/diffs). Mutually exclusive with namespace" },
+            "namespace": { "type": "string", "description": "Optional namespace under registry (e.g. my-org). Mutually exclusive with repository" },
+            "scheme": {
+              "type": "string",
+              "description": "URL scheme for connecting to the registry",
+              "enum": ["", "http", "https"]
+            },
+            "skipServerVerification": { "type": "boolean", "description": "Skip TLS verification when connecting to the registry" },
+            "caCrt": { "type": "string", "description": "Base64-encoded PEM of a custom registry CA (same encoding as Repository spec ca.crt)" },
+            "secretName": { "type": "string", "description": "Name of the Kubernetes Secret containing 'username' and 'password' keys" }
+          },
+          "allOf": [
+            {
+              "not": {
+                "allOf": [
+                  {
+                    "required": ["repository"],
+                    "properties": {
+                      "repository": { "type": "string", "minLength": 1 }
+                    }
+                  },
+                  {
+                    "required": ["namespace"],
+                    "properties": {
+                      "namespace": { "type": "string", "minLength": 1 }
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "maxConcurrentDeltaGenerations": {
+          "type": "integer",
+          "description": "Maximum number of concurrent delta generation jobs. Defaults to 2 when omitted or <= 0"
+        },
+        "timeout": {
+          "type": "string",
+          "description": "Per-job timeout for generating a delta (Go duration, e.g. 30m). Defaults to 30m when omitted or <= 0"
         }
       }
     },
@@ -884,9 +1181,35 @@
             "endpoint": { "type": "string" },
             "insecure": { "type": "boolean" }
           }
+        },
+        "profiling": {
+          "type": "object",
+          "description": "Optional pprof and/or Pyroscope profiling for long-running services",
+          "additionalProperties": false,
+          "properties": {
+            "pprof": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "port": { "type": "integer", "description": "Optional loopback pprof port override for a single process" }
+              }
+            },
+            "pyroscope": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "serverAddress": { "type": "string" },
+                "applicationName": { "type": "string" },
+                "basicAuthUser": { "type": "string" },
+                "basicAuthPassword": { "type": "string" },
+                "tenantID": { "type": "string" }
+              }
+            }
+          }
         }
       }
     }
   }
 }
-

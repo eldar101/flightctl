@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -19,6 +20,12 @@ import (
 const (
 	// QuadletUnitPath is the quadlet unit path on device (rootful)
 	QuadletUnitPath = "/etc/containers/systemd"
+
+	// VMGuestMemoryDefault is the guest RAM for e2e KubeVirt VM manifests.
+	VMGuestMemoryDefault = "1024M"
+
+	// VMFedoraGuestUser is the default login user on Fedora containerdisk images.
+	VMFedoraGuestUser = "fedora"
 )
 
 // QuadletPathForUser returns the quadlet systemd path for the given user.
@@ -41,22 +48,6 @@ func deviceHasApplicationWithStatus(device *v1beta1.Device, appName string, stat
 	for _, app := range device.Status.Applications {
 		if app.Name == appName && app.Status == status {
 			return true
-		}
-	}
-	return false
-}
-
-func applicationReadyForRunning(device *v1beta1.Device, appName string) bool {
-	if device == nil || device.Status == nil {
-		return false
-	}
-	for _, app := range device.Status.Applications {
-		if app.Name == appName && app.Status == v1beta1.ApplicationStatusRunning {
-			parts := strings.Split(app.Ready, "/")
-			if len(parts) != 2 {
-				return false
-			}
-			return parts[0] == parts[1]
 		}
 	}
 	return false
@@ -202,10 +193,16 @@ func NewContainerApplicationSpecWithRunAs(
 	containerApp := v1beta1.ContainerApplication{
 		Name:      lo.ToPtr(name),
 		AppType:   v1beta1.AppTypeContainer,
-		Image:     image,
-		Ports:     &ports,
 		Resources: resources,
 		Volumes:   volumes,
+	}
+	if err := containerApp.FromImageApplicationProviderSpec(v1beta1.ImageApplicationProviderSpec{Image: image}); err != nil {
+		return v1beta1.ApplicationProviderSpec{}, err
+	}
+	// Only set Ports when non-nil. A non-nil pointer to a nil slice marshals as
+	// "ports": null, which OpenAPI validation rejects.
+	if ports != nil {
+		containerApp.Ports = &ports
 	}
 	if runAs != "" {
 		containerApp.RunAs = v1beta1.Username(runAs)
@@ -231,13 +228,46 @@ func NewMountVolume(name, mountPath string) (v1beta1.ApplicationVolume, error) {
 	return volume, err
 }
 
+// NewVmApplicationSpec creates an inline VmApplication spec containing a KubeVirt
+// VirtualMachine manifest (vm.yaml). The port mapping is expressed via
+// publishPorts so that the server-side renderer can inject it into the
+// generated .pod unit.
+func NewVmApplicationSpec(name, image string) (v1beta1.ApplicationProviderSpec, error) {
+	vmYAML := VMYAML(name, VMGuestMemoryDefault, image, VMFedoraNoCloudUserData("fedora"))
+	return NewVmApplicationSpecFromYAML(name, []string{"2222:22"}, vmYAML)
+}
+
+// NewVmApplicationSpecFromYAML creates an inline VmApplication spec from a pre-built
+// KubeVirt VirtualMachine manifest and publishPorts list.
+func NewVmApplicationSpecFromYAML(name string, publishPorts []string, vmYAML string) (v1beta1.ApplicationProviderSpec, error) {
+	vmApp := v1beta1.VmApplication{
+		AppType:      v1beta1.AppTypeVm,
+		Name:         lo.ToPtr(name),
+		PublishPorts: &publishPorts,
+	}
+	if err := vmApp.FromInlineApplicationProviderSpec(v1beta1.InlineApplicationProviderSpec{
+		Inline: []v1beta1.ApplicationContent{
+			{Path: "vm.yaml", Content: lo.ToPtr(vmYAML)},
+		},
+	}); err != nil {
+		return v1beta1.ApplicationProviderSpec{}, fmt.Errorf("building inline VM application spec: %w", err)
+	}
+	var appSpec v1beta1.ApplicationProviderSpec
+	if err := appSpec.FromVmApplication(vmApp); err != nil {
+		return v1beta1.ApplicationProviderSpec{}, fmt.Errorf("converting VM application to provider spec: %w", err)
+	}
+	return appSpec, nil
+}
+
 // NewHelmApplicationSpec creates a HelmApplication spec with optional values files.
 func NewHelmApplicationSpec(name, image, namespace string, valuesFiles []string) (v1beta1.ApplicationProviderSpec, error) {
 	helmApp := v1beta1.HelmApplication{
 		AppType:   v1beta1.AppTypeHelm,
 		Name:      lo.ToPtr(name),
-		Image:     image,
 		Namespace: lo.ToPtr(namespace),
+	}
+	if err := helmApp.FromImageApplicationProviderSpec(v1beta1.ImageApplicationProviderSpec{Image: image}); err != nil {
+		return v1beta1.ApplicationProviderSpec{}, err
 	}
 	if len(valuesFiles) > 0 {
 		helmApp.ValuesFiles = &valuesFiles
@@ -252,9 +282,11 @@ func NewHelmApplicationSpecWithValues(name, image, namespace string, values map[
 	helmApp := v1beta1.HelmApplication{
 		AppType:   v1beta1.AppTypeHelm,
 		Name:      lo.ToPtr(name),
-		Image:     image,
 		Namespace: lo.ToPtr(namespace),
 		Values:    &values,
+	}
+	if err := helmApp.FromImageApplicationProviderSpec(v1beta1.ImageApplicationProviderSpec{Image: image}); err != nil {
+		return v1beta1.ApplicationProviderSpec{}, err
 	}
 	var appSpec v1beta1.ApplicationProviderSpec
 	err := appSpec.FromHelmApplication(helmApp)
@@ -422,7 +454,11 @@ func GetContainerApplicationImage(spec v1beta1.ApplicationProviderSpec) (string,
 	if err != nil {
 		return "", err
 	}
-	return app.Image, nil
+	imageSpec, err := app.AsImageApplicationProviderSpec()
+	if err != nil {
+		return "", fmt.Errorf("GetContainerApplicationImage: %w", err)
+	}
+	return imageSpec.Image, nil
 }
 
 // GetContainerApplicationVolumeImageRef returns the image reference of the named volume in a ContainerApplication spec.
@@ -693,7 +729,6 @@ func (h *Harness) waitForApplicationsSummaryCondition(deviceID string, descripti
 }
 
 // WaitForApplicationStatusByName waits for an application to reach the specified status.
-// For Running status, it also verifies ready replicas match.
 func (h *Harness) WaitForApplicationStatusByName(deviceId string, applicationName string, expectedStatus v1beta1.ApplicationStatusType) {
 	GinkgoWriter.Printf("Waiting for application %s to reach %s status\n", applicationName, expectedStatus)
 	h.WaitForDeviceContents(deviceId, fmt.Sprintf("Application %s", expectedStatus),
@@ -703,13 +738,6 @@ func (h *Harness) WaitForApplicationStatusByName(deviceId string, applicationNam
 			}
 			for _, application := range device.Status.Applications {
 				if application.Name == applicationName && application.Status == expectedStatus {
-					if expectedStatus == v1beta1.ApplicationStatusRunning {
-						parts := strings.Split(application.Ready, "/")
-						if len(parts) != 2 {
-							return false
-						}
-						return parts[0] == parts[1]
-					}
 					return true
 				}
 			}
@@ -747,7 +775,29 @@ func (h *Harness) WaitForApplicationsSummaryStatus(deviceId string, expectedStat
 
 // WaitForApplicationStatus polls until the device reports the given application with the given status, or timeout.
 func (h *Harness) WaitForApplicationStatus(deviceID, appName string, status v1beta1.ApplicationStatusType, timeout, polling time.Duration) error {
+	GinkgoWriter.Printf("Waiting for application %s to reach %s on device %s (timeout=%s, polling=%s)\n",
+		appName, status, deviceID, timeout, polling)
+
+	formatStatus := func(device *v1beta1.Device) string {
+		if device == nil || device.Status == nil {
+			return "<no device status>"
+		}
+		summary := string(device.Status.ApplicationsSummary.Status)
+		if device.Status.ApplicationsSummary.Info != nil && *device.Status.ApplicationsSummary.Info != "" {
+			summary = fmt.Sprintf("%s info=%q", summary, *device.Status.ApplicationsSummary.Info)
+		}
+		for _, app := range device.Status.Applications {
+			if app.Name == appName {
+				return fmt.Sprintf("status=%s ready=%s applicationsSummary=%s", app.Status, app.Ready, summary)
+			}
+		}
+		return fmt.Sprintf("app not in status.applications (applicationsSummary=%s)", summary)
+	}
+
 	deadline := time.Now().Add(timeout)
+	var lastStatus string
+	loggedInitial := false
+
 	for time.Now().Before(deadline) {
 		resp, err := h.GetDeviceWithStatusSystem(deviceID)
 		if err != nil {
@@ -755,16 +805,27 @@ func (h *Harness) WaitForApplicationStatus(deviceID, appName string, status v1be
 			time.Sleep(polling)
 			continue
 		}
-		if resp.JSON200 != nil && deviceHasApplicationWithStatus(resp.JSON200, appName, status) {
-			if status == v1beta1.ApplicationStatusRunning {
-				if applicationReadyForRunning(resp.JSON200, appName) {
-					return nil
-				}
-			} else {
+		if resp != nil && resp.JSON200 != nil {
+			current := formatStatus(resp.JSON200)
+			switch {
+			case !loggedInitial:
+				GinkgoWriter.Printf("Application %s initial status: %s\n", appName, current)
+				lastStatus = current
+				loggedInitial = true
+			case current != lastStatus:
+				GinkgoWriter.Printf("Application %s status changed: %s\n", appName, current)
+				lastStatus = current
+			}
+			if deviceHasApplicationWithStatus(resp.JSON200, appName, status) {
+				GinkgoWriter.Printf("Application %s reached %s: %s\n", appName, status, lastStatus)
 				return nil
 			}
 		}
 		time.Sleep(polling)
+	}
+	if loggedInitial {
+		return fmt.Errorf("timed out after %s waiting for application %s to have status %s (last observed: %s)",
+			timeout, appName, status, lastStatus)
 	}
 	return fmt.Errorf("timed out after %s waiting for application %s to have status %s", timeout, appName, status)
 }
@@ -782,7 +843,7 @@ func (h *Harness) WaitForApplicationSummary(deviceID string, timeout, polling ti
 			time.Sleep(polling)
 			continue
 		}
-		if resp.JSON200 != nil && deviceSummaryMatchesAny(resp.JSON200, expectedStatuses) {
+		if resp != nil && resp.JSON200 != nil && deviceSummaryMatchesAny(resp.JSON200, expectedStatuses) {
 			return nil
 		}
 		time.Sleep(polling)
@@ -998,42 +1059,64 @@ func (h *Harness) QuadletPathForUserOnVM(user string) (string, error) {
 }
 
 func (h *Harness) getUserHomeOnVM(user string) (string, error) {
+	_, home, err := h.getUserOnVM(user)
+	return home, err
+}
+
+func (h *Harness) getUserOnVM(user string) (uid, home string, err error) {
 	out, err := h.VM.RunSSH([]string{"sudo", "getent", "passwd", user}, nil)
 	if err != nil {
-		return "", fmt.Errorf("getent passwd %s: %w", user, err)
+		return "", "", fmt.Errorf("getent passwd %s: %w", user, err)
 	}
 	line := strings.TrimSpace(out.String())
 	fields := strings.Split(line, ":")
-	if len(fields) < 2 {
-		return "", fmt.Errorf("getent passwd %s: unexpected output", user)
+	// passwd: name:password:UID:GID:GECOS:home:shell — GECOS may contain colons.
+	if len(fields) < 7 {
+		return "", "", fmt.Errorf("getent passwd %s: unexpected output", user)
 	}
-	return fields[len(fields)-2], nil
+	uid = fields[2]
+	home = fields[len(fields)-2]
+	if uid == "" || home == "" {
+		return "", "", fmt.Errorf("getent passwd %s: missing uid or home", user)
+	}
+	for _, r := range uid {
+		if r < '0' || r > '9' {
+			return "", "", fmt.Errorf("getent passwd %s: invalid uid %q", user, uid)
+		}
+	}
+	return uid, home, nil
 }
 
-// RunPodmanPsContainerNamesAsUser runs podman ps (or podman ps -a) on the VM as the given user and returns container names.
-func (h *Harness) RunPodmanPsContainerNamesAsUser(user string, allContainers bool) (string, error) {
-	var args []string
+// RunShellAsUserOnVM runs command in sh -c as user on the VM.
+// RunSSH joins argv with spaces for the remote shell, so the command is passed as one quoted argument.
+func (h *Harness) RunShellAsUserOnVM(user, command string) (string, error) {
+	var remote string
 	if user == "root" {
-		args = []string{"sudo", "-u", user, "podman", "ps", "--format", "{{.Names}}"}
-		if allContainers {
-			args = []string{"sudo", "-u", user, "podman", "ps", "-a", "--format", "{{.Names}}"}
-		}
+		remote = fmt.Sprintf("sudo sh -c %q", command)
 	} else {
-		home, err := h.getUserHomeOnVM(user)
+		uid, home, err := h.getUserOnVM(user)
 		if err != nil {
 			return "", err
 		}
-		cmd := fmt.Sprintf("cd /tmp && env HOME=%q podman ps --format '{{.Names}}'", home)
-		if allContainers {
-			cmd = fmt.Sprintf("cd /tmp && env HOME=%q podman ps -a --format '{{.Names}}'", home)
-		}
-		args = []string{"sudo", "-u", user, "sh", "-c", cmd}
+		// Bake in the numeric UID. $(id -u) is expanded by the outer bash -lc as the
+		// SSH user, not the target user, so it cannot be used here.
+		inner := fmt.Sprintf("cd /tmp && env HOME=%q XDG_RUNTIME_DIR=/run/user/%s %s", home, uid, command)
+		remote = fmt.Sprintf("sudo -u %q sh -c %q", user, inner)
 	}
-	out, err := h.VM.RunSSH(args, nil)
+	out, err := h.VM.RunSSH(vmShellCommandArgs(remote), nil)
 	if err != nil {
 		return "", err
 	}
 	return out.String(), nil
+}
+
+// RunPodmanPsContainerNamesAsUser runs podman ps (or podman ps -a) on the VM as the given user and returns container names.
+func (h *Harness) RunPodmanPsContainerNamesAsUser(user string, allContainers bool) (string, error) {
+	ps := "podman ps --format '{{.Names}}'"
+	if allContainers {
+		ps = "podman ps -a --format '{{.Names}}'"
+	}
+	return h.RunShellAsUserOnVM(user, ps)
 }
 
 // RunSystemctlUserStatus runs systemctl --user status for the given user on the VM.
@@ -1059,6 +1142,241 @@ func (h *Harness) GetContainerPorts() (string, error) {
 // =============================================================================
 // VM operations
 // =============================================================================
+
+// VirshOnCompute runs virsh inside the virt-launcher compute container on the device.
+func (h *Harness) VirshOnCompute(container string, virshArgs ...string) (string, error) {
+	args := append([]string{"sudo", "podman", "exec", container, "virsh"}, virshArgs...)
+	out, err := h.VM.RunSSH(args, nil)
+	if err != nil {
+		return "", fmt.Errorf("virsh %s in %q: %w", strings.Join(virshArgs, " "), container, err)
+	}
+	return strings.TrimSpace(out.String()), nil
+}
+
+// CurlOnDevice GETs url from inside the device VM using curl --fail.
+func (h *Harness) CurlOnDevice(url, connectTimeout, maxTime string) error {
+	if h.VM == nil {
+		return fmt.Errorf("device VM is not configured")
+	}
+	if url == "" {
+		return fmt.Errorf("url is required")
+	}
+	out, err := h.VM.RunSSH([]string{
+		"curl", "-sS", "--fail",
+		"--connect-timeout", connectTimeout,
+		"--max-time", maxTime,
+		url,
+	}, nil)
+	if err != nil {
+		curlOutput := ""
+		if out != nil {
+			curlOutput = strings.TrimSpace(out.String())
+		}
+		return fmt.Errorf("GET %s: %w, curl output: %q", url, err, curlOutput)
+	}
+	return nil
+}
+
+// RunSSHOnDeviceLocalPort runs ssh on the device host to localhost:port using password auth.
+// This exercises VM publishPorts mappings (e.g. host 2222 to guest 22).
+// Nested SSH can mix device profile noise onto stdout, so only the last non-empty
+// line is returned. Use RunSSHOnDeviceLocalPortRaw for multi-line guest commands.
+func (h *Harness) RunSSHOnDeviceLocalPort(port int, user, password string, remoteArgs ...string) (string, error) {
+	return h.runSSHOnDeviceLocalPort(port, user, password, true, remoteArgs...)
+}
+
+// RunSSHOnDeviceLocalPortRaw is like RunSSHOnDeviceLocalPort but returns the full guest stdout.
+func (h *Harness) RunSSHOnDeviceLocalPortRaw(port int, user, password string, remoteArgs ...string) (string, error) {
+	return h.runSSHOnDeviceLocalPort(port, user, password, false, remoteArgs...)
+}
+
+func (h *Harness) runSSHOnDeviceLocalPort(port int, user, password string, lastLineOnly bool, remoteArgs ...string) (string, error) {
+	if h.VM == nil {
+		return "", fmt.Errorf("device VM is not configured")
+	}
+	if port <= 0 || port > 65535 {
+		return "", fmt.Errorf("port must be between 1 and 65535, got %d", port)
+	}
+	if user == "" {
+		return "", fmt.Errorf("ssh user is required")
+	}
+	if password == "" {
+		return "", fmt.Errorf("ssh password is required")
+	}
+	if len(remoteArgs) == 0 {
+		return "", fmt.Errorf("remote command is required")
+	}
+
+	quotedRemoteArgs := make([]string, len(remoteArgs))
+	for i, arg := range remoteArgs {
+		quotedRemoteArgs[i] = shellQuote(arg)
+	}
+	quotedPassword := shellQuote(password)
+	remoteCommand := strings.Join(quotedRemoteArgs, " ")
+	sshCommand := fmt.Sprintf(
+		`ssh -T -p %d -o ConnectTimeout=10 -o RequestTTY=no -o PubkeyAuthentication=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o LogLevel=ERROR %s %s`,
+		port,
+		shellQuote(user+"@127.0.0.1"),
+		remoteCommand,
+	)
+	// Run via /bin/sh on the device. Inline the ssh command (not a shell function) because
+	// sshpass/setsid execute a binary and cannot invoke shell functions.
+	script := fmt.Sprintf(`set -eu
+ssh_home=$(mktemp -d)
+trap 'rm -rf "$ssh_home"' EXIT
+export HOME="$ssh_home"
+export PATH=/usr/local/bin:/usr/bin:/bin
+if command -v sshpass >/dev/null 2>&1; then
+  sshpass -p %s %s
+else
+  askpass="$ssh_home/askpass"
+  {
+    printf '%%s\n' '#!/bin/sh'
+    printf '%%s\n' "printf '%%s\n' %s"
+  } >"$askpass"
+  chmod 700 "$askpass"
+  SSH_ASKPASS="$askpass" SSH_ASKPASS_REQUIRE=force DISPLAY=:0 setsid %s
+fi`,
+		quotedPassword,
+		sshCommand,
+		quotedPassword,
+		sshCommand,
+	)
+	out, err := h.VM.RunSSH([]string{"/bin/sh -c " + shellQuote(script)}, nil)
+	if err != nil {
+		return "", classifyDeviceLocalSSHError(fmt.Errorf(
+			"running /bin/sh -c ssh script on device VM (localhost:%d user=%s remote=%s): %w",
+			port, user, strings.Join(remoteArgs, " "), err,
+		))
+	}
+	stdout := out.String()
+	if lastLineOnly {
+		return trimSSHCommandOutput(stdout), nil
+	}
+	return strings.TrimSpace(stdout), nil
+}
+
+var (
+	ErrSSHConnectionRefused = errors.New("ssh connection refused")
+	ErrSSHAuthFailed        = errors.New("ssh authentication failed")
+	ErrSSHTimeout           = errors.New("ssh connection timed out")
+)
+
+func classifyDeviceLocalSSHError(err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "connection refused"):
+		return fmt.Errorf("%w: %s", ErrSSHConnectionRefused, err.Error())
+	case strings.Contains(msg, "permission denied"), strings.Contains(msg, "authentication failed"):
+		return fmt.Errorf("%w: %s", ErrSSHAuthFailed, err.Error())
+	case strings.Contains(msg, "connection timed out"), strings.Contains(msg, "operation timed out"):
+		return fmt.Errorf("%w: %s", ErrSSHTimeout, err.Error())
+	default:
+		return err
+	}
+}
+
+// ExpectSSHUnavailableOnPort waits until password SSH on localhost:port fails, then checks it stays down.
+func (h *Harness) ExpectSSHUnavailableOnPort(port int, appName, user, password string) {
+	GinkgoHelper()
+	const remoteCmd = "/usr/bin/whoami"
+	const unavailableWindow = "10s"
+	Eventually(func(g Gomega) {
+		_, sshErr := h.RunSSHOnDeviceLocalPort(port, user, password, remoteCmd)
+		g.Expect(sshErr).To(HaveOccurred(), "SSH to %s on published port %d should be unavailable", appName, port)
+		g.Expect(errors.Is(sshErr, ErrSSHConnectionRefused) || errors.Is(sshErr, ErrSSHTimeout)).
+			To(BeTrue(), "SSH to %s on port %d failed with %v, want connection refused or timeout", appName, port, sshErr)
+	}, LONGTIMEOUT, POLLING).Should(Succeed())
+
+	Consistently(func(g Gomega) {
+		_, sshErr := h.RunSSHOnDeviceLocalPort(port, user, password, remoteCmd)
+		g.Expect(sshErr).To(HaveOccurred(), "SSH to %s on published port %d should remain unavailable", appName, port)
+		g.Expect(errors.Is(sshErr, ErrSSHConnectionRefused) || errors.Is(sshErr, ErrSSHTimeout)).
+			To(BeTrue(), "SSH to %s on port %d failed with %v, want connection refused or timeout", appName, port, sshErr)
+	}, unavailableWindow, POLLING).Should(Succeed())
+}
+
+// trimSSHCommandOutput returns the last non-empty line from nested SSH output. Device-side
+// shell profiles can print environment noise before the guest command result on stdout.
+func trimSSHCommandOutput(stdout string) string {
+	lines := strings.Split(strings.TrimSpace(stdout), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if line := strings.TrimSpace(lines[i]); line != "" {
+			return line
+		}
+	}
+	return ""
+}
+
+// UDPProbePythonCommand returns a remote shell command that sends a UDP datagram with
+// payload "ping" to 127.0.0.1:port and prints the trimmed reply. Intended for nested
+// SSH (device host -> guest published TCP port); uses a single-quoted python -c string.
+func UDPProbePythonCommand(port int) string {
+	return fmt.Sprintf(
+		`python3 -c 'import socket; port=%d; s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b"ping", ("127.0.0.1", port)); print(s.recv(1024).decode().strip())'`,
+		port,
+	)
+}
+
+// udpProbeDeviceHostScript returns a shell script that probes localhost:port over UDP
+// using socat when available, otherwise python3 via a heredoc (avoids fragile -c quoting).
+func udpProbeDeviceHostScript(port int) string {
+	return fmt.Sprintf(`set -eu
+export PATH=/usr/local/bin:/usr/bin:/bin
+port=%d
+if command -v socat >/dev/null 2>&1; then
+  printf 'ping\n' | socat -t2 - UDP4:127.0.0.1:${port}
+elif command -v python3 >/dev/null 2>&1; then
+  python3 - "$port" <<'PY'
+import socket
+import sys
+port = int(sys.argv[1])
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(2)
+s.sendto(b"ping", ("127.0.0.1", port))
+print(s.recv(1024).decode().strip())
+PY
+else
+  echo "UDP probe requires socat or python3" >&2
+  exit 127
+fi`, port)
+}
+
+// lastNonEmptyLine returns the last non-empty line from command output.
+func lastNonEmptyLine(stdout string) string {
+	lines := strings.Split(strings.TrimSpace(stdout), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if line := strings.TrimSpace(lines[i]); line != "" {
+			return line
+		}
+	}
+	return ""
+}
+
+// RunUDPProbeOnDeviceLocalPort sends a UDP "ping" datagram to localhost:port on the device host
+// and returns the response. This exercises VM publishPorts UDP mappings.
+func (h *Harness) RunUDPProbeOnDeviceLocalPort(port int) (string, error) {
+	if h.VM == nil {
+		return "", fmt.Errorf("device VM is not configured")
+	}
+	if port <= 0 || port > 65535 {
+		return "", fmt.Errorf("port must be between 1 and 65535, got %d", port)
+	}
+
+	out, err := h.VM.RunSSH([]string{"/bin/sh -c " + shellQuote(udpProbeDeviceHostScript(port))}, nil)
+	if err != nil {
+		return "", fmt.Errorf("running UDP probe on device host localhost:%d: %w", port, err)
+	}
+	raw := out.String()
+	reply := lastNonEmptyLine(raw)
+	if reply == "" {
+		return "", fmt.Errorf("UDP probe on localhost:%d returned empty output (raw stdout=%q)", port, raw)
+	}
+	return reply, nil
+}
 
 // RebootVMAndWaitForSSH triggers a reboot on the VM and waits for SSH to become ready again.
 func (h *Harness) RebootVMAndWaitForSSH(waitInterval time.Duration, maxAttempts int) error {

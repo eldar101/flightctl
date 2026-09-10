@@ -19,7 +19,7 @@ func TestCatalogItemValidate(t *testing.T) {
 	v := func(version string, channels ...string) CatalogItemVersion {
 		return CatalogItemVersion{
 			Version:    version,
-			References: map[string]string{"container": "v" + version},
+			References: map[CatalogItemArtifactType]string{"container": "v" + version},
 			Channels:   channels,
 		}
 	}
@@ -99,7 +99,7 @@ func TestCatalogItemValidate(t *testing.T) {
 			artifacts: defaultArtifacts,
 			versions: makeVersions(CatalogItemVersion{
 				Version:    "1.0.0",
-				References: map[string]string{"container": "v1.0.0"},
+				References: map[CatalogItemArtifactType]string{"container": "v1.0.0"},
 				Channels:   []string{},
 			}),
 			wantErr:     true,
@@ -121,7 +121,7 @@ func TestCatalogItemValidate(t *testing.T) {
 			},
 			versions: []CatalogItemVersion{{
 				Version:    "1.0.0",
-				References: map[string]string{"container": "v1.0.0"},
+				References: map[CatalogItemArtifactType]string{"container": "v1.0.0"},
 				Channels:   []string{"INVALID_CHANNEL"},
 			}},
 			wantErr:     true,
@@ -135,7 +135,7 @@ func TestCatalogItemValidate(t *testing.T) {
 			},
 			versions: []CatalogItemVersion{{
 				Version:    "1.0.0",
-				References: map[string]string{"container": "sha256:a3ed95caeb02ffe68cdd9fd84406680ae93d633cb16422d00e8a7c22955b46d4"},
+				References: map[CatalogItemArtifactType]string{"container": "sha256:a3ed95caeb02ffe68cdd9fd84406680ae93d633cb16422d00e8a7c22955b46d4"},
 				Channels:   []string{"stable"},
 			}},
 			wantErr: false,
@@ -148,7 +148,7 @@ func TestCatalogItemValidate(t *testing.T) {
 			},
 			versions: []CatalogItemVersion{{
 				Version:    "1.0.0",
-				References: map[string]string{"container": "v1.0.0"},
+				References: map[CatalogItemArtifactType]string{"container": "v1.0.0"},
 				Channels:   []string{"stable"},
 			}},
 			wantErr: false,
@@ -161,7 +161,7 @@ func TestCatalogItemValidate(t *testing.T) {
 			},
 			versions: []CatalogItemVersion{{
 				Version:    "1.0.0",
-				References: map[string]string{"qcow2": "sha256:a3ed95caeb02ffe68cdd9fd84406680ae93d633cb16422d00e8a7c22955b46d4"},
+				References: map[CatalogItemArtifactType]string{"qcow2": "sha256:a3ed95caeb02ffe68cdd9fd84406680ae93d633cb16422d00e8a7c22955b46d4"},
 				Channels:   []string{"stable"},
 			}},
 			wantErr:     true,
@@ -178,19 +178,19 @@ func TestCatalogItemValidate(t *testing.T) {
 			versions: []CatalogItemVersion{
 				{
 					Version:    "3.0.0",
-					References: map[string]string{"container": "v3.0", "qcow2": "v3.0", "iso": "v3.0"},
+					References: map[CatalogItemArtifactType]string{"container": "v3.0", "qcow2": "v3.0", "iso": "v3.0"},
 					Channels:   []string{"fast"},
 					Replaces:   lo.ToPtr("2.0.0"),
 				},
 				{
 					Version:    "2.0.0",
-					References: map[string]string{"container": "v2.0", "qcow2": "v2.0"},
+					References: map[CatalogItemArtifactType]string{"container": "v2.0", "qcow2": "v2.0"},
 					Channels:   []string{"stable"},
 					Replaces:   lo.ToPtr("1.0.0"),
 				},
 				{
 					Version:    "1.0.0",
-					References: map[string]string{"container": "v1.0"},
+					References: map[CatalogItemArtifactType]string{"container": "v1.0"},
 					Channels:   []string{"stable"},
 				},
 			},
@@ -204,7 +204,7 @@ func TestCatalogItemValidate(t *testing.T) {
 			},
 			versions: []CatalogItemVersion{{
 				Version:    "2.0.0",
-				References: map[string]string{"container": "v2.0"},
+				References: map[CatalogItemArtifactType]string{"container": "v2.0"},
 				Channels:   []string{"stable"},
 			}},
 			wantErr: false,
@@ -217,7 +217,7 @@ func TestCatalogItemValidate(t *testing.T) {
 			},
 			versions: []CatalogItemVersion{{
 				Version:    "2.0.0",
-				References: map[string]string{"container": "sha256:a3ed95caeb02ffe68cdd9fd84406680ae93d633cb16422d00e8a7c22955b46d4"},
+				References: map[CatalogItemArtifactType]string{"container": "sha256:a3ed95caeb02ffe68cdd9fd84406680ae93d633cb16422d00e8a7c22955b46d4"},
 				Channels:   []string{"stable"},
 			}},
 			wantErr: false,
@@ -231,7 +231,7 @@ func TestCatalogItemValidate(t *testing.T) {
 			},
 			versions: []CatalogItemVersion{{
 				Version:    "2.0.0",
-				References: map[string]string{"container": "v2.0", "raw": "v2.0/model.bin"},
+				References: map[CatalogItemArtifactType]string{"container": "v2.0", "raw": "v2.0/model.bin"},
 				Channels:   []string{"stable"},
 			}},
 			wantErr: false,
@@ -245,7 +245,7 @@ func TestCatalogItemValidate(t *testing.T) {
 			},
 			versions: []CatalogItemVersion{{
 				Version:    "2.0.0",
-				References: map[string]string{"container": "v2.0", "qcow2": "v2.0/disk.qcow2"},
+				References: map[CatalogItemArtifactType]string{"container": "v2.0", "qcow2": "v2.0/disk.qcow2"},
 				Channels:   []string{"stable"},
 			}},
 			wantErr: false,
@@ -259,7 +259,7 @@ func TestCatalogItemValidate(t *testing.T) {
 			},
 			versions: []CatalogItemVersion{{
 				Version:    "1.0.0",
-				References: map[string]string{"container": "v1.0", "raw": "v1.0/firmware.bin"},
+				References: map[CatalogItemArtifactType]string{"container": "v1.0", "raw": "v1.0/firmware.bin"},
 				Channels:   []string{"stable"},
 			}},
 			wantErr: false,
@@ -275,7 +275,7 @@ func TestCatalogItemValidate(t *testing.T) {
 			},
 			versions: []CatalogItemVersion{{
 				Version: "3.1.0",
-				References: map[string]string{
+				References: map[CatalogItemArtifactType]string{
 					"container": "v3.1",
 					"qcow2":     "v3.1/disk.qcow2",
 					"iso":       "sha256:a3ed95caeb02ffe68cdd9fd84406680ae93d633cb16422d00e8a7c22955b46d4",
@@ -296,7 +296,7 @@ func TestCatalogItemValidate(t *testing.T) {
 			versions: []CatalogItemVersion{
 				{
 					Version: "3.0.0",
-					References: map[string]string{
+					References: map[CatalogItemArtifactType]string{
 						"container": "sha256:a3ed95caeb02ffe68cdd9fd84406680ae93d633cb16422d00e8a7c22955b46d4",
 						"qcow2":     "v3.0",
 						"raw":       "v3.0/model.bin",
@@ -306,13 +306,13 @@ func TestCatalogItemValidate(t *testing.T) {
 				},
 				{
 					Version:    "2.0.0",
-					References: map[string]string{"container": "v2.0", "qcow2": "v2.0"},
+					References: map[CatalogItemArtifactType]string{"container": "v2.0", "qcow2": "v2.0"},
 					Channels:   []string{"stable"},
 					Replaces:   lo.ToPtr("1.0.0"),
 				},
 				{
 					Version:    "1.0.0",
-					References: map[string]string{"container": "v1.0"},
+					References: map[CatalogItemArtifactType]string{"container": "v1.0"},
 					Channels:   []string{"stable"},
 				},
 			},
@@ -578,6 +578,54 @@ func TestCatalogItemValuesValidation(t *testing.T) {
 			wantErr:     true,
 			errContains: `"ports" is not a valid key`,
 		},
+		// runAs (EDM-5284)
+		{
+			name:     "container with runAs",
+			category: CatalogItemCategoryApplication,
+			itemType: CatalogItemTypeContainer,
+			config: &map[string]interface{}{
+				"runAs": "app-user",
+			},
+			wantErr: false,
+		},
+		{
+			name:     "quadlet with runAs",
+			category: CatalogItemCategoryApplication,
+			itemType: CatalogItemTypeQuadlet,
+			config: &map[string]interface{}{
+				"runAs": "app-user",
+			},
+			wantErr: false,
+		},
+		{
+			name:     "compose with runAs",
+			category: CatalogItemCategoryApplication,
+			itemType: CatalogItemTypeCompose,
+			config: &map[string]interface{}{
+				"runAs": "app-user",
+			},
+			wantErr: false,
+		},
+		{
+			name:     "container with runAs wrong type",
+			category: CatalogItemCategoryApplication,
+			itemType: CatalogItemTypeContainer,
+			config: &map[string]interface{}{
+				"runAs": 1234,
+			},
+			wantErr:     true,
+			errContains: "runAs: must be a string",
+		},
+		{
+			name:     "helm with runAs field (not allowed)",
+			category: CatalogItemCategoryApplication,
+			itemType: CatalogItemTypeHelm,
+			config: &map[string]interface{}{
+				"runAs": "app-user",
+			},
+			wantErr:     true,
+			errContains: `"runAs" is not a valid key`,
+		},
 		// complete examples for each type
 		{
 			name:     "container complete example",
@@ -590,6 +638,7 @@ func TestCatalogItemValuesValidation(t *testing.T) {
 					"ENABLE_DEBUG": "false",
 				},
 				"ports": []interface{}{"8080:80", "9090:9090", "443:443"},
+				"runAs": "app-user",
 				"resources": map[string]interface{}{
 					"limits": map[string]interface{}{
 						"cpu":    "1.5",
@@ -828,7 +877,7 @@ func TestCatalogItemCategoryValidation(t *testing.T) {
 					Category:  tt.category,
 					Type:      tt.itemType,
 					Artifacts: []CatalogItemArtifact{{Type: CatalogItemArtifactTypeContainer, Uri: "quay.io/example/app"}},
-					Versions:  []CatalogItemVersion{{Version: "1.0.0", References: map[string]string{"container": "v1.0.0"}, Channels: []string{"stable"}}},
+					Versions:  []CatalogItemVersion{{Version: "1.0.0", References: map[CatalogItemArtifactType]string{"container": "v1.0.0"}, Channels: []string{"stable"}}},
 				},
 			}
 
@@ -981,7 +1030,7 @@ func TestCatalogItemWithConfigSchema(t *testing.T) {
 			Category:  lo.ToPtr(CatalogItemCategoryApplication),
 			Type:      CatalogItemTypeContainer,
 			Artifacts: []CatalogItemArtifact{{Type: CatalogItemArtifactTypeContainer, Uri: "quay.io/prometheus/prometheus"}},
-			Versions:  []CatalogItemVersion{{Version: "2.45.0", References: map[string]string{"container": "v2.45.0"}, Channels: []string{"stable"}}},
+			Versions:  []CatalogItemVersion{{Version: "2.45.0", References: map[CatalogItemArtifactType]string{"container": "v2.45.0"}, Channels: []string{"stable"}}},
 			Defaults: &CatalogItemConfigurable{
 				Config: &map[string]interface{}{
 					"envVars": map[string]interface{}{
@@ -1091,7 +1140,7 @@ func TestCatalogItemVersionValidation(t *testing.T) {
 			name: "valid with tag reference",
 			version: CatalogItemVersion{
 				Version:    "1.0.0",
-				References: map[string]string{"container": "v1.0.0"},
+				References: map[CatalogItemArtifactType]string{"container": "v1.0.0"},
 				Channels:   []string{"stable"},
 			},
 			wantErr: false,
@@ -1100,7 +1149,7 @@ func TestCatalogItemVersionValidation(t *testing.T) {
 			name: "valid with digest reference",
 			version: CatalogItemVersion{
 				Version:    "1.0.0",
-				References: map[string]string{"container": "sha256:a3ed95caeb02ffe68cdd9fd84406680ae93d633cb16422d00e8a7c22955b46d4"},
+				References: map[CatalogItemArtifactType]string{"container": "sha256:a3ed95caeb02ffe68cdd9fd84406680ae93d633cb16422d00e8a7c22955b46d4"},
 				Channels:   []string{"stable"},
 			},
 			wantErr: false,
@@ -1108,7 +1157,7 @@ func TestCatalogItemVersionValidation(t *testing.T) {
 		{
 			name: "missing version",
 			version: CatalogItemVersion{
-				References: map[string]string{"container": "v1.0.0"},
+				References: map[CatalogItemArtifactType]string{"container": "v1.0.0"},
 				Channels:   []string{"stable"},
 			},
 			wantErr:     true,
@@ -1118,7 +1167,7 @@ func TestCatalogItemVersionValidation(t *testing.T) {
 			name: "invalid semver",
 			version: CatalogItemVersion{
 				Version:    "not-semver",
-				References: map[string]string{"container": "v1.0.0"},
+				References: map[CatalogItemArtifactType]string{"container": "v1.0.0"},
 				Channels:   []string{"stable"},
 			},
 			wantErr:     true,
@@ -1137,7 +1186,7 @@ func TestCatalogItemVersionValidation(t *testing.T) {
 			name: "empty references map",
 			version: CatalogItemVersion{
 				Version:    "1.0.0",
-				References: map[string]string{},
+				References: map[CatalogItemArtifactType]string{},
 				Channels:   []string{"stable"},
 			},
 			wantErr:     true,
@@ -1147,7 +1196,7 @@ func TestCatalogItemVersionValidation(t *testing.T) {
 			name: "invalid replaces semver",
 			version: CatalogItemVersion{
 				Version:    "1.0.0",
-				References: map[string]string{"container": "v1.0.0"},
+				References: map[CatalogItemArtifactType]string{"container": "v1.0.0"},
 				Channels:   []string{"stable"},
 				Replaces:   lo.ToPtr("not-semver"),
 			},
@@ -1158,7 +1207,7 @@ func TestCatalogItemVersionValidation(t *testing.T) {
 			name: "valid replaces",
 			version: CatalogItemVersion{
 				Version:    "2.0.0",
-				References: map[string]string{"container": "v2.0.0"},
+				References: map[CatalogItemArtifactType]string{"container": "v2.0.0"},
 				Channels:   []string{"stable"},
 				Replaces:   lo.ToPtr("1.0.0"),
 			},
@@ -1168,7 +1217,7 @@ func TestCatalogItemVersionValidation(t *testing.T) {
 			name: "invalid skips semver",
 			version: CatalogItemVersion{
 				Version:    "2.0.0",
-				References: map[string]string{"container": "v2.0.0"},
+				References: map[CatalogItemArtifactType]string{"container": "v2.0.0"},
 				Channels:   []string{"stable"},
 				Skips:      &[]string{"not-semver"},
 			},
@@ -1179,7 +1228,7 @@ func TestCatalogItemVersionValidation(t *testing.T) {
 			name: "valid skips",
 			version: CatalogItemVersion{
 				Version:    "2.0.0",
-				References: map[string]string{"container": "v2.0.0"},
+				References: map[CatalogItemArtifactType]string{"container": "v2.0.0"},
 				Channels:   []string{"stable"},
 				Skips:      &[]string{"1.0.0", "1.5.0"},
 			},
@@ -1189,7 +1238,7 @@ func TestCatalogItemVersionValidation(t *testing.T) {
 			name: "invalid skipRange",
 			version: CatalogItemVersion{
 				Version:    "2.0.0",
-				References: map[string]string{"container": "v2.0.0"},
+				References: map[CatalogItemArtifactType]string{"container": "v2.0.0"},
 				Channels:   []string{"stable"},
 				SkipRange:  lo.ToPtr(">=invalid"),
 			},
@@ -1200,7 +1249,7 @@ func TestCatalogItemVersionValidation(t *testing.T) {
 			name: "valid skipRange",
 			version: CatalogItemVersion{
 				Version:    "2.0.0",
-				References: map[string]string{"container": "v2.0.0"},
+				References: map[CatalogItemArtifactType]string{"container": "v2.0.0"},
 				Channels:   []string{"stable"},
 				SkipRange:  lo.ToPtr(">=1.0.0 <2.0.0"),
 			},
@@ -1210,7 +1259,7 @@ func TestCatalogItemVersionValidation(t *testing.T) {
 			name: "references key does not match artifact type",
 			version: CatalogItemVersion{
 				Version:    "1.0.0",
-				References: map[string]string{"qcow2": "sha256:a3ed95caeb02ffe68cdd9fd84406680ae93d633cb16422d00e8a7c22955b46d4"},
+				References: map[CatalogItemArtifactType]string{"qcow2": "sha256:a3ed95caeb02ffe68cdd9fd84406680ae93d633cb16422d00e8a7c22955b46d4"},
 				Channels:   []string{"stable"},
 			},
 			wantErr:     true,
@@ -1220,7 +1269,7 @@ func TestCatalogItemVersionValidation(t *testing.T) {
 			name: "adding new artifact type does not affect old versions",
 			version: CatalogItemVersion{
 				Version:    "3.0.0",
-				References: map[string]string{"container": "v3.0.0"},
+				References: map[CatalogItemArtifactType]string{"container": "v3.0.0"},
 				Channels:   []string{"fast"},
 			},
 			artifactTypes: map[string]struct{}{"container": {}, "qcow2": {}, "iso": {}},
@@ -1230,7 +1279,7 @@ func TestCatalogItemVersionValidation(t *testing.T) {
 			name: "valid channel names",
 			version: CatalogItemVersion{
 				Version:    "1.0.0",
-				References: map[string]string{"container": "v1.0.0"},
+				References: map[CatalogItemArtifactType]string{"container": "v1.0.0"},
 				Channels:   []string{"stable", "fast", "my-channel.v1"},
 			},
 			wantErr: false,
@@ -1239,7 +1288,7 @@ func TestCatalogItemVersionValidation(t *testing.T) {
 			name: "invalid channel name with uppercase",
 			version: CatalogItemVersion{
 				Version:    "1.0.0",
-				References: map[string]string{"container": "v1.0.0"},
+				References: map[CatalogItemArtifactType]string{"container": "v1.0.0"},
 				Channels:   []string{"Stable"},
 			},
 			wantErr:     true,
@@ -1249,7 +1298,7 @@ func TestCatalogItemVersionValidation(t *testing.T) {
 			name: "invalid channel name with spaces",
 			version: CatalogItemVersion{
 				Version:    "1.0.0",
-				References: map[string]string{"container": "v1.0.0"},
+				References: map[CatalogItemArtifactType]string{"container": "v1.0.0"},
 				Channels:   []string{"my channel"},
 			},
 			wantErr:     true,
@@ -1259,7 +1308,7 @@ func TestCatalogItemVersionValidation(t *testing.T) {
 			name: "invalid channel name with underscore",
 			version: CatalogItemVersion{
 				Version:    "1.0.0",
-				References: map[string]string{"container": "v1.0.0"},
+				References: map[CatalogItemArtifactType]string{"container": "v1.0.0"},
 				Channels:   []string{"my_channel"},
 			},
 			wantErr:     true,
@@ -1269,7 +1318,7 @@ func TestCatalogItemVersionValidation(t *testing.T) {
 			name: "second channel invalid",
 			version: CatalogItemVersion{
 				Version:    "1.0.0",
-				References: map[string]string{"container": "v1.0.0"},
+				References: map[CatalogItemArtifactType]string{"container": "v1.0.0"},
 				Channels:   []string{"stable", "INVALID"},
 			},
 			wantErr:     true,
@@ -1694,7 +1743,7 @@ func TestValidateVersionConfig(t *testing.T) {
 			name: "valid version with config",
 			version: CatalogItemVersion{
 				Version:    "1.0.0",
-				References: map[string]string{"container": "v1.0.0"},
+				References: map[CatalogItemArtifactType]string{"container": "v1.0.0"},
 				Channels:   []string{"stable"},
 				Config: &map[string]interface{}{
 					"envVars": map[string]interface{}{"LOG_LEVEL": "info"},
@@ -1708,7 +1757,7 @@ func TestValidateVersionConfig(t *testing.T) {
 			name: "version with invalid port in config",
 			version: CatalogItemVersion{
 				Version:    "1.0.0",
-				References: map[string]string{"container": "v1.0.0"},
+				References: map[CatalogItemArtifactType]string{"container": "v1.0.0"},
 				Channels:   []string{"stable"},
 				Config: &map[string]interface{}{
 					"ports": []interface{}{"invalid-port"},
@@ -1723,7 +1772,7 @@ func TestValidateVersionConfig(t *testing.T) {
 			name: "version with invalid configSchema",
 			version: CatalogItemVersion{
 				Version:    "1.0.0",
-				References: map[string]string{"container": "v1.0.0"},
+				References: map[CatalogItemArtifactType]string{"container": "v1.0.0"},
 				Channels:   []string{"stable"},
 				ConfigSchema: &map[string]interface{}{
 					"$ref": "http://evil.com/schema.json",
@@ -1738,7 +1787,7 @@ func TestValidateVersionConfig(t *testing.T) {
 			name: "version with non-object volume",
 			version: CatalogItemVersion{
 				Version:    "1.0.0",
-				References: map[string]string{"container": "v1.0.0"},
+				References: map[CatalogItemArtifactType]string{"container": "v1.0.0"},
 				Channels:   []string{"stable"},
 				Config: &map[string]interface{}{
 					"volumes": []interface{}{"not-an-object"},
@@ -1776,7 +1825,7 @@ func TestValidateReplacesGraph(t *testing.T) {
 		}
 		return CatalogItemVersion{
 			Version:    version,
-			References: map[string]string{"container": "v" + version},
+			References: map[CatalogItemArtifactType]string{"container": "v" + version},
 			Channels:   []string{"stable"},
 			Replaces:   r,
 		}

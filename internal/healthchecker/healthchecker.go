@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/flightctl/flightctl/internal/instrumentation/tracing"
-	"github.com/flightctl/flightctl/internal/store"
 	"github.com/flightctl/flightctl/internal/util"
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
@@ -20,22 +19,29 @@ const (
 	heartbeatChannelSize = 5000
 )
 
+// DeviceHealthchecker is the narrow device-service surface the healthchecker needs.
+// Defined here so this package does not import internal/service/device (which would
+// create an import cycle: device → healthchecker → device).
+type DeviceHealthchecker interface {
+	HealthcheckDevices(ctx context.Context, orgId uuid.UUID, names []string) error
+}
+
 type Healthchecker struct {
-	log   logrus.FieldLogger
-	store store.Store
-	input chan heartbeatRequest
-	once  sync.Once
+	log     logrus.FieldLogger
+	devices DeviceHealthchecker
+	input   chan heartbeatRequest
+	once    sync.Once
 }
 
 type HealthChecksType struct {
 	util.Singleton[Healthchecker]
 }
 
-func (h *HealthChecksType) Initialize(ctx context.Context, store store.Store, log logrus.FieldLogger) {
+func (h *HealthChecksType) Initialize(ctx context.Context, devices DeviceHealthchecker, log logrus.FieldLogger) {
 	h.GetOrInit(&Healthchecker{
-		log:   log,
-		store: store,
-		input: make(chan heartbeatRequest, heartbeatChannelSize),
+		log:     log,
+		devices: devices,
+		input:   make(chan heartbeatRequest, heartbeatChannelSize),
 	}).Start(ctx)
 }
 
@@ -59,7 +65,7 @@ func (h *Healthchecker) save(ctx context.Context, orgId uuid.UUID, names []strin
 	}
 	ctx, span := startSpan(ctx, "HealthcheckDevice")
 	defer span.End()
-	err := h.store.Device().Healthcheck(ctx, orgId, names)
+	err := h.devices.HealthcheckDevices(ctx, orgId, names)
 	if err != nil {
 		h.log.Errorf("HealthcheckDevice failed for %s: %v", orgId, err)
 	}

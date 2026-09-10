@@ -24,8 +24,36 @@ import (
 	"github.com/flightctl/flightctl/internal/console"
 	"github.com/flightctl/flightctl/internal/crypto"
 	"github.com/flightctl/flightctl/internal/kvstore"
+	"github.com/flightctl/flightctl/internal/rendered"
 	"github.com/flightctl/flightctl/internal/service"
+	authproviderservice "github.com/flightctl/flightctl/internal/service/authprovider"
+	catalogservice "github.com/flightctl/flightctl/internal/service/catalog"
+	certificatesigningrequestservice "github.com/flightctl/flightctl/internal/service/certificatesigningrequest"
+	deviceservice "github.com/flightctl/flightctl/internal/service/device"
+	enrollmentconfigservice "github.com/flightctl/flightctl/internal/service/enrollmentconfig"
+	enrollmentrequestservice "github.com/flightctl/flightctl/internal/service/enrollmentrequest"
+	eventservice "github.com/flightctl/flightctl/internal/service/event"
+	"github.com/flightctl/flightctl/internal/service/events"
+	fleetservice "github.com/flightctl/flightctl/internal/service/fleet"
+	organizationservice "github.com/flightctl/flightctl/internal/service/organization"
+	repositoryservice "github.com/flightctl/flightctl/internal/service/repository"
+	resourcesyncservice "github.com/flightctl/flightctl/internal/service/resourcesync"
+	templateversionservice "github.com/flightctl/flightctl/internal/service/templateversion"
+	"github.com/flightctl/flightctl/internal/service/tpmcsr"
+	vulnerabilityfindingservice "github.com/flightctl/flightctl/internal/service/vulnerabilityfinding"
 	"github.com/flightctl/flightctl/internal/store"
+	authproviderstore "github.com/flightctl/flightctl/internal/store/authprovider"
+	catalogstore "github.com/flightctl/flightctl/internal/store/catalog"
+	certificatesigningrequeststore "github.com/flightctl/flightctl/internal/store/certificatesigningrequest"
+	devicestore "github.com/flightctl/flightctl/internal/store/device"
+	enrollmentrequeststore "github.com/flightctl/flightctl/internal/store/enrollmentrequest"
+	eventstore "github.com/flightctl/flightctl/internal/store/event"
+	fleetstore "github.com/flightctl/flightctl/internal/store/fleet"
+	organizationstore "github.com/flightctl/flightctl/internal/store/organization"
+	repositorystore "github.com/flightctl/flightctl/internal/store/repository"
+	resourcesyncstore "github.com/flightctl/flightctl/internal/store/resourcesync"
+	templateversionstore "github.com/flightctl/flightctl/internal/store/templateversion"
+	vulnerabilityfindingstore "github.com/flightctl/flightctl/internal/store/vulnerabilityfinding"
 	transportv1alpha1 "github.com/flightctl/flightctl/internal/transport/v1alpha1"
 	transportv1beta1 "github.com/flightctl/flightctl/internal/transport/v1beta1"
 	"github.com/flightctl/flightctl/internal/worker_client"
@@ -36,6 +64,7 @@ import (
 	oapimiddleware "github.com/oapi-codegen/nethttp-middleware"
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"gorm.io/gorm"
 )
 
 // customTransportHandler wraps the transport handler to exclude the auth validate endpoint
@@ -53,7 +82,7 @@ func (c *customTransportHandler) AuthValidate(w http.ResponseWriter, r *http.Req
 type Server struct {
 	log                logrus.FieldLogger
 	cfg                *config.Config
-	store              store.Store
+	db                 *gorm.DB
 	ca                 *crypto.CAClient
 	listener           net.Listener
 	queuesProvider     queues.Provider
@@ -66,7 +95,7 @@ type Server struct {
 func New(
 	log logrus.FieldLogger,
 	cfg *config.Config,
-	st store.Store,
+	db *gorm.DB,
 	ca *crypto.CAClient,
 	listener net.Listener,
 	queuesProvider queues.Provider,
@@ -75,7 +104,7 @@ func New(
 	return &Server{
 		log:                log,
 		cfg:                cfg,
-		store:              st,
+		db:                 db,
 		ca:                 ca,
 		listener:           listener,
 		queuesProvider:     queuesProvider,
@@ -144,22 +173,70 @@ func (s *Server) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	defer publisher.Close()
+	deltaPublisher, err := worker_client.DeltaQueuePublisher(ctx, s.queuesProvider)
+	if err != nil {
+		return err
+	}
+	defer deltaPublisher.Close()
 	kvStore, err := kvstore.NewKVStore(ctx, s.log, s.cfg.KV.Hostname, s.cfg.KV.Port, s.cfg.KV.Password)
 	if err != nil {
 		return err
 	}
-	workerClient := worker_client.NewWorkerClient(publisher, s.log)
+	workerClient := worker_client.NewWorkerClient(publisher, s.log, worker_client.WithDeltaPublisher(deltaPublisher))
 
 	s.log.Println("Initializing API server")
 
-	// Create service handler and wrap with tracing
+	// Construct the per-resource stores and service handlers this server needs, each wrapped
+	// with tracing. Cross-resource dependencies always go through the other resource's store,
+	// never its service, to avoid layering cycles (e.g. device depends on fleetStore, not
+	// fleetService).
 	vulnerabilityEnabled := s.cfg.VulnerabilityReporting != nil && s.cfg.VulnerabilityReporting.Enabled
-	baseServiceHandler := service.NewServiceHandler(
-		s.store, workerClient, kvStore, s.ca, s.log, s.cfg.Service.BaseAgentEndpointUrl, s.cfg.Service.BaseUIUrl, s.cfg.Service.TPMCAPaths, vulnerabilityEnabled)
-	serviceHandler := service.WrapWithTracing(baseServiceHandler)
 
-	// Initialize auth with traced service handler for OIDC provider access
-	authN, err := auth.InitMultiAuth(s.cfg, s.log, serviceHandler)
+	deviceStore := devicestore.NewDeviceStore(s.db, s.log.WithField("pkg", "device-store"))
+	fleetStore := fleetstore.NewFleetStore(s.db, s.log.WithField("pkg", "fleet-store"))
+	enrollmentRequestStore := enrollmentrequeststore.NewEnrollmentRequestStore(s.db, s.log.WithField("pkg", "enrollmentrequest-store"))
+	csrStore := certificatesigningrequeststore.NewCertificateSigningRequestStore(s.db, s.log.WithField("pkg", "csr-store"))
+	templateVersionStore := templateversionstore.NewTemplateVersionStore(s.db, s.log.WithField("pkg", "templateversion-store"))
+	repositoryStore := repositorystore.NewRepositoryStore(s.db, s.log.WithField("pkg", "repository-store"))
+	resourceSyncStore := resourcesyncstore.NewResourceSyncStore(s.db, s.log.WithField("pkg", "resourcesync-store"))
+	catalogStore := catalogstore.NewCatalogStore(s.db, s.log.WithField("pkg", "catalog-store"))
+	eventStore := eventstore.NewEventStore(s.db, s.log.WithField("pkg", "event-store"))
+	organizationStore := organizationstore.NewOrganizationStore(s.db)
+	authProviderStore := authproviderstore.NewAuthProviderStore(s.db, s.log.WithField("pkg", "authprovider-store"))
+	vulnerabilityFindingStore := vulnerabilityfindingstore.NewVulnerabilityFindingStore(s.db, s.log.WithField("pkg", "vulnerabilityfinding-store"))
+
+	eventsSvc := events.NewServiceHandler(eventStore, workerClient, s.log)
+
+	deviceSvc := deviceservice.WrapWithTracing(
+		deviceservice.NewDeviceServiceHandler(deviceStore, catalogStore, fleetStore, eventsSvc, kvStore, s.cfg.Service.BaseAgentEndpointUrl, s.log))
+	fleetSvc := fleetservice.WrapWithTracing(
+		fleetservice.NewServiceHandler(fleetStore, catalogStore, eventsSvc, s.log))
+	enrollmentRequestSvc := enrollmentrequestservice.WrapWithTracing(
+		enrollmentrequestservice.NewServiceHandler(enrollmentRequestStore, deviceStore, csrStore, s.ca, kvStore, eventsSvc, s.log, s.cfg.Service.TPMCAPaths, s.cfg.Service.BaseAgentEndpointUrl, s.cfg.Service.BaseUIUrl))
+	csrSvc := certificatesigningrequestservice.WrapWithTracing(
+		certificatesigningrequestservice.NewServiceHandler(csrStore, tpmcsr.NewVerifier(enrollmentRequestSvc), s.ca, eventsSvc, s.log, s.cfg.Service.BaseAgentEndpointUrl, s.cfg.Service.BaseUIUrl))
+	templateVersionSvc := templateversionservice.WrapWithTracing(
+		templateversionservice.NewServiceHandler(templateVersionStore, kvStore, eventsSvc, s.log))
+	repositorySvc := repositoryservice.WrapWithTracing(
+		repositoryservice.NewServiceHandler(repositoryStore, eventsSvc, s.log))
+	catalogSvc := catalogservice.WrapWithTracing(
+		catalogservice.NewServiceHandler(catalogStore, deviceStore, fleetStore, eventsSvc, s.log))
+	resourceSyncSvc := resourcesyncservice.WrapWithTracing(
+		resourcesyncservice.NewServiceHandler(resourceSyncStore, catalogSvc, fleetSvc, eventsSvc, s.log))
+	eventSvc := eventservice.WrapWithTracing(
+		eventservice.NewServiceHandler(eventStore, eventsSvc))
+	organizationSvc := organizationservice.WrapWithTracing(
+		organizationservice.NewServiceHandler(organizationStore))
+	authProviderSvc := authproviderservice.WrapWithTracing(
+		authproviderservice.NewServiceHandler(authProviderStore, eventsSvc, s.log))
+	vulnerabilityFindingSvc := vulnerabilityfindingservice.WrapWithTracing(
+		vulnerabilityfindingservice.NewServiceHandler(vulnerabilityFindingStore, deviceSvc, fleetSvc, eventsSvc, vulnerabilityEnabled, s.log))
+	enrollmentConfigSvc := enrollmentconfigservice.WrapWithTracing(
+		enrollmentconfigservice.NewServiceHandler(csrSvc, s.ca, s.cfg.Service.BaseAgentEndpointUrl, s.cfg.Service.BaseUIUrl))
+
+	// Initialize auth with the authprovider service for OIDC provider access
+	authN, err := auth.InitMultiAuth(s.cfg, s.log, authProviderSvc)
 	if err != nil {
 		return fmt.Errorf("failed initializing auth: %w", err)
 	}
@@ -192,8 +269,8 @@ func (s *Server) Run(ctx context.Context) error {
 	router := chi.NewRouter()
 
 	// Create identity mapping middleware
-	orgProvisioner := service.NewOrgProvisioner(s.store, s.log)
-	identityMapper := service.NewIdentityMapper(s.store, orgProvisioner, s.log)
+	orgProvisioner := service.NewOrgProvisioner(catalogSvc, s.log)
+	identityMapper := service.NewIdentityMapper(organizationSvc, orgProvisioner, s.log)
 	identityMapper.Start()
 	defer identityMapper.Stop()
 	identityMappingMiddleware := fcmiddleware.NewIdentityMappingMiddleware(identityMapper, s.log)
@@ -226,9 +303,10 @@ func (s *Server) Run(ctx context.Context) error {
 	// Create version negotiator with v1beta1 as default
 	negotiator := versioning.NewNegotiator(versioning.V1Beta1, server.MetadataResolver)
 
-	// Create v1beta1 transport handler
 	handlerV1Beta1 := transportv1beta1.NewTransportHandler(
-		serviceHandler, convertv1beta1.NewConverter(),
+		authProviderSvc, csrSvc, deviceSvc, enrollmentRequestSvc, enrollmentConfigSvc, eventSvc,
+		fleetSvc, organizationSvc, repositorySvc, resourceSyncSvc, templateVersionSvc,
+		convertv1beta1.NewConverter(),
 		s.authN, authTokenProxy, authUserInfoProxy, s.authZ,
 	)
 
@@ -266,9 +344,9 @@ func (s *Server) Run(ctx context.Context) error {
 		SilenceServersWarning: true,
 	})
 
-	// Create v1alpha1 transport handler for alpha-stage resources (Catalog)
+	// Create v1alpha1 transport handler for alpha-stage resources (Catalog).
 	handlerV1Alpha1 := transportv1alpha1.NewTransportHandler(
-		serviceHandler, convertv1alpha1.NewConverter(),
+		catalogSvc, vulnerabilityFindingSvc, convertv1alpha1.NewConverter(),
 	)
 
 	routerV1Alpha1 := versioning.NewRouter(versioning.RouterConfig{
@@ -344,7 +422,7 @@ func (s *Server) Run(ctx context.Context) error {
 		if s.cfg != nil && s.cfg.Service != nil && s.cfg.Service.HealthChecks != nil && s.cfg.Service.HealthChecks.Enabled {
 			hc := s.cfg.Service.HealthChecks
 			r.Method(http.MethodGet, hc.ReadinessPath,
-				ReadyzHandler(time.Duration(hc.ReadinessTimeout), s.store, s.queuesProvider))
+				ReadyzHandler(time.Duration(hc.ReadinessTimeout), &store.DBHealthChecker{DB: s.db}, s.queuesProvider))
 			r.Method(http.MethodGet, hc.LivenessPath, HealthzHandler())
 		}
 	})
@@ -360,7 +438,7 @@ func (s *Server) Run(ctx context.Context) error {
 			RateLimitScopeGeneral,
 		)
 
-		consoleSessionManager := console.NewConsoleSessionManager(serviceHandler, s.log, s.consoleEndpointReg)
+		consoleSessionManager := console.NewConsoleSessionManager(deviceSvc, s.log, s.consoleEndpointReg, rendered.Bus.Instance())
 		ws := transportv1beta1.NewWebsocketHandler(s.ca, s.log, consoleSessionManager)
 		ws.RegisterRoutes(r)
 	})

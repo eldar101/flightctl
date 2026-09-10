@@ -36,12 +36,13 @@ var defaultSpecPollConfig = func() poll.Config {
 	}
 }()
 
-// RollbackInfo contains the desired version and spec hash from the rollback
-// spec. These identify the spec we were upgrading to when the rollback was
-// created.
+// RollbackInfo contains the desired version, spec hash, and optional sync error
+// from the rollback spec. These identify the spec we were upgrading to when the
+// rollback was created and, when present, the reason the update failed.
 type RollbackInfo struct {
-	Version  string
-	SpecHash string
+	Version      string
+	SpecHash     string
+	ErrorMessage string
 }
 
 // Watcher provides a way to watch for device spec updates.
@@ -75,11 +76,13 @@ type Manager interface {
 	SetUpgradeFailed(version string, specHash string) error
 	// IsUpdating returns true if the device is in the process of reconciling the desired spec.
 	IsUpgrading() bool
-	// IsOSUpdate returns true if an OS update is in progress by checking the current rendered spec.
-	IsOSUpdate() bool
-	// IsOSUpdatePending returns true if an OS update is specified but the device
-	// has not yet booted into the new image.
-	IsOSUpdatePending(ctx context.Context) (bool, error)
+	// ShouldApplyOSImageUpdate returns true if the agent should run the OS
+	// image update path (desired OS image differs from current). Always false
+	// on package-mode, which has no image manager.
+	ShouldApplyOSImageUpdate() bool
+	// ShouldApplyOSImageUpdatePending returns true if an OS image update is
+	// specified but the device has not yet booted into the new image.
+	ShouldApplyOSImageUpdatePending(ctx context.Context) (bool, error)
 	// CheckOsReconciliation checks if the booted OS image matches the desired OS image.
 	CheckOsReconciliation(ctx context.Context) (string, bool, error)
 	// IsRollingBack returns true if the device is in a rollback state.
@@ -88,10 +91,13 @@ type Manager interface {
 	CreateRollback(ctx context.Context) error
 	// ClearRollback clears the rollback rendered spec.
 	ClearRollback() error
-	// GetRollbackInfo returns the desired version and spec hash stored in
-	// rollback.json. These identify the spec we were upgrading to when the
-	// rollback was created.
+	// GetRollbackInfo returns the desired version, spec hash, and persisted
+	// sync error stored in rollback.json. These identify the spec we were
+	// upgrading to when the rollback was created.
 	GetRollbackInfo() (RollbackInfo, error)
+	// RecordRollbackError stores the sync error that caused a rollback in
+	// rollback.json so the message survives the rollback reboot.
+	RecordRollbackError(ctx context.Context, message string) error
 	// Rollback reverts the device to the state of the rollback rendered spec.
 	Rollback(ctx context.Context, opts ...RollbackOption) error
 	// GetDesired returns the desired rendered device from the management API.

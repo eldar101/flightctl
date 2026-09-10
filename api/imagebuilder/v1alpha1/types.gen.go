@@ -314,6 +314,9 @@ type ImageBuildSpec struct {
 	// Destination ImageBuildDestination specifies the destination for the built image.
 	Destination ImageBuildDestination `json:"destination"`
 
+	// Onboarding When true, installs the flightctl-onboarding RPM and enables flightctl-onboarding-setup.service for first-boot device configuration via a Cockpit-based onboarding wizard. Compatible with both early and late binding. Defaults to false.
+	Onboarding *bool `json:"onboarding,omitempty"`
+
 	// Source ImageBuildSource specifies the source image for the build.
 	Source ImageBuildSource `json:"source"`
 
@@ -572,6 +575,9 @@ type NewCatalogItemTarget struct {
 
 	// CatalogName Name of the parent Catalog resource.
 	CatalogName string `json:"catalogName"`
+
+	// DisplayName Optional human-readable display name for the new CatalogItem.
+	DisplayName *string `json:"displayName,omitempty"`
 
 	// Readme Optional item-level readme for the new CatalogItem. Markdown is supported.
 	Readme *string `json:"readme,omitempty"`

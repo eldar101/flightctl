@@ -45,6 +45,16 @@ data:
             schedule:
               interval: {{ default "2m" .Values.periodic.tasks.resourceSync.schedule.interval }}
           {{ end }}
+          {{ if .Values.periodic.tasks.dependencySync }}
+          dependencySync:
+            schedule:
+              interval: {{ default "3m" .Values.periodic.tasks.dependencySync.schedule.interval }}
+          {{ end }}
+          {{ if .Values.periodic.tasks.repositoryTester }}
+          repositoryTester:
+            schedule:
+              interval: {{ default "2m" .Values.periodic.tasks.repositoryTester.schedule.interval }}
+          {{ end }}
         {{ end }}
     {{ if (default dict .Values.dev).tracing }}
     tracing:
@@ -52,13 +62,19 @@ data:
         endpoint: {{ .Values.dev.tracing.endpoint }}
         insecure: {{ .Values.dev.tracing.insecure }}
     {{ end }}
+{{ include "flightctl.profiling" . | nindent 4 }}
+{{- include "flightctl.encryptionConfig" . | nindent 4 }}
     {{- $vuln := default dict .Values.vulnerabilityReporting }}
     {{- $trustify := default dict $vuln.trustify }}
     {{- $auth := default dict $trustify.auth }}
+    {{- $quay := default dict $vuln.quay }}
     {{- if default false $vuln.enabled }}
     vulnerabilityReporting:
         enabled: true
         syncInterval: {{ $vuln.syncInterval | default "15m" | quote }}
+        {{- if $vuln.backend }}
+        backend: {{ $vuln.backend | quote }}
+        {{- end }}
         {{- if $vuln.trustify }}
         trustify:
             endpoint: {{ $trustify.endpoint | quote }}
@@ -68,6 +84,29 @@ data:
                 {{- if $auth.oidcIssuerUrl }}
                 oidcIssuerUrl: {{ $auth.oidcIssuerUrl | quote }}
                 {{- end }}
+            {{- end }}
+            {{- if $trustify.caCertConfigMapName }}
+            caFile: /etc/ssl/vulnerability/trustify/ca-cert.pem
+            {{- else if $trustify.caFile }}
+            caFile: {{ $trustify.caFile | quote }}
+            {{- end }}
+            {{- if $trustify.skipTlsVerify }}
+            skipTlsVerify: true
+            {{- end }}
+        {{- end }}
+        {{- if $vuln.quay }}
+        quay:
+            endpoint: {{ $quay.endpoint | quote }}
+            {{- if $quay.maxConcurrentRequests }}
+            maxConcurrentRequests: {{ $quay.maxConcurrentRequests }}
+            {{- end }}
+            {{- if $quay.caCertConfigMapName }}
+            caFile: /etc/ssl/vulnerability/quay/ca-cert.pem
+            {{- else if $quay.caFile }}
+            caFile: {{ $quay.caFile | quote }}
+            {{- end }}
+            {{- if $quay.skipTlsVerify }}
+            skipTlsVerify: true
             {{- end }}
         {{- end }}
     {{- end }}

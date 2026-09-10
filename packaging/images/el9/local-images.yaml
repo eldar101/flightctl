@@ -7,6 +7,9 @@ periodic:
 worker:
   image: flightctl-worker-el9
   tag: latest
+delta-worker:
+  image: flightctl-delta-worker-el9
+  tag: latest
 alert-exporter:
   image: flightctl-alert-exporter-el9
   tag: latest
@@ -23,8 +26,8 @@ db-setup:
   image: flightctl-db-setup-el9
   tag: latest
 gateway:
-  image: quay.io/sclorg/nginx-124-c9s
-  tag: "20260422"
+  image: registry.access.redhat.com/ubi9/nginx-124
+  tag: "9.8-1785993104"
 ui:
   # UI images are built from flightctl-ui repo
   image: quay.io/flightctl/flightctl-ui-el9
@@ -55,4 +58,7 @@ telemetry-gateway:
   tag: latest
 userinfo-proxy:
   image: flightctl-userinfo-proxy-el9
+  tag: latest
+remote-access:
+  image: flightctl-remote-access-el9
   tag: latest

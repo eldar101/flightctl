@@ -6,6 +6,7 @@ import (
 
 	apiv1alpha1 "github.com/flightctl/flightctl/api/core/v1alpha1"
 	apiv1beta1 "github.com/flightctl/flightctl/api/core/v1beta1"
+	catalogservice "github.com/flightctl/flightctl/internal/service/catalog"
 	"github.com/flightctl/flightctl/internal/transport"
 )
 
@@ -18,7 +19,7 @@ func (h *TransportHandler) CreateCatalog(w http.ResponseWriter, r *http.Request)
 	}
 
 	domainCatalog := h.converter.Catalog().ToDomain(catalog)
-	body, status := h.serviceHandler.CreateCatalog(r.Context(), transport.OrgIDFromContext(r.Context()), domainCatalog)
+	body, status := catalogservice.CreateCatalogFromUntrusted(r.Context(), h.catalog, transport.OrgIDFromContext(r.Context()), domainCatalog)
 	apiResult := h.converter.Catalog().FromDomain(body)
 	h.SetResponse(w, apiResult, status)
 }
@@ -26,14 +27,14 @@ func (h *TransportHandler) CreateCatalog(w http.ResponseWriter, r *http.Request)
 // (GET /api/v1/catalogs)
 func (h *TransportHandler) ListCatalogs(w http.ResponseWriter, r *http.Request, params apiv1alpha1.ListCatalogsParams) {
 	domainParams := h.converter.Catalog().ListParamsToDomain(params)
-	body, status := h.serviceHandler.ListCatalogs(r.Context(), transport.OrgIDFromContext(r.Context()), domainParams)
+	body, status := h.catalog.ListCatalogs(r.Context(), transport.OrgIDFromContext(r.Context()), domainParams)
 	apiResult := h.converter.Catalog().ListFromDomain(body)
 	h.SetResponse(w, apiResult, status)
 }
 
 // (GET /api/v1/catalogs/{name})
 func (h *TransportHandler) GetCatalog(w http.ResponseWriter, r *http.Request, name string) {
-	body, status := h.serviceHandler.GetCatalog(r.Context(), transport.OrgIDFromContext(r.Context()), name)
+	body, status := h.catalog.GetCatalog(r.Context(), transport.OrgIDFromContext(r.Context()), name)
 	apiResult := h.converter.Catalog().FromDomain(body)
 	h.SetResponse(w, apiResult, status)
 }
@@ -47,14 +48,14 @@ func (h *TransportHandler) ReplaceCatalog(w http.ResponseWriter, r *http.Request
 	}
 
 	domainCatalog := h.converter.Catalog().ToDomain(catalog)
-	body, status := h.serviceHandler.ReplaceCatalog(r.Context(), transport.OrgIDFromContext(r.Context()), name, domainCatalog)
+	body, status := catalogservice.ReplaceCatalogFromUntrusted(r.Context(), h.catalog, transport.OrgIDFromContext(r.Context()), name, domainCatalog, true)
 	apiResult := h.converter.Catalog().FromDomain(body)
 	h.SetResponse(w, apiResult, status)
 }
 
 // (DELETE /api/v1/catalogs/{name})
 func (h *TransportHandler) DeleteCatalog(w http.ResponseWriter, r *http.Request, name string) {
-	status := h.serviceHandler.DeleteCatalog(r.Context(), transport.OrgIDFromContext(r.Context()), name)
+	status := h.catalog.DeleteCatalog(r.Context(), transport.OrgIDFromContext(r.Context()), name, true)
 	h.SetResponse(w, nil, status)
 }
 
@@ -67,14 +68,14 @@ func (h *TransportHandler) PatchCatalog(w http.ResponseWriter, r *http.Request, 
 	}
 
 	domainPatch := h.converter.Common().PatchRequestToDomain(patch)
-	body, status := h.serviceHandler.PatchCatalog(r.Context(), transport.OrgIDFromContext(r.Context()), name, domainPatch)
+	body, status := h.catalog.PatchCatalog(r.Context(), transport.OrgIDFromContext(r.Context()), name, domainPatch, true)
 	apiResult := h.converter.Catalog().FromDomain(body)
 	h.SetResponse(w, apiResult, status)
 }
 
 // (GET /api/v1/catalogs/{name}/status)
 func (h *TransportHandler) GetCatalogStatus(w http.ResponseWriter, r *http.Request, name string) {
-	body, status := h.serviceHandler.GetCatalogStatus(r.Context(), transport.OrgIDFromContext(r.Context()), name)
+	body, status := h.catalog.GetCatalogStatus(r.Context(), transport.OrgIDFromContext(r.Context()), name)
 	apiResult := h.converter.Catalog().FromDomain(body)
 	h.SetResponse(w, apiResult, status)
 }
@@ -88,7 +89,7 @@ func (h *TransportHandler) ReplaceCatalogStatus(w http.ResponseWriter, r *http.R
 	}
 
 	domainCatalog := h.converter.Catalog().ToDomain(catalog)
-	body, status := h.serviceHandler.ReplaceCatalogStatus(r.Context(), transport.OrgIDFromContext(r.Context()), name, domainCatalog)
+	body, status := h.catalog.ReplaceCatalogStatus(r.Context(), transport.OrgIDFromContext(r.Context()), name, domainCatalog)
 	apiResult := h.converter.Catalog().FromDomain(body)
 	h.SetResponse(w, apiResult, status)
 }
@@ -102,7 +103,7 @@ func (h *TransportHandler) PatchCatalogStatus(w http.ResponseWriter, r *http.Req
 	}
 
 	domainPatch := h.converter.Common().PatchRequestToDomain(patch)
-	body, status := h.serviceHandler.PatchCatalogStatus(r.Context(), transport.OrgIDFromContext(r.Context()), name, domainPatch)
+	body, status := h.catalog.PatchCatalogStatus(r.Context(), transport.OrgIDFromContext(r.Context()), name, domainPatch)
 	apiResult := h.converter.Catalog().FromDomain(body)
 	h.SetResponse(w, apiResult, status)
 }
@@ -110,7 +111,7 @@ func (h *TransportHandler) PatchCatalogStatus(w http.ResponseWriter, r *http.Req
 // (GET /api/v1/catalogitems)
 func (h *TransportHandler) ListAllCatalogItems(w http.ResponseWriter, r *http.Request, params apiv1alpha1.ListAllCatalogItemsParams) {
 	domainParams := h.converter.Catalog().ListAllItemsParamsToDomain(params)
-	body, status := h.serviceHandler.ListAllCatalogItems(r.Context(), transport.OrgIDFromContext(r.Context()), domainParams)
+	body, status := h.catalog.ListAllCatalogItems(r.Context(), transport.OrgIDFromContext(r.Context()), domainParams)
 	apiResult := h.converter.Catalog().ItemListFromDomain(body)
 	h.SetResponse(w, apiResult, status)
 }
@@ -118,7 +119,7 @@ func (h *TransportHandler) ListAllCatalogItems(w http.ResponseWriter, r *http.Re
 // (GET /api/v1/catalogs/{name}/items)
 func (h *TransportHandler) ListCatalogItems(w http.ResponseWriter, r *http.Request, name string, params apiv1alpha1.ListCatalogItemsParams) {
 	domainParams := h.converter.Catalog().ListItemsParamsToDomain(params)
-	body, status := h.serviceHandler.ListCatalogItems(r.Context(), transport.OrgIDFromContext(r.Context()), name, domainParams)
+	body, status := h.catalog.ListCatalogItems(r.Context(), transport.OrgIDFromContext(r.Context()), name, domainParams)
 	apiResult := h.converter.Catalog().ItemListFromDomain(body)
 	h.SetResponse(w, apiResult, status)
 }
@@ -132,14 +133,14 @@ func (h *TransportHandler) CreateCatalogItem(w http.ResponseWriter, r *http.Requ
 	}
 
 	domainItem := h.converter.Catalog().ItemToDomain(item)
-	body, status := h.serviceHandler.CreateCatalogItem(r.Context(), transport.OrgIDFromContext(r.Context()), name, domainItem)
+	body, status := catalogservice.CreateCatalogItemFromUntrusted(r.Context(), h.catalog, transport.OrgIDFromContext(r.Context()), name, domainItem)
 	apiResult := h.converter.Catalog().ItemFromDomain(body)
 	h.SetResponse(w, apiResult, status)
 }
 
 // (GET /api/v1/catalogs/{name}/items/{item})
 func (h *TransportHandler) GetCatalogItem(w http.ResponseWriter, r *http.Request, name string, item string) {
-	body, status := h.serviceHandler.GetCatalogItem(r.Context(), transport.OrgIDFromContext(r.Context()), name, item)
+	body, status := h.catalog.GetCatalogItem(r.Context(), transport.OrgIDFromContext(r.Context()), name, item)
 	apiResult := h.converter.Catalog().ItemFromDomain(body)
 	h.SetResponse(w, apiResult, status)
 }
@@ -153,7 +154,7 @@ func (h *TransportHandler) ReplaceCatalogItem(w http.ResponseWriter, r *http.Req
 	}
 
 	domainItem := h.converter.Catalog().ItemToDomain(item)
-	body, status := h.serviceHandler.ReplaceCatalogItem(r.Context(), transport.OrgIDFromContext(r.Context()), name, itemName, domainItem)
+	body, status := catalogservice.ReplaceCatalogItemFromUntrusted(r.Context(), h.catalog, transport.OrgIDFromContext(r.Context()), name, itemName, domainItem, true)
 	apiResult := h.converter.Catalog().ItemFromDomain(body)
 	h.SetResponse(w, apiResult, status)
 }
@@ -167,13 +168,20 @@ func (h *TransportHandler) PatchCatalogItem(w http.ResponseWriter, r *http.Reque
 	}
 
 	domainPatch := h.converter.Common().PatchRequestToDomain(patch)
-	body, status := h.serviceHandler.PatchCatalogItem(r.Context(), transport.OrgIDFromContext(r.Context()), name, itemName, domainPatch)
+	body, status := h.catalog.PatchCatalogItem(r.Context(), transport.OrgIDFromContext(r.Context()), name, itemName, domainPatch, true)
 	apiResult := h.converter.Catalog().ItemFromDomain(body)
 	h.SetResponse(w, apiResult, status)
 }
 
 // (DELETE /api/v1/catalogs/{name}/items/{item})
 func (h *TransportHandler) DeleteCatalogItem(w http.ResponseWriter, r *http.Request, name string, item string) {
-	status := h.serviceHandler.DeleteCatalogItem(r.Context(), transport.OrgIDFromContext(r.Context()), name, item)
+	status := h.catalog.DeleteCatalogItem(r.Context(), transport.OrgIDFromContext(r.Context()), name, item, true)
 	h.SetResponse(w, nil, status)
+}
+
+func (h *TransportHandler) GetCatalogItemDeployments(w http.ResponseWriter, r *http.Request, catalog string, item string, params apiv1alpha1.GetCatalogItemDeploymentsParams) {
+	domainParams := h.converter.Catalog().ListDeploymentParamsToDomain(params)
+	body, status := h.catalog.GetCatalogItemDeployments(r.Context(), transport.OrgIDFromContext(r.Context()), catalog, item, domainParams)
+	apiResult := h.converter.Catalog().DeploymentListFromDomain(body)
+	h.SetResponse(w, apiResult, status)
 }

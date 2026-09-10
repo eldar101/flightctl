@@ -9,11 +9,23 @@ IMAGE_REPO="${IMAGE_REPO:-quay.io/flightctl/flightctl-device}"
 CACHE_IMAGE_REPO="${CACHE_IMAGE_REPO:-quay.io/flightctl-tests/flightctl-device-cache}"
 APP_REPO="${APP_REPO:-quay.io/flightctl}"
 AGENT_OS_ID="${AGENT_OS_ID:-cs9-bootc}"
-VARIANTS="${VARIANTS:-v2 v3 v4 v5 v6 v7 v8 v9 v10 v11 v12}"
+VARIANTS="${VARIANTS:-v2 v3 v4 v5 v6 v7 v8 v9 v10 v11 v12 package}"
+
+current_tree_state() {
+  (cd "${ROOT_DIR}" && {
+    if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      echo "clean"
+    elif [ -z "$(git status --porcelain)" ]; then
+      echo "clean"
+    else
+      echo "dirty"
+    fi
+  })
+}
 
 SOURCE_GIT_TAG="${SOURCE_GIT_TAG:-$(${ROOT_DIR}/hack/current-version)}"
-SOURCE_GIT_TREE_STATE="${SOURCE_GIT_TREE_STATE:-$(cd "${ROOT_DIR}" && ( ( [ ! -d ".git" ] || git diff --quiet ) && echo "clean" ) || echo "dirty")}"
-SOURCE_GIT_COMMIT="${SOURCE_GIT_COMMIT:-$(cd "${ROOT_DIR}" && git rev-parse --short "HEAD^{commit}" 2>/dev/null) || echo "unknown"}"
+SOURCE_GIT_TREE_STATE="${SOURCE_GIT_TREE_STATE:-$(current_tree_state)}"
+SOURCE_GIT_COMMIT="${SOURCE_GIT_COMMIT:-$( (cd "${ROOT_DIR}" && git rev-parse "HEAD^{commit}" 2>/dev/null || echo "unknown") | cut -c1-9)}"
 TAG="${TAG:-$SOURCE_GIT_TAG}"
 
 PODMAN_LOG_LEVEL="${PODMAN_LOG_LEVEL:-info}"
@@ -117,9 +129,15 @@ case "${AGENT_OS_ID}" in
     CONTAINERFILE_DIR="${BASE_DIR}/containerfiles/cs10-bootc${DISTRO_SUFFIX}"
     OS_ID="cs10-bootc"
     ;;
+  fedora-bootc)
+    # Fedora onboarding flavor: only source of a usable mac80211_hwsim radio for
+    # the onboarding WiFi specs (cs9/cs10 kernels filter it out). No -redhat variant.
+    CONTAINERFILE_DIR="${BASE_DIR}/containerfiles/fedora-bootc"
+    OS_ID="fedora-bootc"
+    ;;
   *)
     echo "[ERROR] Unsupported AGENT_OS_ID: ${AGENT_OS_ID}" >&2
-    echo "Supported values: cs9-bootc, cs10-bootc" >&2
+    echo "Supported values: cs9-bootc, cs10-bootc, fedora-bootc" >&2
     exit 1
     ;;
 esac
@@ -215,7 +233,7 @@ echo "  Variants to build: ${variants_list:-none}"
         --build-context "variant-context='"${BASE_DIR}"'/variants/{}" \
         --build-context "common='"${BASE_DIR}"'/common" \
         --build-arg BASE_IMAGE="'"${base_img_canonical}"'" \
-        --label "io.flightctl.e2e.component=app" \
+        --label "io.flightctl.e2e.component=device" \
         -f "'"${BASE_DIR}"'/variants/{}/Containerfile" \
         -t "$v_img_canonical" \
         -t "$v_img_plain" \

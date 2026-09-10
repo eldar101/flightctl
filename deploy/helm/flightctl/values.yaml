@@ -26,7 +26,10 @@ global:
   baseDomain: ""
   # -- Secret containing TLS ca/cert/key. It should be valid for *.${baseDomain}. This certificate is only used for non-mTLS endpoints, mTLS endpoints like agent-api, etc will use different certificates.
   baseDomainTlsSecretName: ""
-  # -- Storage class name for the PVCs. Keep empty to use the default storage class.
+  # -- Storage class name for the PVCs. Keep empty to use the default storage class. Note: for a component
+  # that also sets volumeName or selector.matchLabels for static PV binding, leaving this empty makes the
+  # chart render storageClassName: "" for that PVC instead of omitting the field — see the volumeName
+  # comments below.
   storageClassName: ""
   # -- Name of the secret that holds image pull secret for accessing private container registries
   imagePullSecretName: ""
@@ -187,6 +190,11 @@ db:
     fsGroup: ""
     # -- Additional labels for DB PVCs.
     additionalPVCLabels: null
+    # -- Name of a specific pre-provisioned PersistentVolume to bind this PVC to. Only takes effect when the PVC is first created — changing this on an already-bound PVC will make `helm upgrade` fail, because Kubernetes forbids mutating volumeName after creation. Leave empty for normal (dynamic or best-fit static) binding. Note: the target PV's capacity must be >= `storage.size` above, or binding will fail. Setting this (or selector.matchLabels below) also makes the chart render storageClassName: "" on this PVC when global.storageClassName is left empty, so a cluster-default StorageClass can't get injected and mismatch the target PV.
+    volumeName: ""
+    selector:
+      # -- Label selector for binding this PVC to a pre-provisioned PersistentVolume by matching labels on the PV. Same immutability caveat as volumeName applies. Leave empty to disable label-based selection.
+      matchLabels: {}
   external:
     # -- External database hostname
     hostname: ""
@@ -206,22 +214,22 @@ db:
 # -- Key-Value Store Configuration
 kv:
   image:
-    # -- Redis container image
-    image: quay.io/sclorg/redis-7-c9s
-    # -- Redis image tag
-    tag: "20250108"
-    # -- Image pull policy for Redis container
+    # -- Valkey container image
+    image: quay.io/sclorg/valkey-8-c10s
+    # -- Valkey image tag
+    tag: "20260121"
+    # -- Image pull policy for Valkey container
     pullPolicy: ""
-  # -- Secret containing password for Redis password (leave empty for auto-generation)
+  # -- Secret containing password for Valkey (leave empty for auto-generation)
   passwordSecretName: ""
-  # -- Redis log level (debug, verbose, notice, warning)
+  # -- Valkey log level (debug, verbose, notice, warning)
   loglevel: warning
-  # -- File system group ID for Redis pod security context
+  # -- File system group ID for Valkey pod security context
   fsGroup: ""
-  # Memory management for in-memory Redis
-  # -- Maximum memory usage for Redis
+  # Memory management for in-memory Valkey
+  # -- Maximum memory usage for Valkey
   maxmemory: "1gb"
-  # -- Redis memory eviction policy
+  # -- Valkey memory eviction policy
   maxmemoryPolicy: "allkeys-lru"
 
 # -- Alertmanager Configuration
@@ -239,6 +247,11 @@ alertmanager:
   additionalRouteLabels: null
   # -- Additional labels for Alert Manager PVCs.
   additionalPVCLabels: null
+  # -- Name of a specific pre-provisioned PersistentVolume to bind this PVC to. Only takes effect when the PVC is first created — changing this on an already-bound PVC will make `helm upgrade` fail, because Kubernetes forbids mutating volumeName after creation. Leave empty for normal (dynamic or best-fit static) binding. Note: the target PV's capacity must be >= the fixed `2Gi` this PVC requests, or binding will fail. Setting this (or selector.matchLabels below) also makes the chart render storageClassName: "" on this PVC when global.storageClassName is left empty, so a cluster-default StorageClass can't get injected and mismatch the target PV.
+  volumeName: ""
+  selector:
+    # -- Label selector for binding this PVC to a pre-provisioned PersistentVolume by matching labels on the PV. Same immutability caveat as volumeName applies. Leave empty to disable label-based selection.
+    matchLabels: {}
 
 
 # -- API Server Configuration
@@ -301,6 +314,34 @@ worker:
     pullPolicy: ""
   # -- Allow flightctl-worker to access secrets at the cluster level for embedding in device configs
   clusterLevelSecretAccess: false
+  # -- Time budget for a single device render operation including VM conversion and DB writes (default "60s")
+  renderTimeout: "60s"
+  # -- VM application render options passed to vm-to-quadlet
+  vmRender:
+    # -- virt-launcher image used when converting VmApplications to Quadlet units (leave empty to use the worker default)
+    launcherImage: ""
+    # -- virt-launcher images keyed by os-release ID and major from status.systemInfo (e.g. "rhel-9", "rhel-10")
+    launcherImages: {}
+    # -- Enable passt networking workarounds for older virt-launcher images (default false; enable only for older images)
+    passtWorkarounds: false
+
+# -- Delta-worker Configuration
+deltaWorker:
+  image:
+    # -- Delta-worker container image
+    image: quay.io/flightctl/flightctl-delta-worker-el9
+    # -- Delta-worker image tag
+    tag: ""
+    # -- Image pull policy for delta-worker container
+    pullPolicy: ""
+  # -- Resource requests and limits for the delta-worker container
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "256Mi"
+    limits:
+      cpu: "2"
+      memory: "2Gi"
 
 # -- Periodic Configuration
 periodic:
@@ -321,6 +362,30 @@ periodic:
     enabled: true
     # -- Address for the metrics HTTP server
     address: ":15690"
+
+# -- Remote Access Configuration
+remoteAccess:
+  # -- Enable remote access service
+  enabled: true
+  # -- Log level for the remote access service
+  logLevel: info
+  image:
+    # -- Remote access container image
+    image: quay.io/flightctl/flightctl-remote-access-el9
+    # -- Remote access image tag (leave empty to use chart appVersion)
+    tag: ""
+    # -- Image pull policy for remote access container
+    pullPolicy: ""
+  # -- Additional environment variables for the remote access container
+  env: {}
+  # -- Resource requests and limits for the remote access container
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "256Mi"
 
 # -- Alert Exporter Configuration
 alertExporter:
@@ -345,7 +410,17 @@ alertmanagerProxy:
     tag: ""
     # -- Image pull policy for Alertmanager proxy container
     pullPolicy: ""
-  
+
+# -- UBI Minimal base image used by init containers (cert setup, etc.)
+# Override this when deploying in an air-gapped environment where
+# registry.access.redhat.com is unreachable — set image and tag to the
+# mirrored location produced by the flightctl-mirror-images tool.
+ubiMinimal:
+  # -- UBI minimal image repository
+  image: registry.access.redhat.com/ubi9/ubi-minimal
+  # -- UBI minimal image tag (pinned to avoid unexpected updates)
+  tag: "9.7-1763362218"
+
 # -- ImageBuilder API Configuration
 imageBuilderApi:
   # -- Enable imagebuilder API service
@@ -387,6 +462,11 @@ imageBuilderWorker:
   rhsmCaSecretName: ""
   # -- Builder images (podman, bootc-image-builder, syft) and skip-TLS options
   serviceImages:
+    # -- Secret name containing registry credentials (auth.json) for pulling builder service images.
+    # Required when serviceImages are hosted in an authenticated or air-gapped registry.
+    # The secret must contain a key named `auth.json` in standard podman/Docker auth format.
+    # Mounted read-only at /root/.config/containers/auth.json inside the worker container.
+    pullSecretName: ""
     podman:
       # -- Podman builder image (leave empty to use default).
       image: ""
@@ -425,6 +505,33 @@ telemetryGateway:
     # -- Image pull policy for Telemetry gateway container
     pullPolicy: ""
   additionalRouteLabels: null
+  # -- Extra environment variables for the telemetry gateway container.
+  # Use to inject secrets for forward header values via ${VAR} expansion.
+  extraEnvs: []
+  # -- Extra volume mounts for the telemetry gateway container.
+  # Use to mount TLS certificates for mTLS forward connections.
+  extraVolumeMounts: []
+  # -- Extra volumes for the telemetry gateway pod.
+  extraVolumes: []
+  # -- Forward telemetry to an upstream OTLP collector.
+  # Uses OTLP/gRPC for bare host:port endpoints, OTLP/HTTP for http(s):// URLs.
+  # Header values support ${ENV_VAR} expansion for secret injection.
+  forward:
+    # -- Upstream OTLP endpoint (e.g. "collector:4317" for gRPC, "https://host/api/v2/otlp" for HTTP)
+    endpoint: ""
+    # -- Custom HTTP headers for authentication (only used with OTLP/HTTP endpoints).
+    # Values support ${ENV_VAR} expansion — use extraEnvs with secretKeyRef to avoid
+    # storing tokens in the ConfigMap.
+    headers: {}
+    tls:
+      # -- Skip TLS certificate verification
+      insecureSkipTlsVerify: false
+      # -- Path to CA certificate file
+      caFile: ""
+      # -- Path to client certificate file (for mTLS)
+      certFile: ""
+      # -- Path to client key file (for mTLS)
+      keyFile: ""
 
 # -- UI Configuration
 ui:
@@ -493,6 +600,8 @@ vulnerabilityReporting:
   enabled: false
   # -- Sync interval for periodic Trustify fetch (e.g. "15m", "1h").
   syncInterval: "15m"
+  # -- Vulnerability scanning backend ("trustify" or "quay"); leave empty to default to Trustify when a trustify config with a non-empty endpoint is present.
+  backend: ""
   trustify:
     # -- Trustify API base URL (do not include /api/v1 or /api/v2 paths).
     endpoint: ""
@@ -503,6 +612,48 @@ vulnerabilityReporting:
       oidcIssuerUrl: ""
       # -- Name of the Kubernetes Secret containing 'client_id' and 'client_secret' keys.
       secretName: ""
+    # -- Path to a CA bundle for verifying the Trustify server certificate. If unset, system roots are used.
+    caFile: ""
+    # -- Name of a ConfigMap containing key 'ca-cert.pem' with the CA bundle for the Trustify server. When set, it is mounted and used instead of caFile.
+    caCertConfigMapName: ""
+    # -- Skip TLS certificate verification (insecure, for lab/air-gap only). Defaults to false.
+    skipTlsVerify: false
+  quay:
+    # -- Quay API base URL (e.g. "https://quay.io").
+    endpoint: ""
+    # -- Name of the Kubernetes Secret containing the 'token' key for Quay Security API bearer authentication.
+    secretName: ""
+    # -- Maximum number of concurrent Quay API requests. Defaults to 5 when unset.
+    maxConcurrentRequests: 5
+    # -- Path to a CA bundle for verifying the Quay server certificate. If unset, system roots are used.
+    caFile: ""
+    # -- Name of a ConfigMap containing key 'ca-cert.pem' with the CA bundle for the Quay server. When set, it is mounted and used instead of caFile.
+    caCertConfigMapName: ""
+    # -- Skip TLS certificate verification (insecure, for lab/air-gap only). Defaults to false.
+    skipTlsVerify: false
+
+# -- Default OCI write target for generated deltas when an organization has no deltaStorageTarget Repository.
+# Username and password must come from the Secret named in secretName (keys: username, password); they are not written to config.yaml.
+deltaGeneration:
+  defaultRepository:
+    # -- Registry hostname used as the login/CA host and as the prefix of the push path.
+    registry: ""
+    # -- Optional repository path under registry (e.g. my-org/diffs). Mutually exclusive with namespace.
+    repository: ""
+    # -- Optional namespace under registry (e.g. my-org). Mutually exclusive with repository.
+    namespace: ""
+    # -- URL scheme for connecting to the registry. Allowed values: http, https.
+    scheme: ""
+    # -- Skip TLS verification when connecting to the registry.
+    skipServerVerification: false
+    # -- Base64-encoded PEM of a custom registry CA (same encoding as Repository spec ca.crt).
+    caCrt: ""
+    # -- Name of the Kubernetes Secret containing 'username' and 'password' keys.
+    secretName: ""
+  # -- Maximum number of concurrent delta generation jobs. Defaults to 2 when omitted or <= 0.
+  maxConcurrentDeltaGenerations: 2
+  # -- Per-job timeout for oci-delta/ORAS. Defaults to 30m when omitted or <= 0.
+  timeout: 30m
 
 # -- Upgrade hooks
 upgradeHooks:
@@ -513,7 +664,20 @@ upgradeHooks:
     deployments:
       - flightctl-periodic
       - flightctl-worker
+      - flightctl-delta-worker
     # -- Timeout in seconds to wait for rollout per Deployment
     timeoutSeconds: 120
   # -- Enable pre-upgrade DB migration dry-run as a hook
   databaseMigrationDryRun: true
+
+# -- Encryption-at-rest key configuration.
+# The flightctl-encryption-key Secret is mounted at /root/.flightctl/encryption/ in all services.
+# Each key entry maps a logical key ID to a filename within that Secret.
+# For key rotation: add a new key file to the Secret, add it here, then change activeKeyID.
+encryption:
+  # -- Key ID used for new encryptions. Must match one of the IDs in the keys list.
+  activeKeyID: "default"
+  # -- List of available encryption keys. Old keys remain available for decryption during rotation.
+  keys:
+    - id: "default"
+      file: "key"

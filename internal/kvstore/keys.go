@@ -2,6 +2,7 @@ package kvstore
 
 import (
 	"crypto/md5" //nolint: gosec
+	"crypto/sha256"
 	"fmt"
 
 	"github.com/google/uuid"
@@ -77,6 +78,21 @@ func (k *HttpKey) ComposeKey() string {
 	return fmt.Sprintf("v1/%s/%s/%s/http-data/%x", k.OrgID, k.Fleet, k.TemplateVersion, md5sum)
 }
 
+// HttpFingerprintKey stores the ETag/Last-Modified fingerprint alongside the
+// cached HTTP body so stale entries can be detected on DependencyChangeDetected
+// without changing the HttpKey format.
+type HttpFingerprintKey struct {
+	OrgID           uuid.UUID
+	Fleet           string
+	TemplateVersion string
+	URL             string
+}
+
+func (k *HttpFingerprintKey) ComposeKey() string {
+	md5sum := md5.Sum([]byte(k.URL)) //nolint: gosec
+	return fmt.Sprintf("v1/%s/%s/%s/http-fingerprint/%x", k.OrgID, k.Fleet, k.TemplateVersion, md5sum)
+}
+
 type DeviceKey struct {
 	OrgID      uuid.UUID
 	DeviceName string
@@ -93,4 +109,25 @@ type AwaitingReconnectionKey struct {
 
 func (a *AwaitingReconnectionKey) ComposeKey() string {
 	return fmt.Sprintf("v1/%s/device/%s/awaiting-reconnect", a.OrgID, a.DeviceName)
+}
+
+// VmQuadletFilesKey is a content-addressed KV key for caching the Quadlet unit
+// files produced by vm-to-quadlet. The key is global (not scoped to
+// org/fleet/templateVersion) because the conversion is deterministic: the same
+// vm.yaml input and render options always produce the same Quadlet files. The
+// cached value is a JSON-encoded map[string]string (filename → content).
+type VmQuadletFilesKey struct{}
+
+func (k *VmQuadletFilesKey) ComposeKey(vmYAML []byte, launcherImage string, passtWorkarounds bool) string {
+	h := sha256.New()
+	_, _ = h.Write(vmYAML)
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(launcherImage))
+	_, _ = h.Write([]byte{0})
+	if passtWorkarounds {
+		_, _ = h.Write([]byte("passt=1"))
+	} else {
+		_, _ = h.Write([]byte("passt=0"))
+	}
+	return fmt.Sprintf("v1/vm-quadlet-files/%x", h.Sum(nil))
 }

@@ -93,6 +93,15 @@ type ServerInterface interface {
 	// (PUT /devices/{name})
 	ReplaceDevice(w http.ResponseWriter, r *http.Request, name string)
 
+	// (POST /devices/{name}/applications/{appname}/actions/restart)
+	RestartDeviceApplication(w http.ResponseWriter, r *http.Request, name string, appname string)
+
+	// (POST /devices/{name}/applications/{appname}/actions/start)
+	StartDeviceApplication(w http.ResponseWriter, r *http.Request, name string, appname string)
+
+	// (POST /devices/{name}/applications/{appname}/actions/stop)
+	StopDeviceApplication(w http.ResponseWriter, r *http.Request, name string, appname string)
+
 	// (PUT /devices/{name}/decommission)
 	DecommissionDevice(w http.ResponseWriter, r *http.Request, name string)
 
@@ -174,6 +183,12 @@ type ServerInterface interface {
 	// (PUT /fleets/{name})
 	ReplaceFleet(w http.ResponseWriter, r *http.Request, name string)
 
+	// (POST /fleets/{name}/applications/{appname}/actions/start)
+	StartFleetApplication(w http.ResponseWriter, r *http.Request, name string, appname string)
+
+	// (POST /fleets/{name}/applications/{appname}/actions/stop)
+	StopFleetApplication(w http.ResponseWriter, r *http.Request, name string, appname string)
+
 	// (GET /fleets/{name}/status)
 	GetFleetStatus(w http.ResponseWriter, r *http.Request, name string)
 
@@ -233,6 +248,12 @@ type ServerInterface interface {
 
 	// (GET /version)
 	GetVersion(w http.ResponseWriter, r *http.Request)
+
+	// (GET /ws/v1/devices/{name}/applications/{appname}/console)
+	GetDeviceApplicationConsole(w http.ResponseWriter, r *http.Request, name string, appname string, params GetDeviceApplicationConsoleParams)
+
+	// (GET /ws/v1/devices/{name}/console)
+	GetDeviceConsole(w http.ResponseWriter, r *http.Request, name string)
 }
 
 // Unimplemented server implementation that returns http.StatusNotImplemented for each endpoint.
@@ -361,6 +382,21 @@ func (_ Unimplemented) PatchDevice(w http.ResponseWriter, r *http.Request, name 
 
 // (PUT /devices/{name})
 func (_ Unimplemented) ReplaceDevice(w http.ResponseWriter, r *http.Request, name string) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// (POST /devices/{name}/applications/{appname}/actions/restart)
+func (_ Unimplemented) RestartDeviceApplication(w http.ResponseWriter, r *http.Request, name string, appname string) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// (POST /devices/{name}/applications/{appname}/actions/start)
+func (_ Unimplemented) StartDeviceApplication(w http.ResponseWriter, r *http.Request, name string, appname string) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// (POST /devices/{name}/applications/{appname}/actions/stop)
+func (_ Unimplemented) StopDeviceApplication(w http.ResponseWriter, r *http.Request, name string, appname string) {
 	w.WriteHeader(http.StatusNotImplemented)
 }
 
@@ -499,6 +535,16 @@ func (_ Unimplemented) ReplaceFleet(w http.ResponseWriter, r *http.Request, name
 	w.WriteHeader(http.StatusNotImplemented)
 }
 
+// (POST /fleets/{name}/applications/{appname}/actions/start)
+func (_ Unimplemented) StartFleetApplication(w http.ResponseWriter, r *http.Request, name string, appname string) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// (POST /fleets/{name}/applications/{appname}/actions/stop)
+func (_ Unimplemented) StopFleetApplication(w http.ResponseWriter, r *http.Request, name string, appname string) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
 // (GET /fleets/{name}/status)
 func (_ Unimplemented) GetFleetStatus(w http.ResponseWriter, r *http.Request, name string) {
 	w.WriteHeader(http.StatusNotImplemented)
@@ -597,6 +643,16 @@ func (_ Unimplemented) ReplaceResourceSync(w http.ResponseWriter, r *http.Reques
 
 // (GET /version)
 func (_ Unimplemented) GetVersion(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// (GET /ws/v1/devices/{name}/applications/{appname}/console)
+func (_ Unimplemented) GetDeviceApplicationConsole(w http.ResponseWriter, r *http.Request, name string, appname string, params GetDeviceApplicationConsoleParams) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// (GET /ws/v1/devices/{name}/console)
+func (_ Unimplemented) GetDeviceConsole(w http.ResponseWriter, r *http.Request, name string) {
 	w.WriteHeader(http.StatusNotImplemented)
 }
 
@@ -1257,6 +1313,108 @@ func (siw *ServerInterfaceWrapper) ReplaceDevice(w http.ResponseWriter, r *http.
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.ReplaceDevice(w, r, name)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// RestartDeviceApplication operation middleware
+func (siw *ServerInterfaceWrapper) RestartDeviceApplication(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// ------------- Path parameter "name" -------------
+	var name string
+
+	err = runtime.BindStyledParameterWithOptions("simple", "name", chi.URLParam(r, "name"), &name, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "name", Err: err})
+		return
+	}
+
+	// ------------- Path parameter "appname" -------------
+	var appname string
+
+	err = runtime.BindStyledParameterWithOptions("simple", "appname", chi.URLParam(r, "appname"), &appname, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "appname", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.RestartDeviceApplication(w, r, name, appname)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// StartDeviceApplication operation middleware
+func (siw *ServerInterfaceWrapper) StartDeviceApplication(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// ------------- Path parameter "name" -------------
+	var name string
+
+	err = runtime.BindStyledParameterWithOptions("simple", "name", chi.URLParam(r, "name"), &name, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "name", Err: err})
+		return
+	}
+
+	// ------------- Path parameter "appname" -------------
+	var appname string
+
+	err = runtime.BindStyledParameterWithOptions("simple", "appname", chi.URLParam(r, "appname"), &appname, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "appname", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.StartDeviceApplication(w, r, name, appname)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// StopDeviceApplication operation middleware
+func (siw *ServerInterfaceWrapper) StopDeviceApplication(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// ------------- Path parameter "name" -------------
+	var name string
+
+	err = runtime.BindStyledParameterWithOptions("simple", "name", chi.URLParam(r, "name"), &name, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "name", Err: err})
+		return
+	}
+
+	// ------------- Path parameter "appname" -------------
+	var appname string
+
+	err = runtime.BindStyledParameterWithOptions("simple", "appname", chi.URLParam(r, "appname"), &appname, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "appname", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.StopDeviceApplication(w, r, name, appname)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -2082,6 +2240,74 @@ func (siw *ServerInterfaceWrapper) ReplaceFleet(w http.ResponseWriter, r *http.R
 	handler.ServeHTTP(w, r)
 }
 
+// StartFleetApplication operation middleware
+func (siw *ServerInterfaceWrapper) StartFleetApplication(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// ------------- Path parameter "name" -------------
+	var name string
+
+	err = runtime.BindStyledParameterWithOptions("simple", "name", chi.URLParam(r, "name"), &name, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "name", Err: err})
+		return
+	}
+
+	// ------------- Path parameter "appname" -------------
+	var appname string
+
+	err = runtime.BindStyledParameterWithOptions("simple", "appname", chi.URLParam(r, "appname"), &appname, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "appname", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.StartFleetApplication(w, r, name, appname)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// StopFleetApplication operation middleware
+func (siw *ServerInterfaceWrapper) StopFleetApplication(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// ------------- Path parameter "name" -------------
+	var name string
+
+	err = runtime.BindStyledParameterWithOptions("simple", "name", chi.URLParam(r, "name"), &name, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "name", Err: err})
+		return
+	}
+
+	// ------------- Path parameter "appname" -------------
+	var appname string
+
+	err = runtime.BindStyledParameterWithOptions("simple", "appname", chi.URLParam(r, "appname"), &appname, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "appname", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.StopFleetApplication(w, r, name, appname)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
 // GetFleetStatus operation middleware
 func (siw *ServerInterfaceWrapper) GetFleetStatus(w http.ResponseWriter, r *http.Request) {
 
@@ -2636,6 +2862,91 @@ func (siw *ServerInterfaceWrapper) GetVersion(w http.ResponseWriter, r *http.Req
 	handler.ServeHTTP(w, r)
 }
 
+// GetDeviceApplicationConsole operation middleware
+func (siw *ServerInterfaceWrapper) GetDeviceApplicationConsole(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// ------------- Path parameter "name" -------------
+	var name string
+
+	err = runtime.BindStyledParameterWithOptions("simple", "name", chi.URLParam(r, "name"), &name, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "name", Err: err})
+		return
+	}
+
+	// ------------- Path parameter "appname" -------------
+	var appname string
+
+	err = runtime.BindStyledParameterWithOptions("simple", "appname", chi.URLParam(r, "appname"), &appname, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "appname", Err: err})
+		return
+	}
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params GetDeviceApplicationConsoleParams
+
+	// ------------- Required query parameter "consoleType" -------------
+
+	if paramValue := r.URL.Query().Get("consoleType"); paramValue != "" {
+
+	} else {
+		siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "consoleType"})
+		return
+	}
+
+	err = runtime.BindQueryParameter("form", true, true, "consoleType", r.URL.Query(), &params.ConsoleType)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "consoleType", Err: err})
+		return
+	}
+
+	// ------------- Optional query parameter "force" -------------
+
+	err = runtime.BindQueryParameter("form", true, false, "force", r.URL.Query(), &params.Force)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "force", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.GetDeviceApplicationConsole(w, r, name, appname, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// GetDeviceConsole operation middleware
+func (siw *ServerInterfaceWrapper) GetDeviceConsole(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// ------------- Path parameter "name" -------------
+	var name string
+
+	err = runtime.BindStyledParameterWithOptions("simple", "name", chi.URLParam(r, "name"), &name, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "name", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.GetDeviceConsole(w, r, name)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
 type UnescapedCookieParamError struct {
 	ParamName string
 	Err       error
@@ -2825,6 +3136,15 @@ func HandlerWithOptions(si ServerInterface, options ChiServerOptions) http.Handl
 		r.Put(options.BaseURL+"/devices/{name}", wrapper.ReplaceDevice)
 	})
 	r.Group(func(r chi.Router) {
+		r.Post(options.BaseURL+"/devices/{name}/applications/{appname}/actions/restart", wrapper.RestartDeviceApplication)
+	})
+	r.Group(func(r chi.Router) {
+		r.Post(options.BaseURL+"/devices/{name}/applications/{appname}/actions/start", wrapper.StartDeviceApplication)
+	})
+	r.Group(func(r chi.Router) {
+		r.Post(options.BaseURL+"/devices/{name}/applications/{appname}/actions/stop", wrapper.StopDeviceApplication)
+	})
+	r.Group(func(r chi.Router) {
 		r.Put(options.BaseURL+"/devices/{name}/decommission", wrapper.DecommissionDevice)
 	})
 	r.Group(func(r chi.Router) {
@@ -2906,6 +3226,12 @@ func HandlerWithOptions(si ServerInterface, options ChiServerOptions) http.Handl
 		r.Put(options.BaseURL+"/fleets/{name}", wrapper.ReplaceFleet)
 	})
 	r.Group(func(r chi.Router) {
+		r.Post(options.BaseURL+"/fleets/{name}/applications/{appname}/actions/start", wrapper.StartFleetApplication)
+	})
+	r.Group(func(r chi.Router) {
+		r.Post(options.BaseURL+"/fleets/{name}/applications/{appname}/actions/stop", wrapper.StopFleetApplication)
+	})
+	r.Group(func(r chi.Router) {
 		r.Get(options.BaseURL+"/fleets/{name}/status", wrapper.GetFleetStatus)
 	})
 	r.Group(func(r chi.Router) {
@@ -2964,6 +3290,12 @@ func HandlerWithOptions(si ServerInterface, options ChiServerOptions) http.Handl
 	})
 	r.Group(func(r chi.Router) {
 		r.Get(options.BaseURL+"/version", wrapper.GetVersion)
+	})
+	r.Group(func(r chi.Router) {
+		r.Get(options.BaseURL+"/ws/v1/devices/{name}/applications/{appname}/console", wrapper.GetDeviceApplicationConsole)
+	})
+	r.Group(func(r chi.Router) {
+		r.Get(options.BaseURL+"/ws/v1/devices/{name}/console", wrapper.GetDeviceConsole)
 	})
 
 	return r

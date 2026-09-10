@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -59,6 +60,7 @@ type TestVMInterface interface {
 	SSHCommand(inputArgs []string) *exec.Cmd
 	SSHCommandWithUser(nputArgs []string, user string) *exec.Cmd
 	RunSSH(inputArgs []string, stdin *bytes.Buffer) (*bytes.Buffer, error)
+	RunSSHContext(ctx context.Context, inputArgs []string, stdin *bytes.Buffer) (*bytes.Buffer, error)
 	RunSSHWithUser(inputArgs []string, stdin *bytes.Buffer, user string) (*bytes.Buffer, error)
 	Exists() (bool, error)
 	GetConsoleOutput() string
@@ -136,6 +138,10 @@ func (v *TestVM) sshCommandWithUserContext(ctx context.Context, inputArgs []stri
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "LogLevel=ERROR",
 		"-o", "SetEnv=LC_ALL="}
+	if len(inputArgs) > 0 {
+		// Non-interactive remote commands: no TTY so motd/profile noise stays off stdout.
+		sshArgs = append(sshArgs, "-T")
+	}
 
 	var cmd *exec.Cmd
 	if v.SSHPrivateKeyPath != "" {
@@ -143,9 +149,13 @@ func (v *TestVM) sshCommandWithUserContext(ctx context.Context, inputArgs []stri
 		sshArgs = append([]string{"-i", string(v.SSHPrivateKeyPath), "-o", "PasswordAuthentication=no"}, sshArgs...)
 		cmd = exec.CommandContext(ctx, "ssh", append(sshArgs, inputArgs...)...) // #nosec G204 - test code with controlled inputs
 	} else {
-		// Password-based authentication with sshpass
+		// Password-based authentication with sshpass. Pass the password via the
+		// SSHPASS environment variable (sshpass -e) rather than on the command line
+		// (sshpass -p): the latter puts the credential in argv, where it lands in the
+		// process table and in every debug log of cmd.String() below.
 		sshArgs = append([]string{"-o", "PubkeyAuthentication=no"}, sshArgs...)
-		cmd = exec.CommandContext(ctx, "sshpass", append([]string{"-p", v.SSHPassword, "ssh"}, append(sshArgs, inputArgs...)...)...) // #nosec G204 - test code with controlled inputs
+		cmd = exec.CommandContext(ctx, "sshpass", append([]string{"-e", "ssh"}, append(sshArgs, inputArgs...)...)...) // #nosec G204 - test code with controlled inputs
+		cmd.Env = append(os.Environ(), "SSHPASS="+v.SSHPassword)
 	}
 
 	if len(inputArgs) == 0 {
@@ -191,6 +201,11 @@ func (v *TestVM) RunSSH(inputArgs []string, stdin *bytes.Buffer) (*bytes.Buffer,
 
 	stdout, err := v.RunSSHWithUser(inputArgs, stdin, v.VMUser)
 	return stdout, err
+}
+
+// RunSSHContext runs a command over SSH using the VM's default user and the provided context.
+func (v *TestVM) RunSSHContext(ctx context.Context, inputArgs []string, stdin *bytes.Buffer) (*bytes.Buffer, error) {
+	return v.runSSHWithUserContext(ctx, inputArgs, stdin, v.VMUser)
 }
 
 func (v *TestVM) JournalLogs(opts JournalOpts) (string, error) {

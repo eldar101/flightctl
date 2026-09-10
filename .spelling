@@ -5,6 +5,7 @@
 # where filename is relative to this configuration file
 AAP
 ACM
+AES
 Alertmanager
 amd64
 API
@@ -12,6 +13,7 @@ APIs
 apiVersion
 arm64
 base64
+backoff
 boolean
 bootable
 bootc
@@ -21,6 +23,7 @@ CentOS
 cgroup
 cgroups
 checksum
+ciphertext
 cleanup
 CLI
 cpu
@@ -32,6 +35,7 @@ Containerfile
 CRD
 CSR
 darwin
+decryptable
 DeviceTemplate
 df
 e.g.
@@ -50,6 +54,7 @@ firewalld
 fleetless
 flightctl
 frontend
+GCM
 GitLab
 GitOps
 greenboot
@@ -65,9 +70,14 @@ JSONL
 JWT
 Keycloak
 Klusterlet
+KubeVirt
 Kubernetes
 kustomize
 KVM
+launcherImage
+launcherImages
+distroId
+distroVersion
 lifecycle
 lifecycle-bound
 linux
@@ -79,6 +89,7 @@ microservices
 MicroShift
 mTLS
 namespace
+nonces
 non-root
 NAT
 OCI
@@ -91,6 +102,9 @@ openssl
 OSes
 ostree
 OTA
+passt
+passtWorkarounds
+plaintext
 pluggable
 Podman
 PostgreSQL
@@ -117,10 +131,14 @@ post-mortem
 150s
 pre-rollback
 red.d
+virt-launcher
+vm-to-quadlet
+vmRender
 rootful
 runtime
 schemas
 Sigstore
+skopeo
 Skopeo
 spec
 specs
@@ -128,6 +146,7 @@ SpiceDB
 stream9
 stream10
 subdomains
+subpackage
 substring
 systemd
 targetRevision
@@ -162,6 +181,23 @@ openshift
 acm
 namespaces
 USB
+ext4
+exFAT
+FAT32
+mkfs
+lsblk
+unmount
+Unmount
+reposync
+RPMs
+repodata
+createrepo_c
+exfatprogs
+xorriso
+genisoimage
+Pre-pulled
+pre-load
+registry.redhat.io
 quay.io.
 API_URL
 madrid
@@ -330,7 +366,41 @@ CatalogItem
 URI
 CatalogItems
 multicluster
+ImagePromotion
+semver
+dropdown
+ClusterIssuer
+Issuer
+air-gapped
+vCPU
+vRAM
+WebSocket
+gRPC
+Proxy
+vDisk
+resolution
+Fedora
+bastion
+checksums
+quadlet
+bootc-image-builder
+OCP
+rhem-el9
+rhem-el10
+syft
+ITMS
+MachineConfig
+MachineConfigPool
+mirrorSourcePolicy
+NeverContactSource
+AllowContactingSource
+CRI-O
  - docs/user/installing/configuring-imagebuilder.md
+ RLIMIT
+ NOFILE
+ buildah
+ runtimes
+ open-file
  entitlement
  uncomment
  volume
@@ -339,6 +409,8 @@ multicluster
  air-gapped
  builder-worker.container
  imageBuilderWorker
+ serviceImages
+ pullSecretName
  bool
  imagebuilder
  repos
@@ -356,6 +428,18 @@ multicluster
  Trustify
  distro
  README
+ ImageTagMirrorSet
+ ImageContentSourcePolicy
+ walkthrough
+ arg
+ hardcoding
+ vendored
+ ulimits
+ ulimit
+ - docs/user/references/cli-commands.md
+VNC
+stdin
+stdout
  - docs/user/references/api-resources.md
 CertificateSigningRequest
 AuthConfig
@@ -369,9 +453,9 @@ v1beta1
 v1alpha1
 1.x.x
 ImageBuild
+ImageBuilds
 ImageExport
 ImageExports
-ImageBuilds
 ReadWrite
  - docs/user/references/upgrade-compatibility.md
 v1betaX
@@ -386,6 +470,8 @@ orin
  - docs/user/installing/installing-service-on-kubernetes.md
 demouser
 v3.15
+console.redhat.com
+Datapath
 values.yaml
 Keycloak
 flightctl.MY.DOMAIN
@@ -396,6 +482,17 @@ PVs
 k8s
 v1.35
 flightcontrol
+pre-provisioned
+PersistentVolumes
+PersistentVolume
+PersistentVolumeClaim
+fsync
+pre-create
+Pre-bind
+NFS
+claimRef
+matchLabels
+matchExpressions
  - docs/user/using/managing-devices.md
 AlertRules
 base32-encoded
@@ -413,8 +510,17 @@ setgid
 setuid
 TargetRevision
 undeploy
+undeploying
 unpackaged
 v3.4
+VNC
+VirtIO
+Hyper-V
+enlightenments
+hostDisk
+RDP
+ISO
+ISOs
 WorkDir
 10s
  - docs/user/using/managing-fleets.md
@@ -505,6 +611,14 @@ quadlets
 Sanitization
 SNI
 VPN
+- docs/user/installing/configuring-encryption.md
+256-bit
+256-GCM
+32-byte
+AES-256-GCM
+base64-encoded
+plaintext-to-encrypted
+pre-install
 - docs/user/references/events.md
 lifecycles
 Rollouts
@@ -570,6 +684,10 @@ DDL
  - docs/user/installing/configuring-service-tracing.md
 https
 http
+CPT
+Pyroscope
+pyroscope
+flamegraphs
  - docs/user/installing/configuring-auth/auth-pam.md
 clientId
 clientSecret
@@ -659,3 +777,4 @@ parameterized
 SharedInformer
 sha256
 runbook
+sha256

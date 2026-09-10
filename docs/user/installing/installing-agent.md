@@ -1,4 +1,86 @@
-# Configuring the Flight Control Agent
+# Installing and configuring the Flight Control Agent
+
+This document describes how to install `flightctl-agent` from the public RPM
+repository on Fedora or CentOS Stream, and how to configure the agent after
+installation.
+
+For air-gapped RHEL installs, see
+[Installing the Flight Control agent offline on RHEL](installing-agent-offline.md).
+
+## Installing the agent RPM
+
+Agent RPM packages are hosted at [rpm.flightctl.io](https://rpm.flightctl.io/).
+Enable the repository, then install the package that matches the device OS mode.
+
+The syntax for adding a repository depends on your `dnf` version (4 or 5).
+
+Get the `dnf` version:
+
+```bash
+dnf --version
+```
+
+### Add the FlightCtl repository
+
+With dnf 4:
+
+```bash
+sudo dnf config-manager --add-repo https://rpm.flightctl.io/flightctl-epel.repo
+```
+
+With dnf 5:
+
+```bash
+sudo dnf config-manager addrepo --from-repofile=https://rpm.flightctl.io/flightctl-epel.repo
+```
+
+### Package-mode installation
+
+On package-mode hosts (traditional package management, without `bootc` or
+`rpm-ostree` image management), install the agent without weak dependencies so
+`flightctl-greenboot` is not pulled in:
+
+```bash
+sudo dnf install -y --setopt=install_weak_deps=False flightctl-agent
+```
+
+This installs the agent binary, systemd unit, and related core files. It does
+not install greenboot health checks or bootc timer masking. See
+[Integrating with Greenboot](configuring-device-greenboot.md) for the optional
+`flightctl-greenboot` subpackage.
+
+### Image-mode installation
+
+On image-mode hosts (`bootc` or `rpm-ostree`), install the agent with the
+default weak-dependency behavior:
+
+```bash
+sudo dnf install -y flightctl-agent
+```
+
+This pulls in `flightctl-greenboot` through a `Recommends` dependency and
+enables greenboot integration for image-based OS updates.
+
+### Start the agent
+
+After installation, enable and start the agent service:
+
+```bash
+sudo systemctl enable --now flightctl-agent
+```
+
+Verify that the service is running:
+
+```bash
+systemctl status flightctl-agent
+```
+
+Configure enrollment and other agent settings **before** starting the
+service so the agent has a server to connect to. If you start the agent
+first, it keeps retrying until configuration is available. See the
+configuration sections below.
+
+## Configuring the agent
 
 When the `flightctl-agent` starts, it reads its configuration from `/etc/flightctl/config.yaml` as well as a number of drop-in directories:
 
@@ -18,9 +100,12 @@ The agent's configuration file `/etc/flightctl/config.yaml` takes the following 
 | `enrollment-service`     | `EnrollmentService` | Y | Connection details for the device owner's Flight Control service used by the agent to enroll the device. |
 | `spec-fetch-interval`    | `Duration` | | **Deprecated**: This parameter is no longer used. The agent now uses long-polling to receive specification updates immediately when available. |
 | `status-update-interval` | `Duration` | | Interval in which the agent reports its device status under normal conditions. The agent immediately sends status reports on major events related to the health of the system and application workloads as well as on the progress during a system update. Default: `60s` |
+| `status-update-jitter` | `Duration` | | Maximum random delay before the first status push after agent start. The delay is chosen uniformly in `[0, status-update-jitter)`. Use `0` to disable jitter and push immediately. When omitted, the agent defaults this value to `status-update-interval`. Must be less than or equal to `status-update-interval`. Default: same as `status-update-interval` |
+| `spec-fetch-error-base-delay` | `Duration` | | Initial delay after a failed `/rendered` poll before the agent retries. Repeated failures double this delay up to `spec-fetch-error-max-delay`. Successful polls keep the normal long-poll pacing and reset the backoff. Default: `5s` |
+| `spec-fetch-error-max-delay` | `Duration` | | Maximum delay between `/rendered` retries after repeated failures. Must be greater than or equal to `spec-fetch-error-base-delay`. Default: `5m` |
 | `default-labels`         | `object` (`string`) | | Labels (`key: value`-pairs) that the agent requests for the device during enrollment. **Important:** Label values must be valid Kubernetes labels (alphanumeric, `-`, `_`, `.`, max 63 chars). Invalid labels are skipped with an error log. Default: `{}` |
 | `label-from-systeminfo`  | `object` (`string`) | | Maps system information fields to device labels at enrollment time. See [Enrollment-time label mapping](#enrollment-time-label-mapping). Default: `{}` |
-| `system-info`            | `array` (`string`) | | System info that the agent shall include in status updates from built-in collectors. See [Built-in system info collectors](#built-in-system-info-collectors) and [Managed system-info collectors](#managed-system-info-collectors). Default: `["hostname", "kernel", "distroName", "distroVersion", "productName", "productUuid", "productSerial", "netInterfaceDefault", "netIpDefault", "netMacDefault", "managementCertNotAfter", "managementCertSerial", "tpmVendorInfo"]` |
+| `system-info`            | `array` (`string`) | | System info that the agent shall include in status updates from built-in collectors. See [Built-in system info collectors](#built-in-system-info-collectors) and [Managed system-info collectors](#managed-system-info-collectors). Default: `["hostname", "kernel", "distroName", "distroVersion", "distroId", "productName", "productUuid", "productSerial", "netInterfaceDefault", "netIpDefault", "netMacDefault", "managementCertNotAfter", "managementCertSerial", "tpmVendorInfo"]` |
 | `system-info-custom`     | `array` (`string`) | | System info that the agent shall include in status updates from user-defined collectors. See [Custom system info collectors](#custom-system-info-collectors). Default: `[]` |
 | `system-info-timeout`    | `Duration` | | The timeout for collecting system info. Default: `2m`. Maximum: `2m` |
 | `pull-timeout`           | `Duration` | | The timeout for pulling a single OCI target. Default: `10m` |
@@ -78,6 +163,7 @@ You can specify extra system infos to be included in the device status by listin
 | `kernel`              | The running Linux kernel version                                  |
 | `distroName`          | The name of the operating system distribution.                    |
 | `distroVersion`       | The version of the operating system distribution                  |
+| `distroId`            | The os-release `ID` (for example `rhel` or `fedora`). Used with `distroVersion` to select `launcherImages` keys such as `rhel-9`. See [Configuring VM application rendering](configuring-vm-render.md). |
 | `productName`         | The system’s product or model name (from DMI data)                |
 | `productSerial`       | The hardware serial number (if available)                         |
 | `productUuid`         | The UUID of the system board or chassis                           |
@@ -95,7 +181,7 @@ You can specify extra system infos to be included in the device status by listin
 For example, if you add the following parameter to your agent's `config.yaml`
 
 ```console
-system-info: [hostname, kernel, distroName, distroVersion]
+system-info: [hostname, kernel, distroName, distroVersion, distroId]
 ```
 
 then the reported device status might look like
@@ -112,6 +198,7 @@ status:
     kernel: 5.14.0-503.38.1.el9_5.x86_64
     distroName: Red Hat Enterprise Linux
     distroVersion: 9.5 (Plow)
+    distroId: rhel
 ```
 
 ## Managed system info collectors

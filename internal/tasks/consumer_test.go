@@ -117,6 +117,16 @@ func TestShouldRolloutFleet(t *testing.T) {
 			event:    createTestEvent(domain.RepositoryKind, domain.EventReasonResourceUpdated, "repo1"),
 			expected: false,
 		},
+		{
+			name:     "PrepareDeltas",
+			event:    createTestEvent(domain.FleetKind, domain.EventReasonPrepareDeltas, "fleet1"),
+			expected: false,
+		},
+		{
+			name:     "DeltaGenerationCompleted",
+			event:    createTestEvent(domain.DeviceKind, domain.EventReasonDeltaGenerationCompleted, "device1"),
+			expected: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -328,6 +338,16 @@ func TestShouldRenderDevice(t *testing.T) {
 			event:    createTestEvent(domain.FleetKind, domain.EventReasonDependencyChangeDetected, "fleet1"),
 			expected: false,
 		},
+		{
+			name:     "PrepareDeltas",
+			event:    createTestEvent(domain.DeviceKind, domain.EventReasonPrepareDeltas, "device1"),
+			expected: false,
+		},
+		{
+			name:     "DeltaGenerationCompleted",
+			event:    createTestEvent(domain.DeviceKind, domain.EventReasonDeltaGenerationCompleted, "device1"),
+			expected: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -494,7 +514,7 @@ func TestDispatchTasks_WithNilMetrics(t *testing.T) {
 	mockConsumer.On("Complete", mock.Anything, "entry-123", payload, mock.MatchedBy(func(e error) bool { return e == nil })).Return(nil)
 
 	// Create dispatcher with nil metrics
-	handler := dispatchTasks(nil, nil, nil, nil, nil)
+	handler := dispatchTasks(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	// Execute handler
 	err = handler(ctx, payload, "entry-123", mockConsumer, log)
@@ -529,7 +549,7 @@ func TestDispatchTasks_WithNilMetrics_SuccessfulProcessing(t *testing.T) {
 	mockConsumer.On("Complete", mock.Anything, "entry-123", payload, mock.MatchedBy(func(e error) bool { return e == nil })).Return(nil)
 
 	// Create dispatcher with nil metrics
-	handler := dispatchTasks(nil, nil, nil, nil, nil)
+	handler := dispatchTasks(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	// Execute handler
 	err = handler(ctx, payload, "entry-123", mockConsumer, log)
@@ -552,7 +572,7 @@ func TestDispatchTasks_WithNilMetrics_InvalidPayload(t *testing.T) {
 	mockConsumer.On("Complete", mock.Anything, "entry-123", payload, nil).Return(nil)
 
 	// Create dispatcher with nil metrics
-	handler := dispatchTasks(nil, nil, nil, nil, nil)
+	handler := dispatchTasks(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	// Execute handler
 	err := handler(ctx, payload, "entry-123", mockConsumer, log)

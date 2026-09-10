@@ -14,7 +14,10 @@ import (
 	imagebuilderstore "github.com/flightctl/flightctl/internal/imagebuilder_api/store"
 	"github.com/flightctl/flightctl/internal/instrumentation/tracing"
 	"github.com/flightctl/flightctl/internal/kvstore"
-	"github.com/flightctl/flightctl/internal/service"
+	catalogservice "github.com/flightctl/flightctl/internal/service/catalog"
+	certificatesigningrequestservice "github.com/flightctl/flightctl/internal/service/certificatesigningrequest"
+	organizationservice "github.com/flightctl/flightctl/internal/service/organization"
+	repositoryservice "github.com/flightctl/flightctl/internal/service/repository"
 	"github.com/flightctl/flightctl/internal/store"
 	"github.com/flightctl/flightctl/internal/worker_client"
 	"github.com/flightctl/flightctl/pkg/queues"
@@ -31,9 +34,11 @@ const (
 // Consumer handles incoming jobs from the queue and routes them to appropriate handlers
 type Consumer struct {
 	store               imagebuilderstore.Store
-	mainStore           store.Store
+	organizations       organizationservice.Service
+	repositories        repositoryservice.Service
+	catalogs            catalogservice.Service
 	kvStore             kvstore.KVStore
-	serviceHandler      *service.ServiceHandler
+	serviceHandler      *certificatesigningrequestservice.ServiceHandler
 	imageBuilderService imagebuilderapi.Service
 	queueProducer       queues.QueueProducer
 	cfg                 *config.Config
@@ -43,9 +48,11 @@ type Consumer struct {
 // NewConsumer creates a new Consumer instance with the provided dependencies
 func NewConsumer(
 	store imagebuilderstore.Store,
-	mainStore store.Store,
+	organizations organizationservice.Service,
+	repositories repositoryservice.Service,
+	catalogs catalogservice.Service,
 	kvStore kvstore.KVStore,
-	serviceHandler *service.ServiceHandler,
+	serviceHandler *certificatesigningrequestservice.ServiceHandler,
 	imageBuilderService imagebuilderapi.Service,
 	queueProducer queues.QueueProducer,
 	cfg *config.Config,
@@ -53,7 +60,9 @@ func NewConsumer(
 ) *Consumer {
 	return &Consumer{
 		store:               store,
-		mainStore:           mainStore,
+		organizations:       organizations,
+		repositories:        repositories,
+		catalogs:            catalogs,
 		kvStore:             kvStore,
 		serviceHandler:      serviceHandler,
 		imageBuilderService: imageBuilderService,
@@ -215,9 +224,11 @@ func LaunchConsumers(
 	ctx context.Context,
 	queuesProvider queues.Provider,
 	store imagebuilderstore.Store,
-	mainStore store.Store,
+	organizations organizationservice.Service,
+	repositories repositoryservice.Service,
+	catalogs catalogservice.Service,
 	kvStore kvstore.KVStore,
-	serviceHandler *service.ServiceHandler,
+	serviceHandler *certificatesigningrequestservice.ServiceHandler,
 	imageBuilderService imagebuilderapi.Service,
 	cfg *config.Config,
 	log logrus.FieldLogger,
@@ -231,7 +242,7 @@ func LaunchConsumers(
 		return fmt.Errorf("failed to create queue producer for consumer: %w", err)
 	}
 
-	taskConsumer := NewConsumer(store, mainStore, kvStore, serviceHandler, imageBuilderService, consumerQueueProducer, cfg, log)
+	taskConsumer := NewConsumer(store, organizations, repositories, catalogs, kvStore, serviceHandler, imageBuilderService, consumerQueueProducer, cfg, log)
 
 	for i := 0; i < maxConcurrentBuilds; i++ {
 		consumer, err := queuesProvider.NewQueueConsumer(ctx, consts.ImageBuildTaskQueue)
@@ -291,7 +302,7 @@ func (c *Consumer) executeTimeoutCheck(ctx context.Context) {
 	}
 
 	// List all organizations
-	orgs, err := c.mainStore.Organization().List(ctx, store.ListParams{})
+	orgs, err := c.organizations.List(ctx, store.ListParams{})
 	if err != nil {
 		log.WithError(err).Error("Failed to list organizations")
 		return

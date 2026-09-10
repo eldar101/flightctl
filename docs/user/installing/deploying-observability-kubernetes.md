@@ -215,7 +215,7 @@ Procedure:
     EOF
     ```
 
-4. Create a `NetworkPolicy` to allow the Grafana Operator to access the Grafana instance:
+4. Create a `NetworkPolicy` that allows the Grafana Operator and the OpenShift ingress router to reach Grafana:
 
     ```console
     oc create -f - <<EOF
@@ -235,11 +235,16 @@ Procedure:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: openshift-operators
+        - namespaceSelector:
+            matchLabels:
+              policy-group.network.openshift.io/ingress: ""
         ports:
           - protocol: TCP
             port: 3000
     EOF
     ```
+
+    The Flight Control Helm chart restricts ingress to the `flightctl` namespace. Without a rule for the OpenShift ingress namespace, the Grafana route is unreachable.
 
 5. Create a `GrafanaDatasource` pointing to the Prometheus instance:
 
@@ -422,10 +427,10 @@ Procedure:
 
    ```console
    helm upgrade flightctl oci://quay.io/flightctl/charts/flightctl:${FC_VERSION} \
-     -n flightctl -f values.yaml --reuse-values
+     -n flightctl -f values.yaml --reset-then-reuse-values
    ```
 
-   The `--reuse-values` flag preserves all existing configuration and only updates the values specified in `values.yaml`.
+   The `--reset-then-reuse-values` flag applies new chart defaults first, then merges existing configuration on top, ensuring new chart values are not lost on upgrade.
 
 Verification:
 

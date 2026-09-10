@@ -1,15 +1,22 @@
 package restore_test
 
 import (
+	"context"
 	"time"
 
 	api "github.com/flightctl/flightctl/api/core/v1beta1"
 	"github.com/flightctl/flightctl/internal/restore"
 	"github.com/flightctl/flightctl/internal/store"
+	devicestore "github.com/flightctl/flightctl/internal/store/device"
+	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/samber/lo"
 )
+
+func createTestDevice(ctx context.Context, s devicestore.Store, orgId uuid.UUID, device *api.Device) (*api.Device, error) {
+	return s.Create(ctx, orgId, device, nil)
+}
 
 var _ = Describe("Device restore operations", func() {
 	var s *RestoreTestSuite
@@ -25,8 +32,7 @@ var _ = Describe("Device restore operations", func() {
 
 	Context("PrepareDevicesAfterRestore", func() {
 		It("sets annotation, clears lastSeen, and sets status", func() {
-			devStore := s.Store.Device()
-			callback := store.EventCallback(nil)
+			devStore := s.DeviceStore
 
 			testDeviceName := "restore-test-device"
 			testDevice := &api.Device{
@@ -70,10 +76,9 @@ var _ = Describe("Device restore operations", func() {
 				},
 			}
 
-			createdDevice, created, err := devStore.CreateOrUpdate(s.Ctx, s.OrgID, testDevice, nil, false, nil, callback)
+			createdDevice, err := createTestDevice(s.Ctx, devStore, s.OrgID, testDevice)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(createdDevice).ToNot(BeNil())
-			Expect(created).To(BeTrue())
 
 			Expect(createdDevice.Status.LastSeen.IsZero()).To(BeFalse())
 			Expect(createdDevice.Status.Summary.Status).To(Equal(api.DeviceSummaryStatusOnline))
@@ -104,8 +109,7 @@ var _ = Describe("Device restore operations", func() {
 		})
 
 		It("handles devices with no existing status", func() {
-			devStore := s.Store.Device()
-			callback := store.EventCallback(nil)
+			devStore := s.DeviceStore
 
 			deviceName := "test-device-no-status"
 			device := api.Device{
@@ -118,9 +122,8 @@ var _ = Describe("Device restore operations", func() {
 				Status: nil,
 			}
 
-			_, created, err := devStore.CreateOrUpdate(s.Ctx, s.OrgID, &device, nil, true, nil, callback)
+			_, err := createTestDevice(s.Ctx, devStore, s.OrgID, &device)
 			Expect(err).ToNot(HaveOccurred())
-			Expect(created).To(BeTrue())
 
 			devicesUpdated, err := s.RestoreStore.PrepareDevicesAfterRestore(s.Ctx)
 			Expect(err).ToNot(HaveOccurred())
@@ -142,8 +145,7 @@ var _ = Describe("Device restore operations", func() {
 		})
 
 		It("excludes decommissioned and decommissioning devices", func() {
-			devStore := s.Store.Device()
-			callback := store.EventCallback(nil)
+			devStore := s.DeviceStore
 
 			decommissioningDeviceName := "decommissioning-device"
 			decommissioningDevice := api.Device{
@@ -214,19 +216,16 @@ var _ = Describe("Device restore operations", func() {
 				},
 			}
 
-			_, created, err := devStore.CreateOrUpdate(s.Ctx, s.OrgID, &decommissioningDevice, nil, false, nil, callback)
+			_, err := createTestDevice(s.Ctx, devStore, s.OrgID, &decommissioningDevice)
 			Expect(err).ToNot(HaveOccurred())
-			Expect(created).To(BeTrue())
 			s.SetDeviceLastSeen(decommissioningDeviceName, *decommissioningDevice.Status.LastSeen)
 
-			_, created, err = devStore.CreateOrUpdate(s.Ctx, s.OrgID, &decommissionedDevice, nil, false, nil, callback)
+			_, err = createTestDevice(s.Ctx, devStore, s.OrgID, &decommissionedDevice)
 			Expect(err).ToNot(HaveOccurred())
-			Expect(created).To(BeTrue())
 			s.SetDeviceLastSeen(decommissionedDeviceName, *decommissionedDevice.Status.LastSeen)
 
-			_, created, err = devStore.CreateOrUpdate(s.Ctx, s.OrgID, &normalDevice, nil, false, nil, callback)
+			_, err = createTestDevice(s.Ctx, devStore, s.OrgID, &normalDevice)
 			Expect(err).ToNot(HaveOccurred())
-			Expect(created).To(BeTrue())
 			s.SetDeviceLastSeen(normalDeviceName, *normalDevice.Status.LastSeen)
 
 			devicesUpdated, err := s.RestoreStore.PrepareDevicesAfterRestore(s.Ctx)
@@ -270,8 +269,7 @@ var _ = Describe("Device restore operations", func() {
 		})
 
 		It("properly clears last_seen column", func() {
-			devStore := s.Store.Device()
-			callback := store.EventCallback(nil)
+			devStore := s.DeviceStore
 
 			deviceName := "last-seen-column-test"
 			device := &api.Device{
@@ -283,9 +281,8 @@ var _ = Describe("Device restore operations", func() {
 				},
 			}
 
-			_, created, err := devStore.CreateOrUpdate(s.Ctx, s.OrgID, device, nil, false, nil, callback)
+			_, err := createTestDevice(s.Ctx, devStore, s.OrgID, device)
 			Expect(err).ToNot(HaveOccurred())
-			Expect(created).To(BeTrue())
 
 			s.SetDeviceLastSeen(deviceName, *device.Status.LastSeen)
 
@@ -310,18 +307,18 @@ var _ = Describe("Device restore operations", func() {
 				Spec:     &api.DeviceSpec{Os: &api.DeviceOsSpec{Image: "test-image"}},
 			}
 
-			createdDevice, status := s.Handler.CreateDevice(s.Ctx, s.OrgID, *device)
+			createdDevice, status := s.Device.CreateDevice(s.Ctx, s.OrgID, *device)
 			Expect(status.Code).To(Equal(int32(201)))
 			Expect(createdDevice).ToNot(BeNil())
 
-			initialEvents, err := s.Store.Event().List(s.Ctx, s.OrgID, store.ListParams{Limit: 1000})
+			initialEvents, err := s.EventStore.List(s.Ctx, s.OrgID, store.ListParams{Limit: 1000})
 			Expect(err).ToNot(HaveOccurred())
 			initialEventCount := len(initialEvents.Items)
 
 			_, err = restore.PrepareDevices(s.Ctx, s.RestoreStore, nil, s.Log)
 			Expect(err).ToNot(HaveOccurred())
 
-			finalEvents, err := s.Store.Event().List(s.Ctx, s.OrgID, store.ListParams{Limit: 1000})
+			finalEvents, err := s.EventStore.List(s.Ctx, s.OrgID, store.ListParams{Limit: 1000})
 			Expect(err).ToNot(HaveOccurred())
 			Expect(len(finalEvents.Items)).To(BeNumerically(">", initialEventCount))
 
@@ -347,7 +344,7 @@ var _ = Describe("Device restore operations", func() {
 				Spec:     &api.DeviceSpec{Os: &api.DeviceOsSpec{Image: "test-image"}},
 			}
 
-			createdDevice, status := s.Handler.CreateDevice(s.Ctx, s.OrgID, *device)
+			createdDevice, status := s.Device.CreateDevice(s.Ctx, s.OrgID, *device)
 			Expect(status.Code).To(Equal(int32(201)))
 			Expect(createdDevice).ToNot(BeNil())
 
@@ -359,7 +356,7 @@ var _ = Describe("Device restore operations", func() {
 				Limit:         lo.ToPtr(int32(100)),
 			}
 
-			eventList, status := s.Handler.ListEvents(s.Ctx, s.OrgID, params)
+			eventList, status := s.Event.ListEvents(s.Ctx, s.OrgID, params)
 			Expect(status.Code).To(Equal(int32(200)))
 			Expect(eventList).ToNot(BeNil())
 			Expect(len(eventList.Items)).To(BeNumerically(">=", 1))
@@ -382,7 +379,7 @@ var _ = Describe("Device restore operations", func() {
 				Limit:         lo.ToPtr(int32(100)),
 			}
 
-			deviceEventList, status := s.Handler.ListEvents(s.Ctx, s.OrgID, deviceParams)
+			deviceEventList, status := s.Event.ListEvents(s.Ctx, s.OrgID, deviceParams)
 			Expect(status.Code).To(Equal(int32(200)))
 			Expect(deviceEventList).ToNot(BeNil())
 			Expect(len(deviceEventList.Items)).To(BeNumerically(">=", 1))

@@ -75,7 +75,15 @@ that contains your unapplied changes. The most common error when updating a reso
 is another editor changing the resource on the server. When this occurs, you will have
 to apply your changes to the newer version of the resource, or update your temporary
 saved copy to include the latest resource version.`,
-		Args: cobra.RangeArgs(1, 2),
+		Args: func(cmd *cobra.Command, args []string) error {
+			if len(args) < 1 {
+				return fmt.Errorf("you must specify a resource to edit (TYPE NAME or TYPE/NAME)")
+			}
+			if len(args) > 2 {
+				return fmt.Errorf("too many arguments: edit accepts at most 2 arguments (TYPE NAME or TYPE/NAME)")
+			}
+			return nil
+		},
 		ValidArgsFunction: KindNameAutocomplete{
 			Options:            o,
 			AllowMultipleNames: false,

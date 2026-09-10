@@ -1,14 +1,118 @@
 # Installing the Flight Control Service on OpenShift/Kubernetes
 
+## System requirements
+
+The following table shows the minimum recommended resources for the Flight Control
+server based on the number of managed devices. These values were established through
+benchmarking and represent the resources needed for the server workload — not the
+managed edge devices themselves.
+
+| Deployment size | Managed devices | vCPU (cores) | vRAM (GB) | vDisk (GB) |
+|---|---|---|---|---|
+| **Small** | 100 | 4 | 4 | 70 |
+| **Medium** | 1,000 | 4 | 8 | 70 |
+| **Large** | 10,000 | 4 | 16 | 70 |
+| **Super Large** | 100,000 | 8 | 40 | 120 |
+
+> [!NOTE]
+> These figures are based on benchmarking with an earlier version of Flight Control
+> and represent a reasonable baseline. Actual resource usage depends on polling
+> intervals, fleet template complexity, and observability stack configuration. Add
+> approximately 3 GB disk for each additional service component (image builder,
+> observability stack).
+
 ## Installing on Kubernetes
 
-You can install the Flight Control Service on any certified Kubernetes distribution that supports the Gateway API. If you have an OpenShift Kubernetes cluster available, refer to [Installing on OpenShift](#installing-on-openshift) for a more streamlined experience.
+You can install the Flight Control Service on any certified Kubernetes distribution that supports the Gateway API. If you have an OpenShift Kubernetes cluster available, refer to [Installing on OpenShift](#installing-on-openshift) for a more streamlined experience. If you are running RHEL and need a lightweight Kubernetes distribution, refer to [Installing on MicroShift](#installing-on-microshift).
 
 It is recommended to install `cert-manager` before installing Flight Control. When the Flight Control installer detects `cert-manager`, it will use it to issue and manage required CA and server TLS certificates. Otherwise, it falls back to creating certificates using Helm's built-in functions once, but does not manage them.
 
+### Binding to pre-provisioned PersistentVolumes
+
+Use this section if your cluster does not support dynamic volume provisioning, or if the database or Alertmanager storage must use a specific, pre-provisioned `PersistentVolume` instead of one selected automatically by a `StorageClass`. This applies to Flight Control installations on Kubernetes, OpenShift, and MicroShift.
+
+Prerequisites:
+
+- The pre-provisioned `PersistentVolume` for the database is group-writable by the group ID configured in `db.builtin.fsGroup`. PostgreSQL mounts its data directory at `/var/lib/pgsql/data` and requires matching filesystem group ownership.
+- The database `PersistentVolumeClaim` is not backed by NFS storage. PostgreSQL relies on file-locking and `fsync` guarantees that many NFS implementations do not provide reliably, which can lead to data corruption.
+- The pre-provisioned `PersistentVolume` for the database has a capacity of at least `db.builtin.storage.size` (default `60Gi`) — Kubernetes cannot bind a claim to a volume smaller than what it requests.
+- The pre-provisioned `PersistentVolume` for Alertmanager has a capacity of at least `2Gi`, the fixed size its `PersistentVolumeClaim` requests.
+
+The Helm chart exposes a `volumeName` and a `selector.matchLabels` value for both the database and Alertmanager `PersistentVolumeClaim` resources. Set one of these values to bind that `PersistentVolumeClaim` to a matching pre-provisioned `PersistentVolume`:
+
+```yaml
+db:
+  builtin:
+    volumeName: "my-db-pv"       # Bind to a PersistentVolume by name
+    # selector:
+    #   matchLabels:
+    #     disk: fast              # Or bind to a PersistentVolume by label selector
+
+alertmanager:
+  volumeName: "my-alertmanager-pv"
+  # selector:
+  #   matchLabels:
+  #     disk: standard
+```
+
+Both values are optional and unset by default, which preserves the existing dynamic-provisioning behavior. Set only one of `volumeName` or `selector.matchLabels` per component to keep the binding unambiguous.
+
+Setting either value on a component also makes Flight Control render `storageClassName: ""` on that `PersistentVolumeClaim` when `global.storageClassName` is not explicitly set, instead of omitting the field. This keeps the binding working regardless of whether the cluster has a default `StorageClass` — without it, Kubernetes could inject a default class that does not match the pre-provisioned `PersistentVolume` and leave the claim unbound.
+
+> [!IMPORTANT]
+> `volumeName` and `selector` take effect only when Flight Control first creates the underlying storage resource. For the database, Kubernetes does not allow changing these fields on an existing `PersistentVolumeClaim`. For Alertmanager, Kubernetes does not allow changing `volumeClaimTemplates` on an existing `StatefulSet` at all. Either way, setting or changing these values on an already-installed release causes `helm upgrade` to fail for that resource. Set the values before the first `helm install`.
+
+If you need a binding pattern the `volumeName` and `selector.matchLabels` values do not cover, such as `matchExpressions`, or changing the binding on an already-installed release, manage the `PersistentVolumeClaim` outside the values covered here:
+
+- For the database: pre-create the `PersistentVolumeClaim` with the exact specification you need, then add the Helm ownership label and annotations (`app.kubernetes.io/managed-by: Helm`, `meta.helm.sh/release-name`, `meta.helm.sh/release-namespace`) before running `helm install`, so Helm adopts the existing resource instead of creating a new one. See [Using Kubernetes Secrets](configuring-external-database.md#using-kubernetes-secrets) in [Configuring External PostgreSQL Database](configuring-external-database.md) for the equivalent adoption pattern applied to secrets. This does not apply to Alertmanager: its `PersistentVolumeClaim` is generated by the `StatefulSet` controller from `volumeClaimTemplates`, not rendered by Helm, so Helm ownership metadata has no effect on it.
+- For Alertmanager: pre-create a `PersistentVolumeClaim` named `flightctl-alertmanager-data-flightctl-alertmanager-0` with the exact specification you need. The `StatefulSet` controller reuses an existing `PersistentVolumeClaim` that already matches its expected name instead of creating a new one from `volumeClaimTemplates`.
+- Pre-bind the `PersistentVolume` to the future `PersistentVolumeClaim` (database or Alertmanager) by setting the `PersistentVolume`'s `spec.claimRef` to the claim's name and namespace before the claim exists. Kubernetes then reserves that `PersistentVolume` for the matching claim once it is created.
+
+### Using a custom CA
+
+If you have an existing certificate authority (CA) and want Flight Control to use it instead of generating a self-signed CA, provide a `flightctl-ca` secret in the installation namespace **before** running `helm install`.
+
+Flight Control checks for an existing `flightctl-ca` secret during installation. If found, it will use that CA to sign all service certificates (API, UI, telemetry, imagebuilder). If not found, it creates a self-signed CA automatically.
+
+**For cert-manager users:**
+
+Create a Certificate resource named `flightctl-ca` with `isCA: true` before installing Flight Control. You can reference any cert-manager issuer (ClusterIssuer or Issuer):
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: flightctl-ca
+  namespace: flightctl  # Must match your installation namespace
+spec:
+  isCA: true
+  commonName: flightctl-ca
+  secretName: flightctl-ca
+  duration: 87600h  # 10 years
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    name: your-issuer-name
+    kind: ClusterIssuer  # or Issuer
+    group: cert-manager.io
+```
+
+**For users not using cert-manager:**
+
+Create a Kubernetes secret named `flightctl-ca` containing your CA certificate and private key in the installation namespace:
+
+```console
+kubectl create secret tls flightctl-ca -n flightctl \
+  --cert=/path/to/ca.crt \
+  --key=/path/to/ca.key
+```
+
+Your CA must be capable of signing other certificates (a CA certificate, not a leaf certificate).
+
 ### (Optional) Installing a `kind` cluster
 
-If you do not have a Kubernetes cluster available, you can use the [installation on Linux](installing-service-on-linux.md) or create a local test cluster using `kind` (Kubernetes in Docker). This section guides you through setting up a `kind` cluster with Gateway API support for use with Flight Control.
+If you do not have a Kubernetes cluster available and are not running RHEL, you can use the [installation on Linux](installing-service-on-linux.md) or create a local test cluster using `kind` (Kubernetes in Docker). This section guides you through setting up a `kind` cluster with Gateway API support for use with Flight Control.
 
 Prerequisites:
 
@@ -245,6 +349,10 @@ When you install the Flight Control Service on the OpenShift Kubernetes distribu
 
 It is recommended to install the `cert-manager` Operator from the OpenShift Software Catalog before installing Flight Control. When the Flight Control installer detects `cert-manager`, it will use it to issue and manage required CA and server TLS certificates. Otherwise, it falls back to creating certificates using `openssl` once, but does not manage them.
 
+To use a custom CA instead of Flight Control's self-signed CA, see [Using a custom CA](#using-a-custom-ca) in the Kubernetes installation section above.
+
+To bind the database or Alertmanager storage to a pre-provisioned `PersistentVolume`, see [Binding to pre-provisioned PersistentVolumes](#binding-to-pre-provisioned-persistentvolumes) in the Kubernetes installation section above.
+
 ### Installing using the CLI
 
 Prerequisites:
@@ -318,6 +426,102 @@ Procedure:
 6. Click on the URL shown under "Location" to access the Flight Control UI with your current user account and credentials.
 
 If you need to access your service using the `flightctl` CLI, find and click the "Copy login command" button to see the command to use to log the `flightctl` CLI in to your service.
+
+## Installing on MicroShift
+
+MicroShift is the recommended lightweight Kubernetes distribution for RHEL. It is installed as an RPM, runs as a systemd service, and exposes OpenShift-compatible APIs including Routes and OAuth. The Flight Control Helm chart automatically detects MicroShift as an OpenShift cluster and uses Routes for service exposure, so no Gateway API configuration is required.
+
+To bind the database or Alertmanager storage to a pre-provisioned `PersistentVolume`, see [Binding to pre-provisioned PersistentVolumes](#binding-to-pre-provisioned-persistentvolumes) in the Kubernetes installation section above.
+
+Prerequisites:
+
+- You have a RHEL 9 host with an active Red Hat subscription.
+- You have a Red Hat pull secret downloaded from [console.redhat.com](https://console.redhat.com) → OpenShift → Downloads.
+- You have `helm` version 3.17+ installed.
+
+### Step 1: Install MicroShift
+
+1. Enable the MicroShift and Fast Datapath repositories:
+
+    ```console
+    sudo subscription-manager repos \
+        --enable rhocp-4.17-for-rhel-9-x86_64-rpms \
+        --enable fast-datapath-for-rhel-9-x86_64-rpms
+    ```
+
+2. Install MicroShift:
+
+    ```console
+    sudo dnf install -y microshift
+    ```
+
+3. Copy your pull secret to the required location:
+
+    ```console
+    sudo cp ~/openshift-pull-secret.json /etc/crio/openshift-pull-secret
+    sudo chmod 600 /etc/crio/openshift-pull-secret
+    ```
+
+4. Enable and start MicroShift:
+
+    ```console
+    sudo systemctl enable --now microshift
+    ```
+
+### Step 2: Configure kubeconfig access
+
+```console
+mkdir -p ~/.kube
+sudo cat /var/lib/microshift/resources/kubeadmin/$(hostname)/kubeconfig > ~/.kube/config
+```
+
+Verify the cluster is running:
+
+```console
+kubectl get nodes
+```
+
+### Step 3: Install Flight Control
+
+1. Define the Flight Control version and namespace:
+
+    ```console
+    FC_VERSION=1.1.0
+    FC_NAMESPACE=flightctl
+    ```
+
+2. Deploy Flight Control:
+
+    ```console
+    helm upgrade --install flightctl oci://quay.io/flightctl/charts/flightctl:${FC_VERSION} \
+      --namespace ${FC_NAMESPACE} --create-namespace
+    ```
+
+    > [!IMPORTANT]
+    > EL10 container images are not supported with Helm deployments. Use EL9 images only.
+
+3. Wait for the pods to be in `Running` or `Completed` state:
+
+    ```console
+    kubectl get pods -n ${FC_NAMESPACE} -w
+    ```
+
+### Step 4: Access the service
+
+Get the UI URL:
+
+```console
+oc get route flightctl-ui -n ${FC_NAMESPACE} -o jsonpath='{.spec.host}'
+```
+
+Log in with the `flightctl` CLI:
+
+```console
+FC_API_ENDPOINT=$(oc get route flightctl-api -n ${FC_NAMESPACE} -o jsonpath='{.spec.host}')
+FC_TOKEN=$(kubectl create token flightctl-admin -n ${FC_NAMESPACE} --duration=24h)
+
+flightctl login ${FC_API_ENDPOINT} -t ${FC_TOKEN}
+```
 
 ## Installing with Advanced Cluster Management
 

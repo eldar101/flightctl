@@ -225,13 +225,15 @@ For more detailed configuration options, see the [Values](#values) section below
 | alertExporter.image.image | string | `"quay.io/flightctl/flightctl-alert-exporter-el9"` | Alert exporter container image |
 | alertExporter.image.pullPolicy | string | `""` | Image pull policy for alert exporter container |
 | alertExporter.image.tag | string | `""` | Alert exporter image tag |
-| alertmanager | object | `{"additionalPVCLabels":null,"additionalRouteLabels":null,"enabled":true,"image":{"image":"quay.io/prometheus/alertmanager","pullPolicy":"","tag":"v0.28.1"}}` | Alertmanager Configuration |
+| alertmanager | object | `{"additionalPVCLabels":null,"additionalRouteLabels":null,"enabled":true,"image":{"image":"quay.io/prometheus/alertmanager","pullPolicy":"","tag":"v0.28.1"},"selector":{"matchLabels":{}},"volumeName":""}` | Alertmanager Configuration |
 | alertmanager.additionalPVCLabels | string | `nil` | Additional labels for Alert Manager PVCs. |
 | alertmanager.additionalRouteLabels | string | `nil` | Additional labels for Alert Manager routes. |
 | alertmanager.enabled | bool | `true` | Enable Alertmanager for alert handling |
 | alertmanager.image.image | string | `"quay.io/prometheus/alertmanager"` | Alertmanager container image |
 | alertmanager.image.pullPolicy | string | `""` | Image pull policy for Alertmanager container |
 | alertmanager.image.tag | string | `"v0.28.1"` | Alertmanager image tag |
+| alertmanager.selector.matchLabels | object | `{}` | Label selector for binding this PVC to a pre-provisioned PersistentVolume by matching labels on the PV. Same immutability caveat as volumeName applies. Leave empty to disable label-based selection. |
+| alertmanager.volumeName | string | `""` | Name of a specific pre-provisioned PersistentVolume to bind this PVC to. Only takes effect when the PVC is first created — changing this on an already-bound PVC will make `helm upgrade` fail, because Kubernetes forbids mutating volumeName after creation. Leave empty for normal (dynamic or best-fit static) binding. Note: the target PV's capacity must be >= the fixed `2Gi` this PVC requests, or binding will fail. Setting this (or selector.matchLabels below) also makes the chart render storageClassName: "" on this PVC when global.storageClassName is left empty, so a cluster-default StorageClass can't get injected and mismatch the target PV. |
 | alertmanagerProxy | object | `{"enabled":true,"image":{"image":"quay.io/flightctl/flightctl-alertmanager-proxy-el9","pullPolicy":"","tag":""}}` | Alertmanager Proxy Configuration |
 | alertmanagerProxy.enabled | bool | `true` | Enable Alertmanager proxy service |
 | alertmanagerProxy.image.image | string | `"quay.io/flightctl/flightctl-alertmanager-proxy-el9"` | Alertmanager proxy container image |
@@ -259,8 +261,8 @@ For more detailed configuration options, see the [Values](#values) section below
 | clusterCli.image.image | string | `"quay.io/openshift/origin-cli"` | Cluster CLI container image |
 | clusterCli.image.pullPolicy | string | `""` | Image pull policy for cluster CLI container |
 | clusterCli.image.tag | string | `"4.20.0"` | Cluster CLI image tag |
-| db | object | `{"builtin":{"additionalPVCLabels":null,"applicationUserSecretName":"","fsGroup":"","image":{"image":"quay.io/sclorg/postgresql-16-c9s","pullPolicy":"","tag":"20250214"},"masterUserSecretName":"","maxConnections":200,"migrationUserSecretName":"","resources":{"requests":{"cpu":"512m","memory":"512Mi"}},"storage":{"size":"60Gi"}},"external":{"applicationUserSecretName":"","hostname":"","migrationUserSecretName":"","port":5432,"sslmode":"","tlsConfigMapName":"","tlsSecretName":""},"name":"flightctl","type":"builtin"}` | Database Configuration |
-| db.builtin | object | `{"additionalPVCLabels":null,"applicationUserSecretName":"","fsGroup":"","image":{"image":"quay.io/sclorg/postgresql-16-c9s","pullPolicy":"","tag":"20250214"},"masterUserSecretName":"","maxConnections":200,"migrationUserSecretName":"","resources":{"requests":{"cpu":"512m","memory":"512Mi"}},"storage":{"size":"60Gi"}}` | Settings for builtin DB |
+| db | object | `{"builtin":{"additionalPVCLabels":null,"applicationUserSecretName":"","fsGroup":"","image":{"image":"quay.io/sclorg/postgresql-16-c9s","pullPolicy":"","tag":"20250214"},"masterUserSecretName":"","maxConnections":200,"migrationUserSecretName":"","resources":{"requests":{"cpu":"512m","memory":"512Mi"}},"selector":{"matchLabels":{}},"storage":{"size":"60Gi"},"volumeName":""},"external":{"applicationUserSecretName":"","hostname":"","migrationUserSecretName":"","port":5432,"sslmode":"","tlsConfigMapName":"","tlsSecretName":""},"name":"flightctl","type":"builtin"}` | Database Configuration |
+| db.builtin | object | `{"additionalPVCLabels":null,"applicationUserSecretName":"","fsGroup":"","image":{"image":"quay.io/sclorg/postgresql-16-c9s","pullPolicy":"","tag":"20250214"},"masterUserSecretName":"","maxConnections":200,"migrationUserSecretName":"","resources":{"requests":{"cpu":"512m","memory":"512Mi"}},"selector":{"matchLabels":{}},"storage":{"size":"60Gi"},"volumeName":""}` | Settings for builtin DB |
 | db.builtin.additionalPVCLabels | string | `nil` | Additional labels for DB PVCs. |
 | db.builtin.applicationUserSecretName | string | `""` | Database application user secret name containing username/password. If not provided, the secret will be generated |
 | db.builtin.fsGroup | string | `""` | File system group ID for database pod security context |
@@ -272,7 +274,9 @@ For more detailed configuration options, see the [Values](#values) section below
 | db.builtin.migrationUserSecretName | string | `""` | Database migration user secret name containing username/password. If not provided, the secret will be generated |
 | db.builtin.resources.requests.cpu | string | `"512m"` | CPU resource requests for database pod |
 | db.builtin.resources.requests.memory | string | `"512Mi"` | Memory resource requests for database pod |
+| db.builtin.selector.matchLabels | object | `{}` | Label selector for binding this PVC to a pre-provisioned PersistentVolume by matching labels on the PV. Same immutability caveat as volumeName applies. Leave empty to disable label-based selection. |
 | db.builtin.storage.size | string | `"60Gi"` | Persistent volume size for database storage |
+| db.builtin.volumeName | string | `""` | Name of a specific pre-provisioned PersistentVolume to bind this PVC to. Only takes effect when the PVC is first created — changing this on an already-bound PVC will make `helm upgrade` fail, because Kubernetes forbids mutating volumeName after creation. Leave empty for normal (dynamic or best-fit static) binding. Note: the target PV's capacity must be >= `storage.size` above, or binding will fail. Setting this (or selector.matchLabels below) also makes the chart render storageClassName: "" on this PVC when global.storageClassName is left empty, so a cluster-default StorageClass can't get injected and mismatch the target PV. |
 | db.external.applicationUserSecretName | string | `""` | Database application user secret name containing username/password. |
 | db.external.hostname | string | `""` | External database hostname |
 | db.external.migrationUserSecretName | string | `""` | Database migration user secret name containing username/password. |
@@ -290,6 +294,24 @@ For more detailed configuration options, see the [Values](#values) section below
 | dbSetup.migration.backoffLimit | int | `2147483647` | Number of retries for the migration Job on failure  |
 | dbSetup.wait.sleep | int | `2` | Seconds to sleep between database connection attempts Default sleep interval between connection attempts |
 | dbSetup.wait.timeout | int | `60` | Seconds to wait for database readiness before failing Default timeout for database wait (can be overridden per deployment) |
+| deltaGeneration | object | `{"defaultRepository":{"caCrt":"","namespace":"","registry":"","repository":"","scheme":"","secretName":"","skipServerVerification":false},"maxConcurrentDeltaGenerations":2,"timeout":"30m"}` | Default OCI write target for generated deltas when an organization has no deltaStorageTarget Repository. Username and password must come from the Secret named in secretName (keys: username, password); they are not written to config.yaml. |
+| deltaGeneration.defaultRepository.caCrt | string | `""` | Base64-encoded PEM of a custom registry CA (same encoding as Repository spec ca.crt). |
+| deltaGeneration.defaultRepository.namespace | string | `""` | Optional namespace under registry (e.g. my-org). Mutually exclusive with repository. |
+| deltaGeneration.defaultRepository.registry | string | `""` | Registry hostname used as the login/CA host and as the prefix of the push path. |
+| deltaGeneration.defaultRepository.repository | string | `""` | Optional repository path under registry (e.g. my-org/diffs). Mutually exclusive with namespace. |
+| deltaGeneration.defaultRepository.scheme | string | `""` | URL scheme for connecting to the registry. Allowed values: http, https. |
+| deltaGeneration.defaultRepository.secretName | string | `""` | Name of the Kubernetes Secret containing 'username' and 'password' keys. |
+| deltaGeneration.defaultRepository.skipServerVerification | bool | `false` | Skip TLS verification when connecting to the registry. |
+| deltaGeneration.maxConcurrentDeltaGenerations | int | `2` | Maximum number of concurrent delta generation jobs. Defaults to 2 when omitted or <= 0. |
+| deltaGeneration.timeout | string | `"30m"` | Per-job timeout for oci-delta/ORAS. Defaults to 30m when omitted or <= 0. |
+| deltaWorker | object | `{"image":{"image":"quay.io/flightctl/flightctl-delta-worker-el9","pullPolicy":"","tag":""},"resources":{"limits":{"cpu":"2","memory":"2Gi"},"requests":{"cpu":"100m","memory":"256Mi"}}}` | Delta-worker Configuration |
+| deltaWorker.image.image | string | `"quay.io/flightctl/flightctl-delta-worker-el9"` | Delta-worker container image |
+| deltaWorker.image.pullPolicy | string | `""` | Image pull policy for delta-worker container |
+| deltaWorker.image.tag | string | `""` | Delta-worker image tag |
+| deltaWorker.resources | object | `{"limits":{"cpu":"2","memory":"2Gi"},"requests":{"cpu":"100m","memory":"256Mi"}}` | Resource requests and limits for the delta-worker container |
+| encryption | object | `{"activeKeyID":"default","keys":[{"file":"key","id":"default"}]}` | Encryption-at-rest key configuration. The flightctl-encryption-key Secret is mounted at /root/.flightctl/encryption/ in all services. Each key entry maps a logical key ID to a filename within that Secret. For key rotation: add a new key file to the Secret, add it here, then change activeKeyID. |
+| encryption.activeKeyID | string | `"default"` | Key ID used for new encryptions. Must match one of the IDs in the keys list. |
+| encryption.keys | list | `[{"file":"key","id":"default"}]` | List of available encryption keys. Old keys remain available for decryption during rotation. |
 | global.additionalPVCLabels | string | `nil` | Additional labels for PVCs. |
 | global.additionalRouteLabels | string | `nil` | Additional labels for routes. |
 | global.auth.aap.apiUrl | string | `""` | The URL of the AAP Gateway API endpoint |
@@ -343,13 +365,13 @@ For more detailed configuration options, see the [Values](#values) section below
 | global.multiclusterEngineNamespace | string | `"multicluster-engine"` | Namespace where MultiCluster Engine is installed. Used for creating discovery ConfigMap and RBAC bindings. |
 | global.routeExternalCertificate | string | `"auto"` | Whether to use generated TLS certificates on edge-terminated routes via externalCertificate. - auto: use externalCertificate on fresh install and preserve existing behavior on upgrade. - true: always use externalCertificate. - false: never use externalCertificate (rely on default router cert). |
 | global.sshKnownHosts.data | string | `""` | SSH known hosts file content for Git repository host key verification. |
-| global.storageClassName | string | `""` | Storage class name for the PVCs. Keep empty to use the default storage class. |
+| global.storageClassName | string | `""` | Storage class name for the PVCs. Keep empty to use the default storage class. Note: for a component that also sets volumeName or selector.matchLabels for static PV binding, leaving this empty makes the chart render storageClassName: "" for that PVC instead of omitting the field — see the volumeName comments below. |
 | imageBuilderApi | object | `{"enabled":true,"image":{"image":"quay.io/flightctl/flightctl-imagebuilder-api-el9","pullPolicy":"","tag":""}}` | ImageBuilder API Configuration |
 | imageBuilderApi.enabled | bool | `true` | Enable imagebuilder API service |
 | imageBuilderApi.image.image | string | `"quay.io/flightctl/flightctl-imagebuilder-api-el9"` | ImageBuilder API container image |
 | imageBuilderApi.image.pullPolicy | string | `""` | Image pull policy for ImageBuilder API container |
 | imageBuilderApi.image.tag | string | `""` | ImageBuilder API image tag |
-| imageBuilderWorker | object | `{"defaultTTL":"168h","enabled":true,"image":{"image":"quay.io/flightctl/flightctl-imagebuilder-worker-el9","pullPolicy":"","tag":""},"logLevel":"info","maxConcurrentBuilds":2,"privileged":true,"replicas":1,"resources":{},"rhsmCaSecretName":"","rhsmSecretName":"","sbom":{"enabled":true,"purlTransform":{"enabled":true},"pushToRegistry":true,"uploadToTrustify":true},"serviceImages":{"bootcImageBuilder":{"image":"","skipTlsVerify":false},"podman":{"image":"","skipTlsVerify":false},"syft":{"image":"","skipTlsVerify":false}},"yumReposSecretName":""}` | ImageBuilder Worker Configuration |
+| imageBuilderWorker | object | `{"defaultTTL":"168h","enabled":true,"image":{"image":"quay.io/flightctl/flightctl-imagebuilder-worker-el9","pullPolicy":"","tag":""},"logLevel":"info","maxConcurrentBuilds":2,"privileged":true,"replicas":1,"resources":{},"rhsmCaSecretName":"","rhsmSecretName":"","sbom":{"enabled":true,"purlTransform":{"enabled":true},"pushToRegistry":true,"uploadToTrustify":true},"serviceImages":{"bootcImageBuilder":{"image":"","skipTlsVerify":false},"podman":{"image":"","skipTlsVerify":false},"pullSecretName":"","syft":{"image":"","skipTlsVerify":false}},"yumReposSecretName":""}` | ImageBuilder Worker Configuration |
 | imageBuilderWorker.defaultTTL | string | `"168h"` | Default TTL for image build resources |
 | imageBuilderWorker.enabled | bool | `true` | Enable imagebuilder worker service |
 | imageBuilderWorker.image.image | string | `"quay.io/flightctl/flightctl-imagebuilder-worker-el9"` | ImageBuilder Worker container image |
@@ -367,23 +389,24 @@ For more detailed configuration options, see the [Values](#values) section below
 | imageBuilderWorker.sbom.purlTransform.enabled | bool | `true` | Normalize RPM PURLs (namespace/distro/qualifiers) before push/upload for advisory matching. |
 | imageBuilderWorker.sbom.pushToRegistry | bool | `true` | Attach the SBOM to the pushed image as an OCI 1.1 referrer artifact on the destination registry. |
 | imageBuilderWorker.sbom.uploadToTrustify | bool | `true` | Upload the SBOM to Trustify when vulnerability reporting is enabled and Trustify is configured (same settings as `vulnerabilityReporting` elsewhere in this chart). |
-| imageBuilderWorker.serviceImages | object | `{"bootcImageBuilder":{"image":"","skipTlsVerify":false},"podman":{"image":"","skipTlsVerify":false},"syft":{"image":"","skipTlsVerify":false}}` | Builder images (podman, bootc-image-builder, syft) and skip-TLS options |
+| imageBuilderWorker.serviceImages | object | `{"bootcImageBuilder":{"image":"","skipTlsVerify":false},"podman":{"image":"","skipTlsVerify":false},"pullSecretName":"","syft":{"image":"","skipTlsVerify":false}}` | Builder images (podman, bootc-image-builder, syft) and skip-TLS options |
 | imageBuilderWorker.serviceImages.bootcImageBuilder.image | string | `""` | bootc-image-builder image (leave empty to use default). |
 | imageBuilderWorker.serviceImages.bootcImageBuilder.skipTlsVerify | bool | `false` | Set to true to skip TLS verification when pulling the bootc-image-builder image. |
 | imageBuilderWorker.serviceImages.podman.image | string | `""` | Podman builder image (leave empty to use default). |
 | imageBuilderWorker.serviceImages.podman.skipTlsVerify | bool | `false` | Set to true to skip TLS verification when pulling the Podman builder image. |
+| imageBuilderWorker.serviceImages.pullSecretName | string | `""` | Secret name containing registry credentials (auth.json) for pulling builder service images. Required when serviceImages are hosted in an authenticated or air-gapped registry. The secret must contain a key named `auth.json` in standard podman/Docker auth format. Mounted read-only at /root/.config/containers/auth.json inside the worker container. |
 | imageBuilderWorker.serviceImages.syft.image | string | `""` | Syft image for SBOM generation. If empty, defaults to `docker.io/anchore/syft:v1.44.0`. |
 | imageBuilderWorker.serviceImages.syft.skipTlsVerify | bool | `false` | Set to true to skip TLS verification when pulling the Syft image. |
 | imageBuilderWorker.yumReposSecretName | string | `""` | Secret name containing yum repository configuration files, mounted at /etc/yum.repos.d |
-| kv | object | `{"fsGroup":"","image":{"image":"quay.io/sclorg/redis-7-c9s","pullPolicy":"","tag":"20250108"},"loglevel":"warning","maxmemory":"1gb","maxmemoryPolicy":"allkeys-lru","passwordSecretName":""}` | Key-Value Store Configuration |
-| kv.fsGroup | string | `""` | File system group ID for Redis pod security context |
-| kv.image.image | string | `"quay.io/sclorg/redis-7-c9s"` | Redis container image |
-| kv.image.pullPolicy | string | `""` | Image pull policy for Redis container |
-| kv.image.tag | string | `"20250108"` | Redis image tag |
-| kv.loglevel | string | `"warning"` | Redis log level (debug, verbose, notice, warning) |
-| kv.maxmemory | string | `"1gb"` | Maximum memory usage for Redis |
-| kv.maxmemoryPolicy | string | `"allkeys-lru"` | Redis memory eviction policy |
-| kv.passwordSecretName | string | `""` | Secret containing password for Redis password (leave empty for auto-generation) |
+| kv | object | `{"fsGroup":"","image":{"image":"quay.io/sclorg/valkey-8-c10s","pullPolicy":"","tag":"20260121"},"loglevel":"warning","maxmemory":"1gb","maxmemoryPolicy":"allkeys-lru","passwordSecretName":""}` | Key-Value Store Configuration |
+| kv.fsGroup | string | `""` | File system group ID for Valkey pod security context |
+| kv.image.image | string | `"quay.io/sclorg/valkey-8-c10s"` | Valkey container image |
+| kv.image.pullPolicy | string | `""` | Image pull policy for Valkey container |
+| kv.image.tag | string | `"20260121"` | Valkey image tag |
+| kv.loglevel | string | `"warning"` | Valkey log level (debug, verbose, notice, warning) |
+| kv.maxmemory | string | `"1gb"` | Maximum memory usage for Valkey |
+| kv.maxmemoryPolicy | string | `"allkeys-lru"` | Valkey memory eviction policy |
+| kv.passwordSecretName | string | `""` | Secret containing password for Valkey (leave empty for auto-generation) |
 | periodic | object | `{"clusterLevelSecretAccess":false,"consumers":5,"image":{"image":"quay.io/flightctl/flightctl-periodic-el9","pullPolicy":"","tag":""},"metrics":{"address":":15690","enabled":true}}` | Periodic Configuration |
 | periodic.clusterLevelSecretAccess | bool | `false` | Allow flightctl-periodic to list/watch secrets at the cluster level for change detection |
 | periodic.consumers | int | `5` | Number of periodic consumers |
@@ -393,10 +416,31 @@ For more detailed configuration options, see the [Values](#values) section below
 | periodic.metrics | object | `{"address":":15690","enabled":true}` | Metrics configuration for flightctl-periodic |
 | periodic.metrics.address | string | `":15690"` | Address for the metrics HTTP server |
 | periodic.metrics.enabled | bool | `true` | Enable Prometheus metrics endpoint |
+| remoteAccess | object | `{"enabled":true,"env":{},"image":{"image":"quay.io/flightctl/flightctl-remote-access-el9","pullPolicy":"","tag":""},"logLevel":"info","resources":{"limits":{"cpu":"500m","memory":"256Mi"},"requests":{"cpu":"100m","memory":"128Mi"}}}` | Remote Access Configuration |
+| remoteAccess.enabled | bool | `true` | Enable remote access service |
+| remoteAccess.env | object | `{}` | Additional environment variables for the remote access container |
+| remoteAccess.image.image | string | `"quay.io/flightctl/flightctl-remote-access-el9"` | Remote access container image |
+| remoteAccess.image.pullPolicy | string | `""` | Image pull policy for remote access container |
+| remoteAccess.image.tag | string | `""` | Remote access image tag (leave empty to use chart appVersion) |
+| remoteAccess.logLevel | string | `"info"` | Log level for the remote access service |
+| remoteAccess.resources | object | `{"limits":{"cpu":"500m","memory":"256Mi"},"requests":{"cpu":"100m","memory":"128Mi"}}` | Resource requests and limits for the remote access container |
 | telemetryGateway.additionalRouteLabels | string | `nil` |  |
+| telemetryGateway.extraEnvs | list | `[]` | Extra environment variables for the telemetry gateway container. Use to inject secrets for forward header values via ${VAR} expansion. |
+| telemetryGateway.extraVolumeMounts | list | `[]` | Extra volume mounts for the telemetry gateway container. Use to mount TLS certificates for mTLS forward connections. |
+| telemetryGateway.extraVolumes | list | `[]` | Extra volumes for the telemetry gateway pod. |
+| telemetryGateway.forward | object | `{"endpoint":"","headers":{},"tls":{"caFile":"","certFile":"","insecureSkipTlsVerify":false,"keyFile":""}}` | Forward telemetry to an upstream OTLP collector. Uses OTLP/gRPC for bare host:port endpoints, OTLP/HTTP for http(s):// URLs. Header values support ${ENV_VAR} expansion for secret injection. |
+| telemetryGateway.forward.endpoint | string | `""` | Upstream OTLP endpoint (e.g. "collector:4317" for gRPC, "https://host/api/v2/otlp" for HTTP) |
+| telemetryGateway.forward.headers | object | `{}` | Custom HTTP headers for authentication (only used with OTLP/HTTP endpoints). Values support ${ENV_VAR} expansion — use extraEnvs with secretKeyRef to avoid storing tokens in the ConfigMap. |
+| telemetryGateway.forward.tls.caFile | string | `""` | Path to CA certificate file |
+| telemetryGateway.forward.tls.certFile | string | `""` | Path to client certificate file (for mTLS) |
+| telemetryGateway.forward.tls.insecureSkipTlsVerify | bool | `false` | Skip TLS certificate verification |
+| telemetryGateway.forward.tls.keyFile | string | `""` | Path to client key file (for mTLS) |
 | telemetryGateway.image.image | string | `"quay.io/flightctl/flightctl-telemetry-gateway-el9"` | Telemetry gateway container image |
 | telemetryGateway.image.pullPolicy | string | `""` | Image pull policy for Telemetry gateway container |
 | telemetryGateway.image.tag | string | `""` | Telemetry gateway image tag |
+| ubiMinimal | object | `{"image":"registry.access.redhat.com/ubi9/ubi-minimal","tag":"9.7-1763362218"}` | UBI Minimal base image used by init containers (cert setup, etc.) Override this when deploying in an air-gapped environment where registry.access.redhat.com is unreachable — set image and tag to the mirrored location produced by the flightctl-mirror-images tool. |
+| ubiMinimal.image | string | `"registry.access.redhat.com/ubi9/ubi-minimal"` | UBI minimal image repository |
+| ubiMinimal.tag | string | `"9.7-1763362218"` | UBI minimal image tag (pinned to avoid unexpected updates) |
 | ui | object | `{"additionalRouteLabels":null,"auth":{"caCert":"","insecureSkipTlsVerify":false},"enabled":true,"image":{"image":"quay.io/flightctl/flightctl-ui-el9","pluginImage":"quay.io/flightctl/flightctl-ocp-ui-el9","pullPolicy":"","tag":""},"trustXForwardedHeaders":true,"trustedProxyCidrs":""}` | UI Configuration |
 | ui.additionalRouteLabels | string | `nil` | Additional labels for UI routes. |
 | ui.auth.caCert | string | `""` | A custom CA cert for Auth TLS. |
@@ -408,23 +452,38 @@ For more detailed configuration options, see the [Values](#values) section below
 | ui.image.tag | string | `""` | UI container image tag |
 | ui.trustXForwardedHeaders | bool | `true` | When true, the UI proxy uses X-Forwarded-Proto and X-Forwarded-Host for OAuth redirect validation (required when TLS terminates at an ingress). Disable if the UI is reached directly without a trusted reverse proxy. Optional trustedProxyCidrs restricts this to listed CIDRs. |
 | ui.trustedProxyCidrs | string | `""` | Comma-separated CIDRs for immediate clients that may set forwarded headers (e.g. ingress pod network). Empty means any client when trustXForwardedHeaders is true. |
-| upgradeHooks | object | `{"databaseMigrationDryRun":true,"scaleDown":{"condition":"chart","deployments":["flightctl-periodic","flightctl-worker"],"timeoutSeconds":120}}` | Upgrade hooks |
+| upgradeHooks | object | `{"databaseMigrationDryRun":true,"scaleDown":{"condition":"chart","deployments":["flightctl-periodic","flightctl-worker","flightctl-delta-worker"],"timeoutSeconds":120}}` | Upgrade hooks |
 | upgradeHooks.databaseMigrationDryRun | bool | `true` | Enable pre-upgrade DB migration dry-run as a hook |
 | upgradeHooks.scaleDown.condition | string | `"chart"` | When to run pre-upgrade scale down job: "always", "never", or "chart" (default). "chart" runs only if helm.sh/chart changed. |
-| upgradeHooks.scaleDown.deployments | list | `["flightctl-periodic","flightctl-worker"]` | List of Deployments to scale down in order |
+| upgradeHooks.scaleDown.deployments | list | `["flightctl-periodic","flightctl-worker","flightctl-delta-worker"]` | List of Deployments to scale down in order |
 | upgradeHooks.scaleDown.timeoutSeconds | int | `120` | Timeout in seconds to wait for rollout per Deployment |
-| vulnerabilityReporting | object | `{"enabled":false,"syncInterval":"15m","trustify":{"auth":{"mode":"none","oidcIssuerUrl":"","secretName":""},"endpoint":""}}` | Vulnerability Integration Configuration |
+| vulnerabilityReporting | object | `{"backend":"","enabled":false,"quay":{"caCertConfigMapName":"","caFile":"","endpoint":"","maxConcurrentRequests":5,"secretName":"","skipTlsVerify":false},"syncInterval":"15m","trustify":{"auth":{"mode":"none","oidcIssuerUrl":"","secretName":""},"caCertConfigMapName":"","caFile":"","endpoint":"","skipTlsVerify":false}}` | Vulnerability Integration Configuration |
+| vulnerabilityReporting.backend | string | `""` | Vulnerability scanning backend ("trustify" or "quay"); leave empty to default to Trustify when a trustify config with a non-empty endpoint is present. |
 | vulnerabilityReporting.enabled | bool | `false` | Enable vulnerability integration (sync task + API endpoints). |
+| vulnerabilityReporting.quay.caCertConfigMapName | string | `""` | Name of a ConfigMap containing key 'ca-cert.pem' with the CA bundle for the Quay server. When set, it is mounted and used instead of caFile. |
+| vulnerabilityReporting.quay.caFile | string | `""` | Path to a CA bundle for verifying the Quay server certificate. If unset, system roots are used. |
+| vulnerabilityReporting.quay.endpoint | string | `""` | Quay API base URL (e.g. "https://quay.io"). |
+| vulnerabilityReporting.quay.maxConcurrentRequests | int | `5` | Maximum number of concurrent Quay API requests. Defaults to 5 when unset. |
+| vulnerabilityReporting.quay.secretName | string | `""` | Name of the Kubernetes Secret containing the 'token' key for Quay Security API bearer authentication. |
+| vulnerabilityReporting.quay.skipTlsVerify | bool | `false` | Skip TLS certificate verification (insecure, for lab/air-gap only). Defaults to false. |
 | vulnerabilityReporting.syncInterval | string | `"15m"` | Sync interval for periodic Trustify fetch (e.g. "15m", "1h"). |
 | vulnerabilityReporting.trustify.auth.mode | string | `"none"` | Authentication mode for Trustify. Allowed values: 'client-credentials', 'none'. |
 | vulnerabilityReporting.trustify.auth.oidcIssuerUrl | string | `""` | OIDC issuer URL for client-credentials mode. |
 | vulnerabilityReporting.trustify.auth.secretName | string | `""` | Name of the Kubernetes Secret containing 'client_id' and 'client_secret' keys. |
+| vulnerabilityReporting.trustify.caCertConfigMapName | string | `""` | Name of a ConfigMap containing key 'ca-cert.pem' with the CA bundle for the Trustify server. When set, it is mounted and used instead of caFile. |
+| vulnerabilityReporting.trustify.caFile | string | `""` | Path to a CA bundle for verifying the Trustify server certificate. If unset, system roots are used. |
 | vulnerabilityReporting.trustify.endpoint | string | `""` | Trustify API base URL (do not include /api/v1 or /api/v2 paths). |
-| worker | object | `{"clusterLevelSecretAccess":false,"image":{"image":"quay.io/flightctl/flightctl-worker-el9","pullPolicy":"","tag":""}}` | Worker Configuration |
+| vulnerabilityReporting.trustify.skipTlsVerify | bool | `false` | Skip TLS certificate verification (insecure, for lab/air-gap only). Defaults to false. |
+| worker | object | `{"clusterLevelSecretAccess":false,"image":{"image":"quay.io/flightctl/flightctl-worker-el9","pullPolicy":"","tag":""},"renderTimeout":"60s","vmRender":{"launcherImage":"","launcherImages":{},"passtWorkarounds":false}}` | Worker Configuration |
 | worker.clusterLevelSecretAccess | bool | `false` | Allow flightctl-worker to access secrets at the cluster level for embedding in device configs |
 | worker.image.image | string | `"quay.io/flightctl/flightctl-worker-el9"` | Worker container image |
 | worker.image.pullPolicy | string | `""` | Image pull policy for worker container |
 | worker.image.tag | string | `""` | Worker image tag |
+| worker.renderTimeout | string | `"60s"` | Time budget for a single device render operation including VM conversion and DB writes (default "60s") |
+| worker.vmRender | object | `{"launcherImage":"","launcherImages":{},"passtWorkarounds":false}` | VM application render options passed to vm-to-quadlet |
+| worker.vmRender.launcherImage | string | `""` | virt-launcher image used when converting VmApplications to Quadlet units (leave empty to use the worker default) |
+| worker.vmRender.launcherImages | object | `{}` | virt-launcher images keyed by os-release ID and major from status.systemInfo (e.g. "rhel-9", "rhel-10") |
+| worker.vmRender.passtWorkarounds | bool | `false` | Enable passt networking workarounds for older virt-launcher images (default false; enable only for older images) |
 
 ## Environment-Specific Values Files
 

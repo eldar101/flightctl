@@ -2,6 +2,27 @@
 
 This document outlines the network requirements, port configurations, and firewall settings necessary for deploying and operating Flight Control.
 
+## System requirements
+
+The following table shows the minimum recommended VM resources for the Flight Control
+server based on the number of managed devices. These values were established through
+benchmarking and represent the resources needed for the server host — not the managed
+edge devices themselves.
+
+| Deployment size | Managed devices | vCPU (cores) | vRAM (GB) | vDisk (GB) |
+|---|---|---|---|---|
+| **Small** | 100 | 4 | 4 | 70 |
+| **Medium** | 1,000 | 4 | 8 | 70 |
+| **Large** | 10,000 | 4 | 16 | 70 |
+| **Super Large** | 100,000 | 8 | 40 | 120 |
+
+> [!NOTE]
+> These figures are based on benchmarking with an earlier version of Flight Control
+> and represent a reasonable baseline. Actual resource usage depends on polling
+> intervals, fleet template complexity, and observability stack configuration. Add
+> approximately 3 GB disk for each additional service component (image builder,
+> observability stack).
+
 ## Overview
 
 Flight Control is a distributed system consisting of multiple services that communicate over the network. This document provides the information needed to configure firewalls, load balancers, and network policies to ensure proper operation.
@@ -448,9 +469,27 @@ telnet api.flightctl.example.com 3443
 
 ### Air-Gapped Environment
 
-- Requires local container registry
-- May need proxy configuration
-- Ensure all required images are mirrored locally
+Air-gapped installations require all artifacts to be transferred to the target machine
+before installation begins. The specific steps depend on what you are installing:
+
+- **Agent and CLI on RHEL** — Download `flightctl-agent` and `flightctl-cli` RPMs on a
+  connected prep machine using `dnf download` or `dnf reposync`, transfer them via
+  portable media, and install locally with `dnf`. See
+  [Installing the Flight Control agent offline on RHEL](installing-agent-offline.md).
+
+- **Local RPM repository** — To create a full offline repository that the target machine
+  can use as a `dnf` source (with full dependency resolution), mirror the FlightCtl
+  repo using `dnf reposync`. See
+  [Setting up a local RPM repository](offline-rpm-repository.md).
+
+- **Container images for server or workloads** — Use the `flightctl-mirror-images --bundle`
+  command to create a portable archive of all required images. The archive includes
+  an `import.sh` script that pushes images into a local container registry on the
+  target. See the [air-gap mirroring guide](../../../scripts/air-gap/README.md).
+
+- **Portable media formats** — Artifacts can be transferred via tar archive, USB drive
+  (ext4 or exFAT), ISO image, or local network share. See
+  [Packaging artifacts for portable media](offline-portable-media.md).
 
 ## Port Reference Table
 

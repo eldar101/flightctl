@@ -196,6 +196,20 @@ func TestStaticAuthZ_CheckPermission(t *testing.T) {
 			expected: true,
 		},
 		{
+			name:     "viewer cannot access devices/applications/console",
+			roles:    []string{v1beta1.RoleViewer},
+			resource: "devices/applications/console",
+			op:       "get",
+			expected: false,
+		},
+		{
+			name:     "operator can access devices/applications/console",
+			roles:    []string{v1beta1.RoleOperator},
+			resource: "devices/applications/console",
+			op:       "get",
+			expected: true,
+		},
+		{
 			name:     "viewer can list catalog",
 			roles:    []string{v1beta1.RoleViewer},
 			resource: "catalogs",
@@ -385,8 +399,16 @@ func TestStaticAuthZ_GetUserPermissions(t *testing.T) {
 					Operations: []string{"create", "delete", "get", "list", "patch", "update"},
 				},
 				{
+					Resource:   "devices/applications/lifecycle",
+					Operations: []string{"update"},
+				},
+				{
 					Resource:   "fleets",
 					Operations: []string{"create", "delete", "get", "list", "patch", "update"},
+				},
+				{
+					Resource:   "fleets/applications/lifecycle",
+					Operations: []string{"update"},
 				},
 				{
 					Resource:   "imagebuilds",
@@ -443,6 +465,10 @@ func TestStaticAuthZ_GetUserPermissions(t *testing.T) {
 					Operations: []string{"get", "list"},
 				},
 				{
+					Resource:   "devices/applications/console",
+					Operations: []string{}, // Explicitly denied
+				},
+				{
 					Resource:   "devices/console",
 					Operations: []string{}, // Explicitly denied
 				},
@@ -497,6 +523,10 @@ func TestStaticAuthZ_GetUserPermissions(t *testing.T) {
 				{
 					Resource:   "certificatesigningrequests",
 					Operations: []string{"create", "get", "list", "update"},
+				},
+				{
+					Resource:   "devices/applications/console",
+					Operations: []string{}, // Explicitly denied by viewer, installer does not grant it
 				},
 				{
 					Resource:   "devices/console",

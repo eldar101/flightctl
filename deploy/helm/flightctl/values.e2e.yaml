@@ -12,15 +12,23 @@ api:
 cliArtifacts:
   enabled: true
 worker:
+  clusterLevelSecretAccess: true
   env:
     GORM_TRACE_ENFORCE_FATAL: "true"
     GORM_TRACE_INCLUDE_QUERY_VARIABLES: "true"
 periodic:
+  clusterLevelSecretAccess: true
   env:
     GORM_TRACE_ENFORCE_FATAL: "true"
     GORM_TRACE_INCLUDE_QUERY_VARIABLES: "true"
   tasks:
     resourceSync:
+      schedule:
+        interval: 5s
+    dependencySync:
+      schedule:
+        interval: 5s
+    repositoryTester:
       schedule:
         interval: 5s
 alertExporter:

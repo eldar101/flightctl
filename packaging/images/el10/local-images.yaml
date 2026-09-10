@@ -7,6 +7,9 @@ periodic:
 worker:
   image: flightctl-worker-el10
   tag: latest
+delta-worker:
+  image: flightctl-delta-worker-el10
+  tag: latest
 alert-exporter:
   image: flightctl-alert-exporter-el10
   tag: latest
@@ -23,15 +26,14 @@ db-setup:
   image: flightctl-db-setup-el10
   tag: latest
 gateway:
-  image: quay.io/sclorg/nginx-126-c10s
-  tag: "20260421"
+  image: registry.access.redhat.com/ubi10/nginx-126
+  tag: "1785834652"
 ui:
   # UI images are built from flightctl-ui repo
   image: quay.io/flightctl/flightctl-ui-el10
   tag: latest
 db:
-  # Using CentOS Stream 10 PostgreSQL for EL10 flavor
-  image: quay.io/sclorg/postgresql-16-c10s
+  image: quay.io/sclorg/postgresql-16-c9s
   tag: "20250214"
 kv:
   # Using Valkey (Redis replacement) for EL10 flavor
@@ -59,4 +61,7 @@ telemetry-gateway:
   tag: latest
 userinfo-proxy:
   image: flightctl-userinfo-proxy-el10
+  tag: latest
+remote-access:
+  image: flightctl-remote-access-el10
   tag: latest

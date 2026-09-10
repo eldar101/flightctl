@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"path/filepath"
 	"testing"
 	"time"
@@ -212,16 +213,15 @@ func TestEnsure(t *testing.T) {
 			cache:            newCache(log),
 		}
 
-		// First loop: check all 3 files for allMissing detection (all return false)
+		// single loop: all 3 files missing (allMissing=true, anyMissing=true)
 		mockReadWriter.EXPECT().PathExists(gomock.Any()).Times(3).Return(false, nil)
-		// Second loop: check current file, find it missing, attempt write and fail
-		mockReadWriter.EXPECT().PathExists(gomock.Any()).Times(1).Return(false, nil)
+		// write loop: attempt to write first file and fail
 		mockReadWriter.EXPECT().WriteFile(gomock.Any(), gomock.Any(), gomock.Any()).Return(fileErr)
 		err := s.Ensure()
 		require.ErrorIs(err, errors.ErrWritingRenderedSpec)
 	})
 
-	t.Run("files are written when they don't exist", func(t *testing.T) {
+	t.Run("one file missing resets all specs to zero", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		defer ctrl.Finish()
 
@@ -234,20 +234,23 @@ func TestEnsure(t *testing.T) {
 			deviceReadWriter: mockReadWriter,
 			queue:            mockPriorityQueue,
 			cache:            newCache(log),
+			publisher:        newPublisher("test", poll.NewConfig(time.Second, 1.5), defaultErrorBackoff(), "1", nil, log),
 		}
 
-		// First loop: check first file, it exists, break early
+		// single loop: current exists, desired exists, rollback missing (allMissing=false, anyMissing=true)
 		mockReadWriter.EXPECT().PathExists(gomock.Any()).Times(1).Return(true, nil)
-		// Second loop: check all 3 files
-		mockReadWriter.EXPECT().PathExists(gomock.Any()).Times(1).Return(true, nil)  // current exists
-		mockReadWriter.EXPECT().PathExists(gomock.Any()).Times(1).Return(true, nil)  // desired exists
-		mockReadWriter.EXPECT().PathExists(gomock.Any()).Times(1).Return(false, nil) // rollback missing
-		// Write the missing file
-		mockReadWriter.EXPECT().WriteFile(gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(nil)
+		mockReadWriter.EXPECT().PathExists(gomock.Any()).Times(1).Return(true, nil)
+		mockReadWriter.EXPECT().PathExists(gomock.Any()).Times(1).Return(false, nil)
+		// write loop: all 3 files reset to "0"
+		mockReadWriter.EXPECT().WriteFile(gomock.Any(), gomock.Any(), gomock.Any()).Times(3).Return(nil)
 		mockReadWriter.EXPECT().ReadFile(gomock.Any()).Return([]byte(`{}`), nil).Times(3)
 		mockPriorityQueue.EXPECT().Add(gomock.Any(), gomock.Any()).Times(1)
 		err := s.Ensure()
 		require.NoError(err)
+
+		// publisher version should be reset to "0" during recovery
+		pub := s.publisher.(*publisher)
+		require.Equal("0", pub.lastKnownVersion)
 	})
 
 	t.Run("no files are written when they all exist", func(t *testing.T) {
@@ -265,9 +268,7 @@ func TestEnsure(t *testing.T) {
 			cache:            newCache(log),
 		}
 
-		// First loop: check all 3 files for allMissing detection - all exist, break early
-		mockReadWriter.EXPECT().PathExists(gomock.Any()).Times(1).Return(true, nil)
-		// Second loop: check each file before potentially creating - all exist
+		// single loop: all 3 files exist (allMissing=false, anyMissing=false)
 		mockReadWriter.EXPECT().PathExists(gomock.Any()).Times(3).Return(true, nil)
 		mockReadWriter.EXPECT().ReadFile(gomock.Any()).Return([]byte(`{}`), nil).Times(3)
 		mockPriorityQueue.EXPECT().Add(gomock.Any(), gomock.Any()).Times(1)
@@ -469,7 +470,7 @@ func TestUpgrade(t *testing.T) {
 	}
 }
 
-func TestIsOSUpdate(t *testing.T) {
+func TestShouldApplyOSImageUpdate(t *testing.T) {
 	require := require.New(t)
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
@@ -491,7 +492,7 @@ func TestIsOSUpdate(t *testing.T) {
 		s.cache.current.osVersion = ""
 		s.cache.desired.osVersion = ""
 
-		osUpdate := s.IsOSUpdate()
+		osUpdate := s.ShouldApplyOSImageUpdate()
 		require.Equal(false, osUpdate)
 	})
 
@@ -501,7 +502,7 @@ func TestIsOSUpdate(t *testing.T) {
 		s.cache.current.osVersion = image
 		s.cache.desired.osVersion = image
 
-		osUpdate := s.IsOSUpdate()
+		osUpdate := s.ShouldApplyOSImageUpdate()
 		require.Equal(false, osUpdate)
 	})
 
@@ -511,8 +512,32 @@ func TestIsOSUpdate(t *testing.T) {
 		s.cache.current.osVersion = currentImage
 		s.cache.desired.osVersion = desiredImage
 
-		osUpdate := s.IsOSUpdate()
+		osUpdate := s.ShouldApplyOSImageUpdate()
 		require.Equal(true, osUpdate)
+	})
+
+	t.Run("When mode is package it should return false even when versions differ", func(t *testing.T) {
+		s.caps.OsMode = v1beta1.OsModePackage
+		s.cache.current.osVersion = "flightctl-device:v2"
+		s.cache.desired.osVersion = "flightctl-device:v3"
+
+		require.False(s.ShouldApplyOSImageUpdate())
+	})
+
+	t.Run("When mode is image it should retain version comparison", func(t *testing.T) {
+		s.caps.OsMode = v1beta1.OsModeImage
+		s.cache.current.osVersion = "flightctl-device:v2"
+		s.cache.desired.osVersion = "flightctl-device:v3"
+
+		require.True(s.ShouldApplyOSImageUpdate())
+	})
+
+	t.Run("When mode is unset it should retain version comparison", func(t *testing.T) {
+		s.caps.OsMode = ""
+		s.cache.current.osVersion = "flightctl-device:v2"
+		s.cache.desired.osVersion = "flightctl-device:v3"
+
+		require.True(s.ShouldApplyOSImageUpdate())
 	})
 }
 
@@ -733,6 +758,114 @@ func TestCreateRollback(t *testing.T) {
 	})
 }
 
+func TestGetRollbackInfo(t *testing.T) {
+	require := require.New(t)
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockReadWriter := fileio.NewMockReadWriter(ctrl)
+	log := log.NewPrefixLogger("test")
+	rollbackPath := "test/rollback.json"
+	s := &manager{
+		log:              log,
+		deviceReadWriter: mockReadWriter,
+		rollbackPath:     rollbackPath,
+		cache:            newCache(log),
+	}
+
+	t.Run("When rollback spec is missing it should return empty info", func(t *testing.T) {
+		mockReadWriter.EXPECT().ReadFile(rollbackPath).Return(nil, errors.ErrNotExist)
+		info, err := s.GetRollbackInfo()
+		require.NoError(err)
+		require.Empty(info.Version)
+		require.Empty(info.SpecHash)
+		require.Empty(info.ErrorMessage)
+	})
+
+	t.Run("When annotations are nil it should return empty info", func(t *testing.T) {
+		device := &v1beta1.Device{
+			Metadata: v1beta1.ObjectMeta{},
+			Spec:     &v1beta1.DeviceSpec{},
+		}
+		b, err := json.Marshal(device)
+		require.NoError(err)
+		mockReadWriter.EXPECT().ReadFile(rollbackPath).Return(b, nil)
+		info, err := s.GetRollbackInfo()
+		require.NoError(err)
+		require.Empty(info.ErrorMessage)
+	})
+
+	t.Run("When error message is stored it should return it", func(t *testing.T) {
+		device := createTestRenderedDevice("flightctl-device:v1")
+		(*device.Metadata.Annotations)[annotationDesiredVersion] = "6"
+		(*device.Metadata.Annotations)[annotationDesiredSpecHash] = "abc123"
+		(*device.Metadata.Annotations)[annotationRollbackError] = "prefetch failed for quay.io/flightctl/images:doesnotexist"
+		b, err := json.Marshal(device)
+		require.NoError(err)
+		mockReadWriter.EXPECT().ReadFile(rollbackPath).Return(b, nil)
+		info, err := s.GetRollbackInfo()
+		require.NoError(err)
+		require.Equal("6", info.Version)
+		require.Equal("abc123", info.SpecHash)
+		require.Equal("prefetch failed for quay.io/flightctl/images:doesnotexist", info.ErrorMessage)
+	})
+}
+
+func TestRecordRollbackError(t *testing.T) {
+	require := require.New(t)
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mockReadWriter := fileio.NewMockReadWriter(ctrl)
+	log := log.NewPrefixLogger("test")
+	rollbackPath := "test/rollback.json"
+	s := &manager{
+		log:              log,
+		deviceReadWriter: mockReadWriter,
+		rollbackPath:     rollbackPath,
+		cache:            newCache(log),
+	}
+
+	t.Run("When message is empty it should be a no-op", func(t *testing.T) {
+		err := s.RecordRollbackError(ctx, "")
+		require.NoError(err)
+	})
+
+	t.Run("When rollback spec is missing it should propagate the error", func(t *testing.T) {
+		mockReadWriter.EXPECT().ReadFile(rollbackPath).Return(nil, errors.ErrNotExist)
+		err := s.RecordRollbackError(ctx, "prefetch failed for bad-image")
+		require.ErrorIs(err, errors.ErrMissingRenderedSpec)
+	})
+
+	t.Run("When rollback spec cannot be read it should propagate the error", func(t *testing.T) {
+		mockReadWriter.EXPECT().ReadFile(rollbackPath).Return(nil, errors.New("read error"))
+		err := s.RecordRollbackError(ctx, "prefetch failed for bad-image")
+		require.ErrorIs(err, errors.ErrReadingRenderedSpec)
+	})
+
+	t.Run("When rollback spec exists it should persist the error message", func(t *testing.T) {
+		device := createTestRenderedDevice("flightctl-device:v1")
+		(*device.Metadata.Annotations)[annotationDesiredVersion] = "6"
+		existing, err := json.Marshal(device)
+		require.NoError(err)
+		mockReadWriter.EXPECT().ReadFile(rollbackPath).Return(existing, nil)
+		mockReadWriter.EXPECT().WriteFile(rollbackPath, gomock.Any(), gomock.Any()).DoAndReturn(
+			func(_ string, data []byte, _ fs.FileMode, _ ...fileio.FileOption) error {
+				var written v1beta1.Device
+				require.NoError(json.Unmarshal(data, &written))
+				require.Equal("6", (*written.Metadata.Annotations)[annotationDesiredVersion])
+				require.Equal("prefetch failed for bad-image", (*written.Metadata.Annotations)[annotationRollbackError])
+				return nil
+			},
+		)
+		err = s.RecordRollbackError(ctx, "prefetch failed for bad-image")
+		require.NoError(err)
+	})
+}
+
 func TestRollback(t *testing.T) {
 	require := require.New(t)
 	testCases := []struct {
@@ -828,7 +961,7 @@ func TestRollback(t *testing.T) {
 			)
 			log := log.NewPrefixLogger("test")
 			mockPolicyManager := policy.NewMockManager(ctrl)
-			pub := newPublisher("testDevice", poll.NewConfig(10*time.Millisecond, 1.5), "0", nil, log)
+			pub := newPublisher("testDevice", poll.NewConfig(10*time.Millisecond, 1.5), defaultErrorBackoff(), "0", nil, log)
 			cache := newCache(log)
 			queue := newQueueManager(
 				defaultSpecQueueMaxSize,

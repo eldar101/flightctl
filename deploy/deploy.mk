@@ -31,6 +31,9 @@ redeploy-api: flightctl-api-container
 redeploy-worker: flightctl-worker-container
 	test/scripts/redeploy.sh worker
 
+redeploy-delta-worker: flightctl-delta-worker-container
+	test/scripts/redeploy.sh delta-worker
+
 redeploy-periodic: flightctl-periodic-container
 	test/scripts/redeploy.sh periodic
 
@@ -49,9 +52,11 @@ redeploy-imagebuilder-worker: flightctl-imagebuilder-worker-container
 redeploy-imagebuilder-api: flightctl-imagebuilder-api-container
 	test/scripts/redeploy.sh imagebuilder-api
 
+redeploy-remote-access: flightctl-remote-access-container
+	test/scripts/redeploy.sh remote-access
 
 ifndef SKIP_BUILD
-deploy-helm: flightctl-api-container flightctl-db-setup-container flightctl-worker-container flightctl-periodic-container flightctl-alert-exporter-container flightctl-alertmanager-proxy-container flightctl-imagebuilder-api-container flightctl-imagebuilder-worker-container flightctl-multiarch-cli-container flightctl-telemetry-gateway-container
+deploy-helm: flightctl-api-container flightctl-db-setup-container flightctl-worker-container flightctl-delta-worker-container flightctl-periodic-container flightctl-alert-exporter-container flightctl-alertmanager-proxy-container flightctl-imagebuilder-api-container flightctl-imagebuilder-worker-container flightctl-multiarch-cli-container flightctl-telemetry-gateway-container flightctl-remote-access-container
 endif
 deploy-helm:
 	kubectl config set-context kind-kind
@@ -84,6 +89,7 @@ ifndef SKIP_BUILD
 	podman save flightctl-api-$(OS):latest | sudo podman load
 	podman save flightctl-db-setup-$(OS):latest | sudo podman load
 	podman save flightctl-worker-$(OS):latest | sudo podman load
+	podman save flightctl-delta-worker-$(OS):latest | sudo podman load
 	podman save flightctl-periodic-$(OS):latest | sudo podman load
 	podman save flightctl-alert-exporter-$(OS):latest | sudo podman load
 	podman save flightctl-cli-artifacts-$(OS):latest | sudo podman load
@@ -93,6 +99,7 @@ ifndef SKIP_BUILD
 	podman save flightctl-imagebuilder-worker-$(OS):latest | sudo podman load
 	podman save flightctl-userinfo-proxy-$(OS):latest | sudo podman load
 	podman save flightctl-telemetry-gateway-$(OS):latest | sudo podman load
+	podman save flightctl-remote-access-$(OS):latest | sudo podman load
 endif
 	$(MAKE) build-standalone
 	sudo -E OS="$(OS)" deploy/scripts/deploy_quadlets.sh

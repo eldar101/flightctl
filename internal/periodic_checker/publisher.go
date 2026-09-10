@@ -4,6 +4,7 @@ import (
 	"container/heap"
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"sync"
 	"time"
 
@@ -13,7 +14,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/samber/lo"
 	"github.com/sirupsen/logrus"
-	"golang.org/x/exp/rand"
 )
 
 const (
@@ -60,7 +60,7 @@ func NewTaskHeap() *TaskHeap {
 }
 
 type OrganizationService interface {
-	ListOrganizations(ctx context.Context, params domain.ListOrganizationsParams) (*domain.OrganizationList, domain.Status)
+	ListAllOrganizations(ctx context.Context, params domain.ListOrganizationsParams) (*domain.OrganizationList, domain.Status)
 }
 
 type TaskChannelManager interface {
@@ -310,7 +310,7 @@ func (p *PeriodicTaskPublisher) organizationSyncLoop(ctx context.Context) {
 func (p *PeriodicTaskPublisher) syncOrganizations(ctx context.Context) {
 	p.log.Info("Syncing organizations")
 
-	orgList, status := p.orgService.ListOrganizations(ctx, domain.ListOrganizationsParams{})
+	orgList, status := p.orgService.ListAllOrganizations(ctx, domain.ListOrganizationsParams{})
 	if status.Code < 200 || status.Code >= 300 {
 		p.log.Errorf("Failed to list organizations: %v", status)
 		return
@@ -353,7 +353,7 @@ func (p *PeriodicTaskPublisher) addOrganizationTasks(orgID uuid.UUID) {
 		if staggerRange <= 0 {
 			staggerRange = time.Millisecond
 		}
-		stagger := time.Duration(rand.Intn(int(staggerRange)))
+		stagger := time.Duration(rand.IntN(int(staggerRange))) //nolint:gosec // G404: task-scheduling stagger jitter
 		nextRun := now.Add(stagger)
 
 		task := &ScheduledTask{
@@ -391,7 +391,7 @@ func (p *PeriodicTaskPublisher) addSystemWideTasks() {
 		if staggerRange <= 0 {
 			staggerRange = time.Millisecond
 		}
-		stagger := time.Duration(rand.Intn(int(staggerRange)))
+		stagger := time.Duration(rand.IntN(int(staggerRange))) //nolint:gosec // G404: task-scheduling stagger jitter
 		nextRun := now.Add(stagger)
 
 		// System-wide tasks use a special "system" orgID (nil UUID)

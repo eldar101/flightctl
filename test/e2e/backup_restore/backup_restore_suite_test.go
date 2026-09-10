@@ -10,6 +10,7 @@ import (
 	"github.com/flightctl/flightctl/test/e2e/infra/auxiliary"
 	"github.com/flightctl/flightctl/test/e2e/infra/setup"
 	"github.com/flightctl/flightctl/test/harness/e2e"
+	"github.com/flightctl/flightctl/test/login"
 	testutil "github.com/flightctl/flightctl/test/util"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -35,12 +36,11 @@ func TestBackupRestore(t *testing.T) {
 }
 
 var _ = BeforeSuite(func() {
-	auxSvcs = auxiliary.Get(context.Background())
+	auxFuture := e2e.StartAuxServicesAsync(context.Background())
 	Expect(setup.EnsureDefaultProviders(nil)).To(Succeed())
-	if reason := backupRestoreExternalDBSkipReason(); reason != "" {
-		Skip(reason)
-	}
-	_, _, err := e2e.SetupWorkerHarness()
+	// Most specs only exercise backup/restore binaries against the cluster; VM pool is started on demand for e2e.NeedVMLabel specs.
+	_, _, err := e2e.SetupWorkerHarnessWithoutVM()
+	auxSvcs = auxFuture.Wait()
 	Expect(err).ToNot(HaveOccurred())
 })
 
@@ -54,8 +54,10 @@ var _ = BeforeEach(func() {
 	ctx := testutil.StartSpecTracerForGinkgo(suiteCtx)
 	harness.SetTestContext(ctx)
 
-	err := harness.SetupVMFromPoolAndStartAgent(workerID)
-	Expect(err).ToNot(HaveOccurred())
+	if e2e.CurrentSpecNeedsVM() {
+		err := harness.SetupVMFromPoolAndStartAgent(workerID)
+		Expect(err).ToNot(HaveOccurred())
+	}
 
 	GinkgoWriter.Printf("✅ [BeforeEach] Worker %d: Backup/restore test setup completed\n", workerID)
 })
@@ -69,6 +71,10 @@ var _ = AfterEach(func() {
 
 	harness.PrintAgentLogsIfFailed()
 	harness.CaptureDeploymentLogsIfFailed()
+	Eventually(func() error {
+		_, err := login.LoginToAPIWithToken(harness)
+		return err
+	}, testutil.DURATION_TIMEOUT, testutil.POLLING).Should(Succeed(), "API should be responsive before cleanup")
 	err := harness.CleanUpAllTestResources()
 	Expect(err).ToNot(HaveOccurred())
 	harness.SetTestContext(suiteCtx)

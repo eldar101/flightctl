@@ -93,6 +93,33 @@ func TestFlattenedConfig(t *testing.T) {
 	require.Equal(config.Service.CertificateAuthorityData, []byte(certData))
 }
 
+func TestNewHTTPClientForServerSetsProxyFromEnvironment(t *testing.T) {
+	require := require.New(t)
+
+	config := &Config{
+		Service: Service{
+			Server:             "https://localhost:3443",
+			InsecureSkipVerify: true,
+		},
+	}
+	httpClient, err := NewHTTPClientForServer(config, config.Service.Server)
+	require.NoError(err)
+	require.NotNil(httpClient)
+
+	baseTransport := httpClient.Transport
+	for {
+		unwrapper, ok := baseTransport.(interface{ UnwrapTransport() http.RoundTripper })
+		if !ok {
+			break
+		}
+		baseTransport = unwrapper.UnwrapTransport()
+	}
+
+	httpTransport, ok := baseTransport.(*http.Transport)
+	require.True(ok)
+	require.NotNil(httpTransport.Proxy, "Transport.Proxy must be set so the agent respects HTTPS_PROXY/HTTP_PROXY/NO_PROXY")
+}
+
 func TestClientConfig(t *testing.T) {
 	require := require.New(t)
 	tests := []struct {
@@ -180,6 +207,83 @@ func TestClientConfig(t *testing.T) {
 				caPool.AddCert(caCert)
 			}
 			require.True(caPool.Equal(httpTransport.TLSClientConfig.RootCAs))
+		})
+	}
+}
+
+func TestConfigEqual_RemoteAccessService(t *testing.T) {
+	svcA := &Service{Server: "https://remote-access-a.example.com"}
+	svcB := &Service{Server: "https://remote-access-b.example.com"}
+
+	tests := []struct {
+		name   string
+		c1     Config
+		c2     Config
+		wantEq bool
+	}{
+		{
+			name:   "When both RemoteAccessService fields are nil the configs should be equal",
+			c1:     Config{Service: Service{Server: "https://api.example.com"}},
+			c2:     Config{Service: Service{Server: "https://api.example.com"}},
+			wantEq: true,
+		},
+		{
+			name:   "When only c1 has RemoteAccessService the configs should not be equal",
+			c1:     Config{Service: Service{Server: "https://api.example.com"}, RemoteAccessService: svcA},
+			c2:     Config{Service: Service{Server: "https://api.example.com"}},
+			wantEq: false,
+		},
+		{
+			name:   "When only c2 has RemoteAccessService the configs should not be equal",
+			c1:     Config{Service: Service{Server: "https://api.example.com"}},
+			c2:     Config{Service: Service{Server: "https://api.example.com"}, RemoteAccessService: svcA},
+			wantEq: false,
+		},
+		{
+			name:   "When both RemoteAccessService fields are equal the configs should be equal",
+			c1:     Config{Service: Service{Server: "https://api.example.com"}, RemoteAccessService: svcA},
+			c2:     Config{Service: Service{Server: "https://api.example.com"}, RemoteAccessService: &Service{Server: "https://remote-access-a.example.com"}},
+			wantEq: true,
+		},
+		{
+			name:   "When RemoteAccessService fields differ the configs should not be equal",
+			c1:     Config{Service: Service{Server: "https://api.example.com"}, RemoteAccessService: svcA},
+			c2:     Config{Service: Service{Server: "https://api.example.com"}, RemoteAccessService: svcB},
+			wantEq: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.wantEq, tt.c1.Equal(&tt.c2))
+		})
+	}
+}
+
+func TestGetRemoteAccessServer(t *testing.T) {
+	tests := []struct {
+		name   string
+		config Config
+		want   string
+	}{
+		{
+			name:   "When RemoteAccessService is nil it should return empty string",
+			config: Config{},
+			want:   "",
+		},
+		{
+			name:   "When RemoteAccessService has empty Server it should return empty string",
+			config: Config{RemoteAccessService: &Service{Server: ""}},
+			want:   "",
+		},
+		{
+			name:   "When RemoteAccessService has a server URL it should return it",
+			config: Config{RemoteAccessService: &Service{Server: "https://remote-access.example.com"}},
+			want:   "https://remote-access.example.com",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.config.GetRemoteAccessServer())
 		})
 	}
 }

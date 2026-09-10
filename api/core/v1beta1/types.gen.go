@@ -23,6 +23,25 @@ const (
 	AppTypeContainer AppType = "container"
 	AppTypeHelm      AppType = "helm"
 	AppTypeQuadlet   AppType = "quadlet"
+	AppTypeVm        AppType = "vm"
+)
+
+// Defines values for ApplicationDesiredState.
+const (
+	ApplicationDesiredStateRunning ApplicationDesiredState = "running"
+	ApplicationDesiredStateStopped ApplicationDesiredState = "stopped"
+)
+
+// Defines values for ApplicationLifecycleChangedDetailsAction.
+const (
+	ApplicationLifecycleActionRestart ApplicationLifecycleChangedDetailsAction = "restart"
+	ApplicationLifecycleActionStart   ApplicationLifecycleChangedDetailsAction = "start"
+	ApplicationLifecycleActionStop    ApplicationLifecycleChangedDetailsAction = "stop"
+)
+
+// Defines values for ApplicationLifecycleChangedDetailsDetailType.
+const (
+	ApplicationLifecycleChangedDetailType ApplicationLifecycleChangedDetailsDetailType = "ApplicationLifecycleChanged"
 )
 
 // Defines values for ApplicationStatusType.
@@ -32,6 +51,8 @@ const (
 	ApplicationStatusPreparing ApplicationStatusType = "Preparing"
 	ApplicationStatusRunning   ApplicationStatusType = "Running"
 	ApplicationStatusStarting  ApplicationStatusType = "Starting"
+	ApplicationStatusStopped   ApplicationStatusType = "Stopped"
+	ApplicationStatusStopping  ApplicationStatusType = "Stopping"
 	ApplicationStatusUnknown   ApplicationStatusType = "Unknown"
 )
 
@@ -135,8 +156,10 @@ const (
 
 // Defines values for DeviceLifecycleHookType.
 const (
+	DeviceLifecycleHookAfterEnrolling  DeviceLifecycleHookType = "AfterEnrolling"
 	DeviceLifecycleHookAfterRebooting  DeviceLifecycleHookType = "AfterRebooting"
 	DeviceLifecycleHookAfterUpdating   DeviceLifecycleHookType = "AfterUpdating"
+	DeviceLifecycleHookBeforeEnrolling DeviceLifecycleHookType = "BeforeEnrolling"
 	DeviceLifecycleHookBeforeRebooting DeviceLifecycleHookType = "BeforeRebooting"
 	DeviceLifecycleHookBeforeUpdating  DeviceLifecycleHookType = "BeforeUpdating"
 )
@@ -213,6 +236,8 @@ const (
 
 // Defines values for EventReason.
 const (
+	EventReasonApplicationLifecycleChanged     EventReason = "ApplicationLifecycleChanged"
+	EventReasonDeltaGenerationCompleted        EventReason = "DeltaGenerationCompleted"
 	EventReasonDependencyChangeDetected        EventReason = "DependencyChangeDetected"
 	EventReasonDependencySyncProbeFailed       EventReason = "DependencySyncProbeFailed"
 	EventReasonDeviceApplicationDegraded       EventReason = "DeviceApplicationDegraded"
@@ -246,6 +271,8 @@ const (
 	EventReasonDeviceVulnerabilityCVECritical  EventReason = "DeviceVulnerabilityCVECritical"
 	EventReasonDeviceVulnerabilityCVEResolved  EventReason = "DeviceVulnerabilityCVEResolved"
 	EventReasonDeviceVulnerabilityCVEWarning   EventReason = "DeviceVulnerabilityCVEWarning"
+	EventReasonEncryptionMigrationCompleted    EventReason = "EncryptionMigrationCompleted"
+	EventReasonEncryptionMigrationStarted      EventReason = "EncryptionMigrationStarted"
 	EventReasonEnrollmentRequestApprovalFailed EventReason = "EnrollmentRequestApprovalFailed"
 	EventReasonEnrollmentRequestApproved       EventReason = "EnrollmentRequestApproved"
 	EventReasonFleetInvalid                    EventReason = "FleetInvalid"
@@ -259,6 +286,7 @@ const (
 	EventReasonFleetValid                      EventReason = "FleetValid"
 	EventReasonInternalTaskFailed              EventReason = "InternalTaskFailed"
 	EventReasonInternalTaskPermanentlyFailed   EventReason = "InternalTaskPermanentlyFailed"
+	EventReasonPrepareDeltas                   EventReason = "PrepareDeltas"
 	EventReasonReferencedRepositoryUpdated     EventReason = "ReferencedRepositoryUpdated"
 	EventReasonRepositoryAccessible            EventReason = "RepositoryAccessible"
 	EventReasonRepositoryInaccessible          EventReason = "RepositoryInaccessible"
@@ -414,12 +442,23 @@ const (
 	Openshift OpenShiftProviderSpecProviderType = "openshift"
 )
 
+// Defines values for OsModeType.
+const (
+	OsModeImage   OsModeType = "image"
+	OsModePackage OsModeType = "package"
+)
+
 // Defines values for PatchRequestOp.
 const (
 	Add     PatchRequestOp = "add"
 	Remove  PatchRequestOp = "remove"
 	Replace PatchRequestOp = "replace"
 	Test    PatchRequestOp = "test"
+)
+
+// Defines values for PrepareDeltasDetailsDetailType.
+const (
+	PrepareDeltas PrepareDeltasDetailsDetailType = "PrepareDeltas"
 )
 
 // Defines values for ReferencedRepositoryUpdatedDetailsDetailType.
@@ -554,6 +593,12 @@ const (
 	ListLabelsParamsKindDevice ListLabelsParamsKind = "Device"
 )
 
+// Defines values for GetDeviceApplicationConsoleParamsConsoleType.
+const (
+	ConsoleTypeSerial GetDeviceApplicationConsoleParamsConsoleType = "serial"
+	ConsoleTypeVnc    GetDeviceApplicationConsoleParamsConsoleType = "vnc"
+)
+
 // AapProviderSpec AapProviderSpec describes an Ansible Automation Platform (AAP) provider configuration.
 type AapProviderSpec struct {
 	// ApiUrl The internal AAP API URL.
@@ -614,22 +659,52 @@ type ApplicationContent struct {
 	Path string `json:"path"`
 }
 
+// ApplicationDesiredState Desired lifecycle state for an application.
+type ApplicationDesiredState string
+
 // ApplicationEnvVars defines model for ApplicationEnvVars.
 type ApplicationEnvVars struct {
 	// EnvVars Environment variable key-value pairs, injected during runtime. The key and value each must be between 1 and 253 characters.
 	EnvVars *map[string]string `json:"envVars,omitempty"`
 }
 
+// ApplicationLifecycleChangedDetails defines model for ApplicationLifecycleChangedDetails.
+type ApplicationLifecycleChangedDetails struct {
+	// Action The lifecycle action that was requested.
+	Action ApplicationLifecycleChangedDetailsAction `json:"action"`
+
+	// AppName The name of the application whose device-level lifecycle override changed.
+	AppName string `json:"appName"`
+
+	// DetailType The type of detail for discriminator purposes.
+	DetailType ApplicationLifecycleChangedDetailsDetailType `json:"detailType"`
+}
+
+// ApplicationLifecycleChangedDetailsAction The lifecycle action that was requested.
+type ApplicationLifecycleChangedDetailsAction string
+
+// ApplicationLifecycleChangedDetailsDetailType The type of detail for discriminator purposes.
+type ApplicationLifecycleChangedDetailsDetailType string
+
 // ApplicationPort Port mapping in format "hostPort:containerPort" (e.g., "8080:80").
 type ApplicationPort = string
 
 // ApplicationProviderBase Common properties for all application types.
 type ApplicationProviderBase struct {
+	// Annotations Arbitrary metadata annotations. Used internally by the control plane (e.g., flightctl.io/workload-type) when transforming application types at render time.
+	Annotations *map[string]string `json:"annotations,omitempty"`
+
 	// AppType The type of the application.
 	AppType AppType `json:"appType"`
 
+	// DesiredState Desired lifecycle state for this application, as most recently set by the stop/start device APIs. Read-only: cannot be set directly by apply; only present in the rendered application spec delivered to the agent.
+	DesiredState *ApplicationDesiredState `json:"desiredState,omitempty"`
+
 	// Name The application name must be 1–253 characters long, start with a letter or number, and contain no whitespace.
 	Name *string `json:"name,omitempty"`
+
+	// RestartGeneration Counter incremented by the restart device API each time the application is restarted. Read-only: cannot be set directly by apply; only present in the rendered application spec delivered to the agent.
+	RestartGeneration *int `json:"restartGeneration,omitempty"`
 }
 
 // ApplicationProviderSpec defines model for ApplicationProviderSpec.
@@ -863,6 +938,27 @@ type BatchSequence struct {
 	Strategy RolloutStrategy `json:"strategy"`
 }
 
+// CatalogItemRefApplicationProviderSpec defines model for CatalogItemRefApplicationProviderSpec.
+type CatalogItemRefApplicationProviderSpec struct {
+	// CatalogItemRef A reference to a catalog item, along with its configuration.
+	CatalogItemRef CatalogItemRefSpec `json:"catalogItemRef"`
+}
+
+// CatalogItemRefSpec A reference to a catalog item, along with its configuration.
+type CatalogItemRefSpec struct {
+	// Catalog The catalog name that the item is part of.
+	Catalog string `json:"catalog"`
+
+	// Channel An optional update channel which will be used to provide update cues when available.
+	Channel *string `json:"channel,omitempty"`
+
+	// Item The name of the catalog item itself.
+	Item string `json:"item"`
+
+	// Version A valid version that currently exists in the catalog item.
+	Version string `json:"version"`
+}
+
 // CertificateSigningRequest CertificateSigningRequest represents a request for a signed certificate from the CA.
 type CertificateSigningRequest struct {
 	// ApiVersion APIVersion defines the versioned schema of this representation of an object. Servers should convert recognized schemas to the latest internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources.
@@ -958,14 +1054,23 @@ type CheckRepositoryOciTagRequest struct {
 
 // ComposeApplication defines model for ComposeApplication.
 type ComposeApplication struct {
+	// Annotations Arbitrary metadata annotations. Used internally by the control plane (e.g., flightctl.io/workload-type) when transforming application types at render time.
+	Annotations *map[string]string `json:"annotations,omitempty"`
+
 	// AppType The type of the application.
 	AppType AppType `json:"appType"`
+
+	// DesiredState Desired lifecycle state for this application, as most recently set by the stop/start device APIs. Read-only: cannot be set directly by apply; only present in the rendered application spec delivered to the agent.
+	DesiredState *ApplicationDesiredState `json:"desiredState,omitempty"`
 
 	// EnvVars Environment variable key-value pairs, injected during runtime. The key and value each must be between 1 and 253 characters.
 	EnvVars *map[string]string `json:"envVars,omitempty"`
 
 	// Name The application name must be 1–253 characters long, start with a letter or number, and contain no whitespace.
 	Name *string `json:"name,omitempty"`
+
+	// RestartGeneration Counter incremented by the restart device API each time the application is restarted. Read-only: cannot be set directly by apply; only present in the rendered application spec delivered to the agent.
+	RestartGeneration *int `json:"restartGeneration,omitempty"`
 
 	// Volumes List of application volumes.
 	Volumes *[]ApplicationVolume `json:"volumes,omitempty"`
@@ -1024,14 +1129,17 @@ type ConfigProviderSpec struct {
 
 // ContainerApplication defines model for ContainerApplication.
 type ContainerApplication struct {
+	// Annotations Arbitrary metadata annotations. Used internally by the control plane (e.g., flightctl.io/workload-type) when transforming application types at render time.
+	Annotations *map[string]string `json:"annotations,omitempty"`
+
 	// AppType The type of the application.
 	AppType AppType `json:"appType"`
 
+	// DesiredState Desired lifecycle state for this application, as most recently set by the stop/start device APIs. Read-only: cannot be set directly by apply; only present in the rendered application spec delivered to the agent.
+	DesiredState *ApplicationDesiredState `json:"desiredState,omitempty"`
+
 	// EnvVars Environment variable key-value pairs, injected during runtime. The key and value each must be between 1 and 253 characters.
 	EnvVars *map[string]string `json:"envVars,omitempty"`
-
-	// Image Reference to the image for this container.
-	Image string `json:"image"`
 
 	// Name The application name must be 1–253 characters long, start with a letter or number, and contain no whitespace.
 	Name *string `json:"name,omitempty"`
@@ -1042,11 +1150,15 @@ type ContainerApplication struct {
 	// Resources Resource constraints for the application.
 	Resources *ApplicationResources `json:"resources,omitempty"`
 
+	// RestartGeneration Counter incremented by the restart device API each time the application is restarted. Read-only: cannot be set directly by apply; only present in the rendered application spec delivered to the agent.
+	RestartGeneration *int `json:"restartGeneration,omitempty"`
+
 	// RunAs The username of the system user this application should be run under. This is not the same as the user within any containers of the application (if applicable). Defaults to the user that the agent runs as (generally root) if not specified.
 	RunAs Username `json:"runAs,omitempty"`
 
 	// Volumes List of application volumes.
 	Volumes *[]ApplicationVolume `json:"volumes,omitempty"`
+	union   json.RawMessage
 }
 
 // ContainerApplicationProperties Properties for container application deployments.
@@ -1153,6 +1265,9 @@ type DeviceApplicationStatus struct {
 	// Embedded Whether the application is embedded in the bootc image.
 	Embedded bool `json:"embedded"`
 
+	// LastDelta Result of the most recent delta apply attempt for this update target.
+	LastDelta *DeviceDeltaApplyStatus `json:"lastDelta,omitempty"`
+
 	// Name Human readable name of the application.
 	Name string `json:"name"`
 
@@ -1181,6 +1296,12 @@ type DeviceApplicationsSummaryStatus struct {
 	Status ApplicationsSummaryStatusType `json:"status"`
 }
 
+// DeviceCapabilities Capabilities reported by the device agent.
+type DeviceCapabilities struct {
+	// OsMode OS management mode. "image" indicates the OS is managed via bootc or rpm-ostree image updates. "package" indicates no image-based OS management is available.
+	OsMode *OsModeType `json:"osMode,omitempty"`
+}
+
 // DeviceConfigStatus Current status of the device config.
 type DeviceConfigStatus struct {
 	// RenderedVersion Rendered version of the device config.
@@ -1204,6 +1325,15 @@ type DeviceDecommission struct {
 
 // DeviceDecommissionTargetType Specifies the desired decommissioning method of the device.
 type DeviceDecommissionTargetType string
+
+// DeviceDeltaApplyStatus Result of the most recent delta apply attempt for this update target.
+type DeviceDeltaApplyStatus struct {
+	// FallbackReason Set when the most recent update attempt fell back from a delta to a full image pull. Absent if no delta was attempted or the delta succeeded. Cleared when the next update attempt for this target starts.
+	FallbackReason *string `json:"fallbackReason,omitempty"`
+
+	// Size Expected delta size in IEC units (KiB, MiB, GiB, or TiB). Absent when the size is not yet known.
+	Size *string `json:"size,omitempty"`
+}
 
 // DeviceIntegrityCheckStatus DeviceIntegrityCheckStatus represents the status of the integrity check performed on the device.
 type DeviceIntegrityCheckStatus struct {
@@ -1310,10 +1440,16 @@ type DeviceMultipleOwnersResolvedDetailsDetailType string
 // DeviceMultipleOwnersResolvedDetailsResolutionType How the conflict was resolved.
 type DeviceMultipleOwnersResolvedDetailsResolutionType string
 
-// DeviceOsSpec DeviceOsSpec describes the target OS for the device.
+// DeviceOsSpec defines model for DeviceOsSpec.
 type DeviceOsSpec struct {
-	// Image The target OS image name or URL.
-	Image string `json:"image"`
+	// CatalogItemRef A reference to a catalog item, along with its configuration.
+	CatalogItemRef *CatalogItemRefSpec `json:"catalogItemRef,omitempty"`
+
+	// DeltaImage Optional hint: a reference to a delta artifact the control plane's generation records indicate may be applicable to reach `image` from this device's current image. Absent does not imply no delta exists — the device independently discovers candidate delta artifacts (e.g. deltas published by a customer's own CI) regardless of this field, and falls back to a full pull only if none is usable.
+	DeltaImage *string `json:"deltaImage,omitempty"`
+
+	// Image Reference to an OCI image or artifact with tag.
+	Image string `json:"image,omitempty"`
 }
 
 // DeviceOsStatus Current status of the device OS.
@@ -1323,6 +1459,9 @@ type DeviceOsStatus struct {
 
 	// ImageDigest The digest of the OS image (e.g. sha256:a0...).
 	ImageDigest string `json:"imageDigest"`
+
+	// LastDelta Result of the most recent delta apply attempt for this update target.
+	LastDelta *DeviceDeltaApplyStatus `json:"lastDelta,omitempty"`
 }
 
 // DeviceOwnershipChangedDetails defines model for DeviceOwnershipChangedDetails.
@@ -1391,7 +1530,7 @@ type DeviceSpec struct {
 	// Decommissioning Metadata about a device decommissioning request.
 	Decommissioning *DeviceDecommission `json:"decommissioning,omitempty"`
 
-	// Os DeviceOsSpec describes the target OS for the device.
+	// Os Either a specific OCI image reference, or a reference to a catalog item version that can be resolved to an OCI image ref.
 	Os *DeviceOsSpec `json:"os,omitempty"`
 
 	// Resources Array of resource monitor configurations.
@@ -1414,6 +1553,9 @@ type DeviceStatus struct {
 
 	// ApplicationsSummary A summary of the health of applications on the device.
 	ApplicationsSummary DeviceApplicationsSummaryStatus `json:"applicationsSummary"`
+
+	// Capabilities Capabilities reported by the device agent.
+	Capabilities *DeviceCapabilities `json:"capabilities,omitempty"`
 
 	// Conditions Conditions represent the observations of a the current state of a device.
 	Conditions []Condition `json:"conditions"`
@@ -1475,8 +1617,17 @@ type DeviceSystemInfo struct {
 	// BootID Boot ID reported by the device.
 	BootID string `json:"bootID"`
 
+	// BootcVersion Version reported by `bootc --version`. Absent when bootc is not installed or the version command fails.
+	BootcVersion *string `json:"bootcVersion,omitempty"`
+
 	// CustomInfo User-defined information about the device.
 	CustomInfo *CustomDeviceInfo `json:"customInfo,omitempty"`
+
+	// DeltaEligible Whether this device can consume OCI deltas. True when the oci-delta binary is present. False when it is not. Omitted when an older agent does not report the field.
+	DeltaEligible *bool `json:"deltaEligible,omitempty"`
+
+	// OciDeltaVersion Version reported by `oci-delta --version`. Absent when oci-delta is not installed or the version command fails.
+	OciDeltaVersion *string `json:"ociDeltaVersion,omitempty"`
 
 	// OperatingSystem The Operating System reported by the device.
 	OperatingSystem      string            `json:"operatingSystem"`
@@ -1527,6 +1678,9 @@ type DevicesSummary struct {
 	// ApplicationStatus A breakdown of the devices in the fleet by "application" status.
 	ApplicationStatus map[string]int64 `json:"applicationStatus"`
 
+	// Capabilities Breakdowns of devices by status.capabilities fields.
+	Capabilities *DevicesSummaryCapabilities `json:"capabilities,omitempty"`
+
 	// SummaryStatus A breakdown of the devices in the fleet by "summary" status.
 	SummaryStatus map[string]int64 `json:"summaryStatus"`
 
@@ -1535,6 +1689,12 @@ type DevicesSummary struct {
 
 	// UpdateStatus A breakdown of the devices in the fleet by "updated" status.
 	UpdateStatus map[string]int64 `json:"updateStatus"`
+}
+
+// DevicesSummaryCapabilities Breakdowns of devices by status.capabilities fields.
+type DevicesSummaryCapabilities struct {
+	// OsMode Counts by status.capabilities.osMode (e.g. image, package). The key "unknown" counts devices that have not reported the capability.
+	OsMode *map[string]int64 `json:"osMode,omitempty"`
 }
 
 // DiskResourceMonitorSpec defines model for DiskResourceMonitorSpec.
@@ -1664,6 +1824,12 @@ type EnrollmentRequestSpec struct {
 
 	// Labels A set of labels that the service will apply to this device when its enrollment is approved.
 	Labels *map[string]string `json:"labels,omitempty"`
+
+	// OsMode OS management mode. "image" indicates the OS is managed via bootc or rpm-ostree image updates. "package" indicates no image-based OS management is available.
+	OsMode *OsModeType `json:"osMode,omitempty"`
+
+	// PreEnrollment Result of pre-enrollment hook execution, agent-populated.
+	PreEnrollment *PreEnrollmentResult `json:"preEnrollment,omitempty"`
 }
 
 // EnrollmentRequestStatus EnrollmentRequestStatus represents information about the status of a EnrollmentRequest.
@@ -2039,11 +2205,14 @@ type GitRepoSpecType string
 
 // HelmApplication defines model for HelmApplication.
 type HelmApplication struct {
+	// Annotations Arbitrary metadata annotations. Used internally by the control plane (e.g., flightctl.io/workload-type) when transforming application types at render time.
+	Annotations *map[string]string `json:"annotations,omitempty"`
+
 	// AppType The type of the application.
 	AppType AppType `json:"appType"`
 
-	// Image Reference to the chart for this helm application.
-	Image string `json:"image"`
+	// DesiredState Desired lifecycle state for this application, as most recently set by the stop/start device APIs. Read-only: cannot be set directly by apply; only present in the rendered application spec delivered to the agent.
+	DesiredState *ApplicationDesiredState `json:"desiredState,omitempty"`
 
 	// Name The application name must be 1–253 characters long, start with a letter or number, and contain no whitespace.
 	Name *string `json:"name,omitempty"`
@@ -2051,11 +2220,15 @@ type HelmApplication struct {
 	// Namespace The target namespace for the application deployment.
 	Namespace *string `json:"namespace,omitempty"`
 
+	// RestartGeneration Counter incremented by the restart device API each time the application is restarted. Read-only: cannot be set directly by apply; only present in the rendered application spec delivered to the agent.
+	RestartGeneration *int `json:"restartGeneration,omitempty"`
+
 	// Values Configuration values for the application. Supports arbitrarily nested structures.
 	Values *map[string]interface{} `json:"values,omitempty"`
 
 	// ValuesFiles List of values files to apply during deployment. Files are relative paths and applied in array order before user-provided values.
 	ValuesFiles *[]string `json:"valuesFiles,omitempty"`
+	union       json.RawMessage
 }
 
 // HookAction defines model for HookAction.
@@ -2157,37 +2330,52 @@ type HttpRepoSpec struct {
 // HttpRepoSpecType The repository type discriminator.
 type HttpRepoSpecType string
 
-// ImageApplicationProviderSpec defines model for ImageApplicationProviderSpec.
-type ImageApplicationProviderSpec struct {
-	// Image Reference to the OCI image or artifact for the application package.
-	Image string `json:"image"`
-}
+// ImageApplicationProviderSpec Reference to an OCI image or artifact with tag.
+type ImageApplicationProviderSpec = ImageSpec
 
 // ImageMountVolumeProviderSpec Volume from OCI image mounted at specified path.
 type ImageMountVolumeProviderSpec struct {
-	// Image Describes the source of an OCI-compliant image or artifact.
+	// Image Describes the source of an OCI-compliant image or artifact. Exactly one of 'reference' or 'catalogItemRef' must be specified.
 	Image ImageVolumeSource `json:"image"`
 
 	// Mount Mount configuration for a volume.
 	Mount VolumeMount `json:"mount"`
 }
 
+// ImageOrCatalogItemRefSpec defines model for ImageOrCatalogItemRefSpec.
+type ImageOrCatalogItemRefSpec struct {
+	// CatalogItemRef A reference to a catalog item, along with its configuration.
+	CatalogItemRef *CatalogItemRefSpec `json:"catalogItemRef,omitempty"`
+
+	// Image Reference to an OCI image or artifact with tag.
+	Image string `json:"image,omitempty"`
+}
+
 // ImagePullPolicy Optional. Defaults to 'IfNotPresent'. When set to 'Always', the image is pulled every time. When set to 'Never', the image must already exist on the device.
 type ImagePullPolicy string
 
+// ImageSpec Reference to an OCI image or artifact with tag.
+type ImageSpec struct {
+	// Image Reference to an OCI image or artifact with tag.
+	Image string `json:"image"`
+}
+
 // ImageVolumeProviderSpec defines model for ImageVolumeProviderSpec.
 type ImageVolumeProviderSpec struct {
-	// Image Describes the source of an OCI-compliant image or artifact.
+	// Image Describes the source of an OCI-compliant image or artifact. Exactly one of 'reference' or 'catalogItemRef' must be specified.
 	Image ImageVolumeSource `json:"image"`
 }
 
-// ImageVolumeSource Describes the source of an OCI-compliant image or artifact.
+// ImageVolumeSource Describes the source of an OCI-compliant image or artifact. Exactly one of 'reference' or 'catalogItemRef' must be specified.
 type ImageVolumeSource struct {
+	// CatalogItemRef A reference to a catalog item, along with its configuration.
+	CatalogItemRef *CatalogItemRefSpec `json:"catalogItemRef,omitempty"`
+
 	// PullPolicy Optional. Defaults to 'IfNotPresent'. When set to 'Always', the image is pulled every time. When set to 'Never', the image must already exist on the device.
 	PullPolicy *ImagePullPolicy `json:"pullPolicy,omitempty"`
 
 	// Reference Reference to an OCI-compliant image or artifact in a registry. This may be a container image or another type of OCI artifact, as long as it conforms to the OCI image specification.
-	Reference string `json:"reference"`
+	Reference string `json:"reference,omitempty"`
 }
 
 // InlineApplicationProviderSpec defines model for InlineApplicationProviderSpec.
@@ -2517,11 +2705,20 @@ type OciRepoSpec struct {
 	// CaCrt Base64 encoded root CA.
 	CaCrt *string `json:"ca.crt,omitempty"`
 
+	// DeltaStorageTarget When true, generated deltas are pushed to this object (at most one per org). Auth is the existing ociAuth / accessMode. Placement follows repository / namespace / registry-only as above.
+	DeltaStorageTarget *bool `json:"deltaStorageTarget,omitempty"`
+
+	// Namespace Optional org/subpath under spec.registry (e.g. my-org). Concrete names are spec.registry/namespace/<name>. Mutually exclusive with repository. Used by delta push (`{registry}/{namespace}/{imageName}`). Invalid on an ImageBuild or ImageExport destination Repository.
+	Namespace *string `json:"namespace,omitempty"`
+
 	// OciAuth Authentication for OCI registries.
 	OciAuth *OciAuth `json:"ociAuth,omitempty"`
 
 	// Registry The OCI registry hostname, FQDN, or IP address with optional port (e.g., quay.io, registry.redhat.io, myregistry.com:5000, 192.168.1.1:5000, [::1]:5000).
 	Registry string `json:"registry"`
+
+	// Repository Optional OCI repository path under spec.registry (e.g. my-org/diffs). When set, this object is that repo (`my-registry.com/my-org/diffs`), not only a registry. Mutually exclusive with namespace. ImageBuild destination imageName must equal this value.
+	Repository *string `json:"repository,omitempty"`
 
 	// Scheme URL scheme for connecting to the registry.
 	Scheme *OciRepoSpecScheme `json:"scheme,omitempty"`
@@ -2626,6 +2823,9 @@ type OrganizationSpec struct {
 	ExternalId *string `json:"externalId,omitempty"`
 }
 
+// OsModeType OS management mode. "image" indicates the OS is managed via bootc or rpm-ostree image updates. "package" indicates no image-based OS management is available.
+type OsModeType string
+
 // PatchRequest defines model for PatchRequest.
 type PatchRequest = []struct {
 	// Op The operation to perform.
@@ -2659,16 +2859,58 @@ type PermissionList struct {
 	Permissions []Permission `json:"permissions"`
 }
 
+// PreEnrollmentActionResult Result of a single executed pre-enrollment hook action, agent-populated.
+type PreEnrollmentActionResult struct {
+	// ExitCode Process exit code from the hook action.
+	ExitCode int `json:"exitCode"`
+
+	// Output Redacted stdout/stderr from this action. The total size across all actions is capped at 4KiB. Secret patterns (PEM blocks, Bearer prefixes, known token env names) are redacted before persistence.
+	Output *string `json:"output,omitempty"`
+
+	// Source Path to the hook definition YAML that contained this action (for example /etc/flightctl/hooks.d/beforeenrolling/10-network.yaml).
+	Source string `json:"source"`
+}
+
+// PreEnrollmentResult Result of pre-enrollment hook execution, agent-populated.
+type PreEnrollmentResult struct {
+	// Actions Per-action results in execution order.
+	Actions *[]PreEnrollmentActionResult `json:"actions,omitempty"`
+
+	// Success Whether all pre-enrollment hooks completed with exit code 0.
+	Success bool `json:"success"`
+}
+
+// PrepareDeltasDetails Structured details for PrepareDeltas events.
+type PrepareDeltasDetails struct {
+	// DetailType The type of detail for discriminator purposes.
+	DetailType PrepareDeltasDetailsDetailType `json:"detailType"`
+
+	// TemplateVersion Fleet only. The TemplateVersion this prepare is for. Required when involvedObject.kind is Fleet; omitted for Device.
+	TemplateVersion *string `json:"templateVersion,omitempty"`
+}
+
+// PrepareDeltasDetailsDetailType The type of detail for discriminator purposes.
+type PrepareDeltasDetailsDetailType string
+
 // QuadletApplication defines model for QuadletApplication.
 type QuadletApplication struct {
+	// Annotations Arbitrary metadata annotations. Used internally by the control plane (e.g., flightctl.io/workload-type) when transforming application types at render time.
+	Annotations *map[string]string `json:"annotations,omitempty"`
+
 	// AppType The type of the application.
 	AppType AppType `json:"appType"`
+
+	// DesiredState Desired lifecycle state for this application, as most recently set by the stop/start device APIs. Read-only: cannot be set directly by apply; only present in the rendered application spec delivered to the agent.
+	DesiredState *ApplicationDesiredState `json:"desiredState,omitempty"`
 
 	// EnvVars Environment variable key-value pairs, injected during runtime. The key and value each must be between 1 and 253 characters.
 	EnvVars *map[string]string `json:"envVars,omitempty"`
 
 	// Name The application name must be 1–253 characters long, start with a letter or number, and contain no whitespace.
 	Name *string `json:"name,omitempty"`
+
+	// RestartGeneration Counter incremented by the restart device API each time the application is restarted. Read-only: cannot be set directly by apply; only present in the rendered application spec delivered to the agent.
+	RestartGeneration *int `json:"restartGeneration,omitempty"`
 
 	// RunAs The username of the system user this application should be run under. This is not the same as the user within any containers of the application (if applicable). Defaults to the user that the agent runs as (generally root) if not specified.
 	RunAs Username `json:"runAs,omitempty"`
@@ -3034,7 +3276,7 @@ type TemplateVersionStatus struct {
 	// Decommissioning Metadata about a device decommissioning request.
 	Decommissioning *DeviceDecommission `json:"decommissioning,omitempty"`
 
-	// Os DeviceOsSpec describes the target OS for the device.
+	// Os Either a specific OCI image reference, or a reference to a catalog item version that can be resolved to an OCI image ref.
 	Os *DeviceOsSpec `json:"os,omitempty"`
 
 	// Resources Array of resource monitor configurations.
@@ -3147,6 +3389,28 @@ type UserInfoResponse struct {
 type Version struct {
 	// Version Git version of the service.
 	Version string `json:"version"`
+}
+
+// VmApplication defines model for VmApplication.
+type VmApplication struct {
+	// Annotations Arbitrary metadata annotations. Used internally by the control plane (e.g., flightctl.io/workload-type) when transforming application types at render time.
+	Annotations *map[string]string `json:"annotations,omitempty"`
+
+	// AppType The type of the application.
+	AppType AppType `json:"appType"`
+
+	// DesiredState Desired lifecycle state for this application, as most recently set by the stop/start device APIs. Read-only: cannot be set directly by apply; only present in the rendered application spec delivered to the agent.
+	DesiredState *ApplicationDesiredState `json:"desiredState,omitempty"`
+
+	// Name The application name must be 1–253 characters long, start with a letter or number, and contain no whitespace.
+	Name *string `json:"name,omitempty"`
+
+	// PublishPorts List of host-to-guest port mappings for the VM. Each entry must follow the format "hostPort:guestPort" or "hostPort:guestPort/protocol" (e.g. "8080:80" or "8080:80/tcp").
+	PublishPorts *[]string `json:"publishPorts,omitempty"`
+
+	// RestartGeneration Counter incremented by the restart device API each time the application is restarted. Read-only: cannot be set directly by apply; only present in the rendered application spec delivered to the agent.
+	RestartGeneration *int `json:"restartGeneration,omitempty"`
+	union             json.RawMessage
 }
 
 // VolumeMount Mount configuration for a volume.
@@ -3350,6 +3614,18 @@ type ListResourceSyncsParams struct {
 	Limit *int32 `form:"limit,omitempty" json:"limit,omitempty"`
 }
 
+// GetDeviceApplicationConsoleParams defines parameters for GetDeviceApplicationConsole.
+type GetDeviceApplicationConsoleParams struct {
+	// ConsoleType The type of console session to open. "serial" opens a text terminal; "vnc" opens a VNC proxy tunnel.
+	ConsoleType GetDeviceApplicationConsoleParamsConsoleType `form:"consoleType" json:"consoleType"`
+
+	// Force If true, take over an already-active console session of the same type for this application instead of failing with a 409 Conflict. The replaced session is disconnected and told why.
+	Force *bool `form:"force,omitempty" json:"force,omitempty"`
+}
+
+// GetDeviceApplicationConsoleParamsConsoleType defines parameters for GetDeviceApplicationConsole.
+type GetDeviceApplicationConsoleParamsConsoleType string
+
 // AuthTokenJSONRequestBody defines body for AuthToken for application/json ContentType.
 type AuthTokenJSONRequestBody = TokenRequest
 
@@ -3504,12 +3780,36 @@ func (a *DeviceSystemInfo) UnmarshalJSON(b []byte) error {
 		delete(object, "bootID")
 	}
 
+	if raw, found := object["bootcVersion"]; found {
+		err = json.Unmarshal(raw, &a.BootcVersion)
+		if err != nil {
+			return fmt.Errorf("error reading 'bootcVersion': %w", err)
+		}
+		delete(object, "bootcVersion")
+	}
+
 	if raw, found := object["customInfo"]; found {
 		err = json.Unmarshal(raw, &a.CustomInfo)
 		if err != nil {
 			return fmt.Errorf("error reading 'customInfo': %w", err)
 		}
 		delete(object, "customInfo")
+	}
+
+	if raw, found := object["deltaEligible"]; found {
+		err = json.Unmarshal(raw, &a.DeltaEligible)
+		if err != nil {
+			return fmt.Errorf("error reading 'deltaEligible': %w", err)
+		}
+		delete(object, "deltaEligible")
+	}
+
+	if raw, found := object["ociDeltaVersion"]; found {
+		err = json.Unmarshal(raw, &a.OciDeltaVersion)
+		if err != nil {
+			return fmt.Errorf("error reading 'ociDeltaVersion': %w", err)
+		}
+		delete(object, "ociDeltaVersion")
 	}
 
 	if raw, found := object["operatingSystem"]; found {
@@ -3554,10 +3854,31 @@ func (a DeviceSystemInfo) MarshalJSON() ([]byte, error) {
 		return nil, fmt.Errorf("error marshaling 'bootID': %w", err)
 	}
 
+	if a.BootcVersion != nil {
+		object["bootcVersion"], err = json.Marshal(a.BootcVersion)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'bootcVersion': %w", err)
+		}
+	}
+
 	if a.CustomInfo != nil {
 		object["customInfo"], err = json.Marshal(a.CustomInfo)
 		if err != nil {
 			return nil, fmt.Errorf("error marshaling 'customInfo': %w", err)
+		}
+	}
+
+	if a.DeltaEligible != nil {
+		object["deltaEligible"], err = json.Marshal(a.DeltaEligible)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'deltaEligible': %w", err)
+		}
+	}
+
+	if a.OciDeltaVersion != nil {
+		object["ociDeltaVersion"], err = json.Marshal(a.OciDeltaVersion)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'ociDeltaVersion': %w", err)
 		}
 	}
 
@@ -3687,6 +4008,34 @@ func (t *ApplicationProviderSpec) MergeHelmApplication(v HelmApplication) error 
 	return err
 }
 
+// AsVmApplication returns the union data inside the ApplicationProviderSpec as a VmApplication
+func (t ApplicationProviderSpec) AsVmApplication() (VmApplication, error) {
+	var body VmApplication
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromVmApplication overwrites any union data inside the ApplicationProviderSpec as the provided VmApplication
+func (t *ApplicationProviderSpec) FromVmApplication(v VmApplication) error {
+	v.AppType = "vm"
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeVmApplication performs a merge with any union data inside the ApplicationProviderSpec, using the provided VmApplication
+func (t *ApplicationProviderSpec) MergeVmApplication(v VmApplication) error {
+	v.AppType = "vm"
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
 func (t ApplicationProviderSpec) Discriminator() (string, error) {
 	var discriminator struct {
 		Discriminator string `json:"appType"`
@@ -3709,6 +4058,8 @@ func (t ApplicationProviderSpec) ValueByDiscriminator() (interface{}, error) {
 		return t.AsHelmApplication()
 	case "quadlet":
 		return t.AsQuadletApplication()
+	case "vm":
+		return t.AsVmApplication()
 	default:
 		return nil, errors.New("unknown discriminator value: " + discriminator)
 	}
@@ -4333,6 +4684,32 @@ func (t *ComposeApplication) MergeImageApplicationProviderSpec(v ImageApplicatio
 	return err
 }
 
+// AsCatalogItemRefApplicationProviderSpec returns the union data inside the ComposeApplication as a CatalogItemRefApplicationProviderSpec
+func (t ComposeApplication) AsCatalogItemRefApplicationProviderSpec() (CatalogItemRefApplicationProviderSpec, error) {
+	var body CatalogItemRefApplicationProviderSpec
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromCatalogItemRefApplicationProviderSpec overwrites any union data inside the ComposeApplication as the provided CatalogItemRefApplicationProviderSpec
+func (t *ComposeApplication) FromCatalogItemRefApplicationProviderSpec(v CatalogItemRefApplicationProviderSpec) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeCatalogItemRefApplicationProviderSpec performs a merge with any union data inside the ComposeApplication, using the provided CatalogItemRefApplicationProviderSpec
+func (t *ComposeApplication) MergeCatalogItemRefApplicationProviderSpec(v CatalogItemRefApplicationProviderSpec) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
 // AsInlineApplicationProviderSpec returns the union data inside the ComposeApplication as a InlineApplicationProviderSpec
 func (t ComposeApplication) AsInlineApplicationProviderSpec() (InlineApplicationProviderSpec, error) {
 	var body InlineApplicationProviderSpec
@@ -4372,9 +4749,23 @@ func (t ComposeApplication) MarshalJSON() ([]byte, error) {
 		}
 	}
 
+	if t.Annotations != nil {
+		object["annotations"], err = json.Marshal(t.Annotations)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'annotations': %w", err)
+		}
+	}
+
 	object["appType"], err = json.Marshal(t.AppType)
 	if err != nil {
 		return nil, fmt.Errorf("error marshaling 'appType': %w", err)
+	}
+
+	if t.DesiredState != nil {
+		object["desiredState"], err = json.Marshal(t.DesiredState)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'desiredState': %w", err)
+		}
 	}
 
 	if t.EnvVars != nil {
@@ -4388,6 +4779,13 @@ func (t ComposeApplication) MarshalJSON() ([]byte, error) {
 		object["name"], err = json.Marshal(t.Name)
 		if err != nil {
 			return nil, fmt.Errorf("error marshaling 'name': %w", err)
+		}
+	}
+
+	if t.RestartGeneration != nil {
+		object["restartGeneration"], err = json.Marshal(t.RestartGeneration)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'restartGeneration': %w", err)
 		}
 	}
 
@@ -4412,10 +4810,24 @@ func (t *ComposeApplication) UnmarshalJSON(b []byte) error {
 		return err
 	}
 
+	if raw, found := object["annotations"]; found {
+		err = json.Unmarshal(raw, &t.Annotations)
+		if err != nil {
+			return fmt.Errorf("error reading 'annotations': %w", err)
+		}
+	}
+
 	if raw, found := object["appType"]; found {
 		err = json.Unmarshal(raw, &t.AppType)
 		if err != nil {
 			return fmt.Errorf("error reading 'appType': %w", err)
+		}
+	}
+
+	if raw, found := object["desiredState"]; found {
+		err = json.Unmarshal(raw, &t.DesiredState)
+		if err != nil {
+			return fmt.Errorf("error reading 'desiredState': %w", err)
 		}
 	}
 
@@ -4430,6 +4842,13 @@ func (t *ComposeApplication) UnmarshalJSON(b []byte) error {
 		err = json.Unmarshal(raw, &t.Name)
 		if err != nil {
 			return fmt.Errorf("error reading 'name': %w", err)
+		}
+	}
+
+	if raw, found := object["restartGeneration"]; found {
+		err = json.Unmarshal(raw, &t.RestartGeneration)
+		if err != nil {
+			return fmt.Errorf("error reading 'restartGeneration': %w", err)
 		}
 	}
 
@@ -4554,6 +4973,224 @@ func (t ConfigProviderSpec) MarshalJSON() ([]byte, error) {
 
 func (t *ConfigProviderSpec) UnmarshalJSON(b []byte) error {
 	err := t.union.UnmarshalJSON(b)
+	return err
+}
+
+// AsImageApplicationProviderSpec returns the union data inside the ContainerApplication as a ImageApplicationProviderSpec
+func (t ContainerApplication) AsImageApplicationProviderSpec() (ImageApplicationProviderSpec, error) {
+	var body ImageApplicationProviderSpec
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromImageApplicationProviderSpec overwrites any union data inside the ContainerApplication as the provided ImageApplicationProviderSpec
+func (t *ContainerApplication) FromImageApplicationProviderSpec(v ImageApplicationProviderSpec) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeImageApplicationProviderSpec performs a merge with any union data inside the ContainerApplication, using the provided ImageApplicationProviderSpec
+func (t *ContainerApplication) MergeImageApplicationProviderSpec(v ImageApplicationProviderSpec) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsCatalogItemRefApplicationProviderSpec returns the union data inside the ContainerApplication as a CatalogItemRefApplicationProviderSpec
+func (t ContainerApplication) AsCatalogItemRefApplicationProviderSpec() (CatalogItemRefApplicationProviderSpec, error) {
+	var body CatalogItemRefApplicationProviderSpec
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromCatalogItemRefApplicationProviderSpec overwrites any union data inside the ContainerApplication as the provided CatalogItemRefApplicationProviderSpec
+func (t *ContainerApplication) FromCatalogItemRefApplicationProviderSpec(v CatalogItemRefApplicationProviderSpec) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeCatalogItemRefApplicationProviderSpec performs a merge with any union data inside the ContainerApplication, using the provided CatalogItemRefApplicationProviderSpec
+func (t *ContainerApplication) MergeCatalogItemRefApplicationProviderSpec(v CatalogItemRefApplicationProviderSpec) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+func (t ContainerApplication) MarshalJSON() ([]byte, error) {
+	b, err := t.union.MarshalJSON()
+	if err != nil {
+		return nil, err
+	}
+	object := make(map[string]json.RawMessage)
+	if t.union != nil {
+		err = json.Unmarshal(b, &object)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if t.Annotations != nil {
+		object["annotations"], err = json.Marshal(t.Annotations)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'annotations': %w", err)
+		}
+	}
+
+	object["appType"], err = json.Marshal(t.AppType)
+	if err != nil {
+		return nil, fmt.Errorf("error marshaling 'appType': %w", err)
+	}
+
+	if t.DesiredState != nil {
+		object["desiredState"], err = json.Marshal(t.DesiredState)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'desiredState': %w", err)
+		}
+	}
+
+	if t.EnvVars != nil {
+		object["envVars"], err = json.Marshal(t.EnvVars)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'envVars': %w", err)
+		}
+	}
+
+	if t.Name != nil {
+		object["name"], err = json.Marshal(t.Name)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'name': %w", err)
+		}
+	}
+
+	if t.Ports != nil {
+		object["ports"], err = json.Marshal(t.Ports)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'ports': %w", err)
+		}
+	}
+
+	if t.Resources != nil {
+		object["resources"], err = json.Marshal(t.Resources)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'resources': %w", err)
+		}
+	}
+
+	if t.RestartGeneration != nil {
+		object["restartGeneration"], err = json.Marshal(t.RestartGeneration)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'restartGeneration': %w", err)
+		}
+	}
+
+	object["runAs"], err = json.Marshal(t.RunAs)
+	if err != nil {
+		return nil, fmt.Errorf("error marshaling 'runAs': %w", err)
+	}
+
+	if t.Volumes != nil {
+		object["volumes"], err = json.Marshal(t.Volumes)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'volumes': %w", err)
+		}
+	}
+	b, err = json.Marshal(object)
+	return b, err
+}
+
+func (t *ContainerApplication) UnmarshalJSON(b []byte) error {
+	err := t.union.UnmarshalJSON(b)
+	if err != nil {
+		return err
+	}
+	object := make(map[string]json.RawMessage)
+	err = json.Unmarshal(b, &object)
+	if err != nil {
+		return err
+	}
+
+	if raw, found := object["annotations"]; found {
+		err = json.Unmarshal(raw, &t.Annotations)
+		if err != nil {
+			return fmt.Errorf("error reading 'annotations': %w", err)
+		}
+	}
+
+	if raw, found := object["appType"]; found {
+		err = json.Unmarshal(raw, &t.AppType)
+		if err != nil {
+			return fmt.Errorf("error reading 'appType': %w", err)
+		}
+	}
+
+	if raw, found := object["desiredState"]; found {
+		err = json.Unmarshal(raw, &t.DesiredState)
+		if err != nil {
+			return fmt.Errorf("error reading 'desiredState': %w", err)
+		}
+	}
+
+	if raw, found := object["envVars"]; found {
+		err = json.Unmarshal(raw, &t.EnvVars)
+		if err != nil {
+			return fmt.Errorf("error reading 'envVars': %w", err)
+		}
+	}
+
+	if raw, found := object["name"]; found {
+		err = json.Unmarshal(raw, &t.Name)
+		if err != nil {
+			return fmt.Errorf("error reading 'name': %w", err)
+		}
+	}
+
+	if raw, found := object["ports"]; found {
+		err = json.Unmarshal(raw, &t.Ports)
+		if err != nil {
+			return fmt.Errorf("error reading 'ports': %w", err)
+		}
+	}
+
+	if raw, found := object["resources"]; found {
+		err = json.Unmarshal(raw, &t.Resources)
+		if err != nil {
+			return fmt.Errorf("error reading 'resources': %w", err)
+		}
+	}
+
+	if raw, found := object["restartGeneration"]; found {
+		err = json.Unmarshal(raw, &t.RestartGeneration)
+		if err != nil {
+			return fmt.Errorf("error reading 'restartGeneration': %w", err)
+		}
+	}
+
+	if raw, found := object["runAs"]; found {
+		err = json.Unmarshal(raw, &t.RunAs)
+		if err != nil {
+			return fmt.Errorf("error reading 'runAs': %w", err)
+		}
+	}
+
+	if raw, found := object["volumes"]; found {
+		err = json.Unmarshal(raw, &t.Volumes)
+		if err != nil {
+			return fmt.Errorf("error reading 'volumes': %w", err)
+		}
+	}
+
 	return err
 }
 
@@ -5143,6 +5780,62 @@ func (t *EventDetails) MergeDependencySyncProbeFailedDetails(v DependencySyncPro
 	return err
 }
 
+// AsApplicationLifecycleChangedDetails returns the union data inside the EventDetails as a ApplicationLifecycleChangedDetails
+func (t EventDetails) AsApplicationLifecycleChangedDetails() (ApplicationLifecycleChangedDetails, error) {
+	var body ApplicationLifecycleChangedDetails
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromApplicationLifecycleChangedDetails overwrites any union data inside the EventDetails as the provided ApplicationLifecycleChangedDetails
+func (t *EventDetails) FromApplicationLifecycleChangedDetails(v ApplicationLifecycleChangedDetails) error {
+	v.DetailType = "ApplicationLifecycleChanged"
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeApplicationLifecycleChangedDetails performs a merge with any union data inside the EventDetails, using the provided ApplicationLifecycleChangedDetails
+func (t *EventDetails) MergeApplicationLifecycleChangedDetails(v ApplicationLifecycleChangedDetails) error {
+	v.DetailType = "ApplicationLifecycleChanged"
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsPrepareDeltasDetails returns the union data inside the EventDetails as a PrepareDeltasDetails
+func (t EventDetails) AsPrepareDeltasDetails() (PrepareDeltasDetails, error) {
+	var body PrepareDeltasDetails
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromPrepareDeltasDetails overwrites any union data inside the EventDetails as the provided PrepareDeltasDetails
+func (t *EventDetails) FromPrepareDeltasDetails(v PrepareDeltasDetails) error {
+	v.DetailType = "PrepareDeltas"
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergePrepareDeltasDetails performs a merge with any union data inside the EventDetails, using the provided PrepareDeltasDetails
+func (t *EventDetails) MergePrepareDeltasDetails(v PrepareDeltasDetails) error {
+	v.DetailType = "PrepareDeltas"
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
 func (t EventDetails) Discriminator() (string, error) {
 	var discriminator struct {
 		Discriminator string `json:"detailType"`
@@ -5157,6 +5850,8 @@ func (t EventDetails) ValueByDiscriminator() (interface{}, error) {
 		return nil, err
 	}
 	switch discriminator {
+	case "ApplicationLifecycleChanged":
+		return t.AsApplicationLifecycleChangedDetails()
 	case "DependencyChangeDetected":
 		return t.AsDependencyChangeDetectedDetails()
 	case "DependencySyncProbeFailed":
@@ -5185,6 +5880,8 @@ func (t EventDetails) ValueByDiscriminator() (interface{}, error) {
 		return t.AsInternalTaskFailedDetails()
 	case "InternalTaskPermanentlyFailed":
 		return t.AsInternalTaskPermanentlyFailedDetails()
+	case "PrepareDeltas":
+		return t.AsPrepareDeltasDetails()
 	case "ReferencedRepositoryUpdated":
 		return t.AsReferencedRepositoryUpdatedDetails()
 	case "ResourceSyncCompleted":
@@ -5203,6 +5900,198 @@ func (t EventDetails) MarshalJSON() ([]byte, error) {
 
 func (t *EventDetails) UnmarshalJSON(b []byte) error {
 	err := t.union.UnmarshalJSON(b)
+	return err
+}
+
+// AsImageApplicationProviderSpec returns the union data inside the HelmApplication as a ImageApplicationProviderSpec
+func (t HelmApplication) AsImageApplicationProviderSpec() (ImageApplicationProviderSpec, error) {
+	var body ImageApplicationProviderSpec
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromImageApplicationProviderSpec overwrites any union data inside the HelmApplication as the provided ImageApplicationProviderSpec
+func (t *HelmApplication) FromImageApplicationProviderSpec(v ImageApplicationProviderSpec) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeImageApplicationProviderSpec performs a merge with any union data inside the HelmApplication, using the provided ImageApplicationProviderSpec
+func (t *HelmApplication) MergeImageApplicationProviderSpec(v ImageApplicationProviderSpec) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsCatalogItemRefApplicationProviderSpec returns the union data inside the HelmApplication as a CatalogItemRefApplicationProviderSpec
+func (t HelmApplication) AsCatalogItemRefApplicationProviderSpec() (CatalogItemRefApplicationProviderSpec, error) {
+	var body CatalogItemRefApplicationProviderSpec
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromCatalogItemRefApplicationProviderSpec overwrites any union data inside the HelmApplication as the provided CatalogItemRefApplicationProviderSpec
+func (t *HelmApplication) FromCatalogItemRefApplicationProviderSpec(v CatalogItemRefApplicationProviderSpec) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeCatalogItemRefApplicationProviderSpec performs a merge with any union data inside the HelmApplication, using the provided CatalogItemRefApplicationProviderSpec
+func (t *HelmApplication) MergeCatalogItemRefApplicationProviderSpec(v CatalogItemRefApplicationProviderSpec) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+func (t HelmApplication) MarshalJSON() ([]byte, error) {
+	b, err := t.union.MarshalJSON()
+	if err != nil {
+		return nil, err
+	}
+	object := make(map[string]json.RawMessage)
+	if t.union != nil {
+		err = json.Unmarshal(b, &object)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if t.Annotations != nil {
+		object["annotations"], err = json.Marshal(t.Annotations)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'annotations': %w", err)
+		}
+	}
+
+	object["appType"], err = json.Marshal(t.AppType)
+	if err != nil {
+		return nil, fmt.Errorf("error marshaling 'appType': %w", err)
+	}
+
+	if t.DesiredState != nil {
+		object["desiredState"], err = json.Marshal(t.DesiredState)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'desiredState': %w", err)
+		}
+	}
+
+	if t.Name != nil {
+		object["name"], err = json.Marshal(t.Name)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'name': %w", err)
+		}
+	}
+
+	if t.Namespace != nil {
+		object["namespace"], err = json.Marshal(t.Namespace)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'namespace': %w", err)
+		}
+	}
+
+	if t.RestartGeneration != nil {
+		object["restartGeneration"], err = json.Marshal(t.RestartGeneration)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'restartGeneration': %w", err)
+		}
+	}
+
+	if t.Values != nil {
+		object["values"], err = json.Marshal(t.Values)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'values': %w", err)
+		}
+	}
+
+	if t.ValuesFiles != nil {
+		object["valuesFiles"], err = json.Marshal(t.ValuesFiles)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'valuesFiles': %w", err)
+		}
+	}
+	b, err = json.Marshal(object)
+	return b, err
+}
+
+func (t *HelmApplication) UnmarshalJSON(b []byte) error {
+	err := t.union.UnmarshalJSON(b)
+	if err != nil {
+		return err
+	}
+	object := make(map[string]json.RawMessage)
+	err = json.Unmarshal(b, &object)
+	if err != nil {
+		return err
+	}
+
+	if raw, found := object["annotations"]; found {
+		err = json.Unmarshal(raw, &t.Annotations)
+		if err != nil {
+			return fmt.Errorf("error reading 'annotations': %w", err)
+		}
+	}
+
+	if raw, found := object["appType"]; found {
+		err = json.Unmarshal(raw, &t.AppType)
+		if err != nil {
+			return fmt.Errorf("error reading 'appType': %w", err)
+		}
+	}
+
+	if raw, found := object["desiredState"]; found {
+		err = json.Unmarshal(raw, &t.DesiredState)
+		if err != nil {
+			return fmt.Errorf("error reading 'desiredState': %w", err)
+		}
+	}
+
+	if raw, found := object["name"]; found {
+		err = json.Unmarshal(raw, &t.Name)
+		if err != nil {
+			return fmt.Errorf("error reading 'name': %w", err)
+		}
+	}
+
+	if raw, found := object["namespace"]; found {
+		err = json.Unmarshal(raw, &t.Namespace)
+		if err != nil {
+			return fmt.Errorf("error reading 'namespace': %w", err)
+		}
+	}
+
+	if raw, found := object["restartGeneration"]; found {
+		err = json.Unmarshal(raw, &t.RestartGeneration)
+		if err != nil {
+			return fmt.Errorf("error reading 'restartGeneration': %w", err)
+		}
+	}
+
+	if raw, found := object["values"]; found {
+		err = json.Unmarshal(raw, &t.Values)
+		if err != nil {
+			return fmt.Errorf("error reading 'values': %w", err)
+		}
+	}
+
+	if raw, found := object["valuesFiles"]; found {
+		err = json.Unmarshal(raw, &t.ValuesFiles)
+		if err != nil {
+			return fmt.Errorf("error reading 'valuesFiles': %w", err)
+		}
+	}
+
 	return err
 }
 
@@ -5556,6 +6445,32 @@ func (t *QuadletApplication) MergeImageApplicationProviderSpec(v ImageApplicatio
 	return err
 }
 
+// AsCatalogItemRefApplicationProviderSpec returns the union data inside the QuadletApplication as a CatalogItemRefApplicationProviderSpec
+func (t QuadletApplication) AsCatalogItemRefApplicationProviderSpec() (CatalogItemRefApplicationProviderSpec, error) {
+	var body CatalogItemRefApplicationProviderSpec
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromCatalogItemRefApplicationProviderSpec overwrites any union data inside the QuadletApplication as the provided CatalogItemRefApplicationProviderSpec
+func (t *QuadletApplication) FromCatalogItemRefApplicationProviderSpec(v CatalogItemRefApplicationProviderSpec) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeCatalogItemRefApplicationProviderSpec performs a merge with any union data inside the QuadletApplication, using the provided CatalogItemRefApplicationProviderSpec
+func (t *QuadletApplication) MergeCatalogItemRefApplicationProviderSpec(v CatalogItemRefApplicationProviderSpec) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
 // AsInlineApplicationProviderSpec returns the union data inside the QuadletApplication as a InlineApplicationProviderSpec
 func (t QuadletApplication) AsInlineApplicationProviderSpec() (InlineApplicationProviderSpec, error) {
 	var body InlineApplicationProviderSpec
@@ -5595,9 +6510,23 @@ func (t QuadletApplication) MarshalJSON() ([]byte, error) {
 		}
 	}
 
+	if t.Annotations != nil {
+		object["annotations"], err = json.Marshal(t.Annotations)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'annotations': %w", err)
+		}
+	}
+
 	object["appType"], err = json.Marshal(t.AppType)
 	if err != nil {
 		return nil, fmt.Errorf("error marshaling 'appType': %w", err)
+	}
+
+	if t.DesiredState != nil {
+		object["desiredState"], err = json.Marshal(t.DesiredState)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'desiredState': %w", err)
+		}
 	}
 
 	if t.EnvVars != nil {
@@ -5611,6 +6540,13 @@ func (t QuadletApplication) MarshalJSON() ([]byte, error) {
 		object["name"], err = json.Marshal(t.Name)
 		if err != nil {
 			return nil, fmt.Errorf("error marshaling 'name': %w", err)
+		}
+	}
+
+	if t.RestartGeneration != nil {
+		object["restartGeneration"], err = json.Marshal(t.RestartGeneration)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'restartGeneration': %w", err)
 		}
 	}
 
@@ -5640,10 +6576,24 @@ func (t *QuadletApplication) UnmarshalJSON(b []byte) error {
 		return err
 	}
 
+	if raw, found := object["annotations"]; found {
+		err = json.Unmarshal(raw, &t.Annotations)
+		if err != nil {
+			return fmt.Errorf("error reading 'annotations': %w", err)
+		}
+	}
+
 	if raw, found := object["appType"]; found {
 		err = json.Unmarshal(raw, &t.AppType)
 		if err != nil {
 			return fmt.Errorf("error reading 'appType': %w", err)
+		}
+	}
+
+	if raw, found := object["desiredState"]; found {
+		err = json.Unmarshal(raw, &t.DesiredState)
+		if err != nil {
+			return fmt.Errorf("error reading 'desiredState': %w", err)
 		}
 	}
 
@@ -5658,6 +6608,13 @@ func (t *QuadletApplication) UnmarshalJSON(b []byte) error {
 		err = json.Unmarshal(raw, &t.Name)
 		if err != nil {
 			return fmt.Errorf("error reading 'name': %w", err)
+		}
+	}
+
+	if raw, found := object["restartGeneration"]; found {
+		err = json.Unmarshal(raw, &t.RestartGeneration)
+		if err != nil {
+			return fmt.Errorf("error reading 'restartGeneration': %w", err)
 		}
 	}
 
@@ -5972,5 +6929,169 @@ func (t RolloutDeviceSelection) MarshalJSON() ([]byte, error) {
 
 func (t *RolloutDeviceSelection) UnmarshalJSON(b []byte) error {
 	err := t.union.UnmarshalJSON(b)
+	return err
+}
+
+// AsImageApplicationProviderSpec returns the union data inside the VmApplication as a ImageApplicationProviderSpec
+func (t VmApplication) AsImageApplicationProviderSpec() (ImageApplicationProviderSpec, error) {
+	var body ImageApplicationProviderSpec
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromImageApplicationProviderSpec overwrites any union data inside the VmApplication as the provided ImageApplicationProviderSpec
+func (t *VmApplication) FromImageApplicationProviderSpec(v ImageApplicationProviderSpec) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeImageApplicationProviderSpec performs a merge with any union data inside the VmApplication, using the provided ImageApplicationProviderSpec
+func (t *VmApplication) MergeImageApplicationProviderSpec(v ImageApplicationProviderSpec) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsInlineApplicationProviderSpec returns the union data inside the VmApplication as a InlineApplicationProviderSpec
+func (t VmApplication) AsInlineApplicationProviderSpec() (InlineApplicationProviderSpec, error) {
+	var body InlineApplicationProviderSpec
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromInlineApplicationProviderSpec overwrites any union data inside the VmApplication as the provided InlineApplicationProviderSpec
+func (t *VmApplication) FromInlineApplicationProviderSpec(v InlineApplicationProviderSpec) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeInlineApplicationProviderSpec performs a merge with any union data inside the VmApplication, using the provided InlineApplicationProviderSpec
+func (t *VmApplication) MergeInlineApplicationProviderSpec(v InlineApplicationProviderSpec) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+func (t VmApplication) MarshalJSON() ([]byte, error) {
+	b, err := t.union.MarshalJSON()
+	if err != nil {
+		return nil, err
+	}
+	object := make(map[string]json.RawMessage)
+	if t.union != nil {
+		err = json.Unmarshal(b, &object)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if t.Annotations != nil {
+		object["annotations"], err = json.Marshal(t.Annotations)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'annotations': %w", err)
+		}
+	}
+
+	object["appType"], err = json.Marshal(t.AppType)
+	if err != nil {
+		return nil, fmt.Errorf("error marshaling 'appType': %w", err)
+	}
+
+	if t.DesiredState != nil {
+		object["desiredState"], err = json.Marshal(t.DesiredState)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'desiredState': %w", err)
+		}
+	}
+
+	if t.Name != nil {
+		object["name"], err = json.Marshal(t.Name)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'name': %w", err)
+		}
+	}
+
+	if t.PublishPorts != nil {
+		object["publishPorts"], err = json.Marshal(t.PublishPorts)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'publishPorts': %w", err)
+		}
+	}
+
+	if t.RestartGeneration != nil {
+		object["restartGeneration"], err = json.Marshal(t.RestartGeneration)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'restartGeneration': %w", err)
+		}
+	}
+	b, err = json.Marshal(object)
+	return b, err
+}
+
+func (t *VmApplication) UnmarshalJSON(b []byte) error {
+	err := t.union.UnmarshalJSON(b)
+	if err != nil {
+		return err
+	}
+	object := make(map[string]json.RawMessage)
+	err = json.Unmarshal(b, &object)
+	if err != nil {
+		return err
+	}
+
+	if raw, found := object["annotations"]; found {
+		err = json.Unmarshal(raw, &t.Annotations)
+		if err != nil {
+			return fmt.Errorf("error reading 'annotations': %w", err)
+		}
+	}
+
+	if raw, found := object["appType"]; found {
+		err = json.Unmarshal(raw, &t.AppType)
+		if err != nil {
+			return fmt.Errorf("error reading 'appType': %w", err)
+		}
+	}
+
+	if raw, found := object["desiredState"]; found {
+		err = json.Unmarshal(raw, &t.DesiredState)
+		if err != nil {
+			return fmt.Errorf("error reading 'desiredState': %w", err)
+		}
+	}
+
+	if raw, found := object["name"]; found {
+		err = json.Unmarshal(raw, &t.Name)
+		if err != nil {
+			return fmt.Errorf("error reading 'name': %w", err)
+		}
+	}
+
+	if raw, found := object["publishPorts"]; found {
+		err = json.Unmarshal(raw, &t.PublishPorts)
+		if err != nil {
+			return fmt.Errorf("error reading 'publishPorts': %w", err)
+		}
+	}
+
+	if raw, found := object["restartGeneration"]; found {
+		err = json.Unmarshal(raw, &t.RestartGeneration)
+		if err != nil {
+			return fmt.Errorf("error reading 'restartGeneration': %w", err)
+		}
+	}
+
 	return err
 }

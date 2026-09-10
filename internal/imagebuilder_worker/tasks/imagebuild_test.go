@@ -9,89 +9,35 @@ import (
 	"github.com/flightctl/flightctl/api/core/v1beta1"
 	api "github.com/flightctl/flightctl/api/imagebuilder/v1alpha1"
 	"github.com/flightctl/flightctl/internal/crypto"
-	"github.com/flightctl/flightctl/internal/flterrors"
-	"github.com/flightctl/flightctl/internal/store"
+	coredomain "github.com/flightctl/flightctl/internal/domain"
+	repositoryservice "github.com/flightctl/flightctl/internal/service/repository"
 	"github.com/flightctl/flightctl/pkg/log"
 	"github.com/google/uuid"
 	"github.com/samber/lo"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 )
 
-// mockStore is a mock implementation of store.Store for testing
-type mockStore struct {
+// mockRepositoryStore is a mock implementation of repositoryservice.Service for testing
+type mockRepositoryStore struct {
+	repositoryservice.Service
 	repositories map[string]*v1beta1.Repository
 }
 
-func newMockStore() *mockStore {
-	return &mockStore{
+func newMockRepositoryStore() *mockRepositoryStore {
+	return &mockRepositoryStore{
 		repositories: make(map[string]*v1beta1.Repository),
 	}
 }
 
-func (m *mockStore) Repository() store.Repository {
-	return &mockRepositoryStore{store: m}
-}
-
-func (m *mockStore) Device() store.Device                                       { return nil }
-func (m *mockStore) EnrollmentRequest() store.EnrollmentRequest                 { return nil }
-func (m *mockStore) CertificateSigningRequest() store.CertificateSigningRequest { return nil }
-func (m *mockStore) Fleet() store.Fleet                                         { return nil }
-func (m *mockStore) TemplateVersion() store.TemplateVersion                     { return nil }
-func (m *mockStore) ResourceSync() store.ResourceSync                           { return nil }
-func (m *mockStore) Event() store.Event                                         { return nil }
-func (m *mockStore) Checkpoint() store.Checkpoint                               { return nil }
-func (m *mockStore) Organization() store.Organization                           { return nil }
-func (m *mockStore) AuthProvider() store.AuthProvider                           { return nil }
-func (m *mockStore) Catalog() store.Catalog                                     { return nil }
-func (m *mockStore) VulnerabilityFinding() store.VulnerabilityFinding           { return nil }
-func (m *mockStore) SyncState() store.SyncState                                 { return nil }
-func (m *mockStore) DependencyRef() store.DependencyRef                         { return nil }
-func (m *mockStore) RunMigrations(context.Context) error                        { return nil }
-func (m *mockStore) CheckHealth(context.Context) error                          { return nil }
-func (m *mockStore) Close() error                                               { return nil }
-
-// mockRepositoryStore is a mock implementation of store.Repository
-type mockRepositoryStore struct {
-	store *mockStore
-}
-
-func (m *mockRepositoryStore) Get(ctx context.Context, orgId uuid.UUID, name string) (*v1beta1.Repository, error) {
-	repo, ok := m.store.repositories[name]
+func (m *mockRepositoryStore) GetRepository(ctx context.Context, orgId uuid.UUID, name string) (*coredomain.Repository, coredomain.Status) {
+	repo, ok := m.repositories[name]
 	if !ok {
-		return nil, flterrors.ErrResourceNotFound
+		return nil, coredomain.StatusResourceNotFound(coredomain.RepositoryKind, name)
 	}
-	return repo, nil
+	return repo, coredomain.StatusOK()
 }
-
-func (m *mockRepositoryStore) InitialMigration(context.Context) error { return nil }
-func (m *mockRepositoryStore) Create(context.Context, uuid.UUID, *v1beta1.Repository, store.EventCallback) (*v1beta1.Repository, error) {
-	return nil, nil
-}
-func (m *mockRepositoryStore) Update(context.Context, uuid.UUID, *v1beta1.Repository, store.EventCallback) (*v1beta1.Repository, error) {
-	return nil, nil
-}
-func (m *mockRepositoryStore) CreateOrUpdate(context.Context, uuid.UUID, *v1beta1.Repository, store.EventCallback) (*v1beta1.Repository, bool, error) {
-	return nil, false, nil
-}
-func (m *mockRepositoryStore) List(context.Context, uuid.UUID, store.ListParams) (*v1beta1.RepositoryList, error) {
-	return nil, nil
-}
-func (m *mockRepositoryStore) Delete(context.Context, uuid.UUID, string, store.EventCallback) error {
-	return nil
-}
-func (m *mockRepositoryStore) UpdateStatus(context.Context, uuid.UUID, *v1beta1.Repository, store.EventCallback) (*v1beta1.Repository, error) {
-	return nil, nil
-}
-func (m *mockRepositoryStore) GetFleetRefs(context.Context, uuid.UUID, string) (*v1beta1.FleetList, error) {
-	return nil, nil
-}
-func (m *mockRepositoryStore) GetDeviceRefs(context.Context, uuid.UUID, string) (*v1beta1.DeviceList, error) {
-	return nil, nil
-}
-func (m *mockRepositoryStore) Count(context.Context, uuid.UUID, store.ListParams) (int64, error) {
-	return 0, nil
-}
-func (m *mockRepositoryStore) CountByOrg(context.Context, *uuid.UUID) ([]store.CountByOrgResult, error) {
+func (m *mockRepositoryStore) GetDeltaStorageTarget(context.Context, uuid.UUID) (*v1beta1.Repository, error) {
 	return nil, nil
 }
 
@@ -216,8 +162,8 @@ func TestContainerfileTemplate(t *testing.T) {
 }
 
 func TestGenerateContainerfile_LateBinding(t *testing.T) {
-	mockStore := newMockStore()
-	mockStore.repositories["test-repo"] = createTestRepository("test-repo", "quay.io", nil)
+	repoStore := newMockRepositoryStore()
+	repoStore.repositories["test-repo"] = createTestRepository("test-repo", "quay.io", nil)
 
 	mockServiceHandler := newMockServiceHandler()
 	imageBuild := newTestImageBuild("test-build", "late")
@@ -226,7 +172,7 @@ func TestGenerateContainerfile_LateBinding(t *testing.T) {
 	orgID := uuid.New()
 	logger := log.InitLogs()
 
-	result, err := GenerateContainerfile(ctx, mockStore, mockServiceHandler, orgID, imageBuild, logger)
+	result, err := GenerateContainerfile(ctx, repoStore, mockServiceHandler, orgID, imageBuild, logger)
 
 	require.NoError(t, err)
 	require.NotNil(t, result)
@@ -247,8 +193,8 @@ func TestGenerateContainerfile_LateBinding(t *testing.T) {
 }
 
 func TestGenerateContainerfile_EarlyBinding(t *testing.T) {
-	mockStore := newMockStore()
-	mockStore.repositories["test-repo"] = createTestRepository("test-repo", "registry.example.com", lo.ToPtr(v1beta1.Https))
+	repoStore := newMockRepositoryStore()
+	repoStore.repositories["test-repo"] = createTestRepository("test-repo", "registry.example.com", lo.ToPtr(v1beta1.Https))
 
 	mockServiceHandler := newMockServiceHandler()
 	imageBuild := newTestImageBuild("test-build", "early")
@@ -257,7 +203,7 @@ func TestGenerateContainerfile_EarlyBinding(t *testing.T) {
 	orgID := uuid.New()
 	logger := log.InitLogs()
 
-	result, err := GenerateContainerfile(ctx, mockStore, mockServiceHandler, orgID, imageBuild, logger)
+	result, err := GenerateContainerfile(ctx, repoStore, mockServiceHandler, orgID, imageBuild, logger)
 
 	require.NoError(t, err)
 	require.NotNil(t, result)
@@ -279,7 +225,7 @@ func TestGenerateContainerfile_EarlyBinding(t *testing.T) {
 }
 
 func TestGenerateContainerfile_RepositoryNotFound(t *testing.T) {
-	mockStore := newMockStore()
+	repoStore := newMockRepositoryStore()
 	mockServiceHandler := newMockServiceHandler()
 	imageBuild := newTestImageBuild("test-build", "late")
 
@@ -287,7 +233,7 @@ func TestGenerateContainerfile_RepositoryNotFound(t *testing.T) {
 	orgID := uuid.New()
 	logger := log.InitLogs()
 
-	_, err := GenerateContainerfile(ctx, mockStore, mockServiceHandler, orgID, imageBuild, logger)
+	_, err := GenerateContainerfile(ctx, repoStore, mockServiceHandler, orgID, imageBuild, logger)
 
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "repository")
@@ -295,22 +241,22 @@ func TestGenerateContainerfile_RepositoryNotFound(t *testing.T) {
 }
 
 func TestGenerateContainerfile_NilImageBuild(t *testing.T) {
-	mockStore := newMockStore()
+	repoStore := newMockRepositoryStore()
 	mockServiceHandler := newMockServiceHandler()
 
 	ctx := context.Background()
 	orgID := uuid.New()
 	logger := log.InitLogs()
 
-	_, err := GenerateContainerfile(ctx, mockStore, mockServiceHandler, orgID, nil, logger)
+	_, err := GenerateContainerfile(ctx, repoStore, mockServiceHandler, orgID, nil, logger)
 
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "cannot be nil")
 }
 
 func TestGenerateContainerfile_InvalidBindingType(t *testing.T) {
-	mockStore := newMockStore()
-	mockStore.repositories["test-repo"] = createTestRepository("test-repo", "quay.io", nil)
+	repoStore := newMockRepositoryStore()
+	repoStore.repositories["test-repo"] = createTestRepository("test-repo", "quay.io", nil)
 
 	mockServiceHandler := newMockServiceHandler()
 	imageBuild := newTestImageBuild("test-build", "late")
@@ -322,15 +268,15 @@ func TestGenerateContainerfile_InvalidBindingType(t *testing.T) {
 	orgID := uuid.New()
 	logger := log.InitLogs()
 
-	_, err := GenerateContainerfile(ctx, mockStore, mockServiceHandler, orgID, imageBuild, logger)
+	_, err := GenerateContainerfile(ctx, repoStore, mockServiceHandler, orgID, imageBuild, logger)
 
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "binding type")
 }
 
 func TestGenerateContainerfile_ServiceHandlerError(t *testing.T) {
-	mockStore := newMockStore()
-	mockStore.repositories["test-repo"] = createTestRepository("test-repo", "quay.io", nil)
+	repoStore := newMockRepositoryStore()
+	repoStore.repositories["test-repo"] = createTestRepository("test-repo", "quay.io", nil)
 
 	mockServiceHandler := &mockServiceHandler{
 		generateError: fmt.Errorf("failed to generate credential"),
@@ -341,15 +287,15 @@ func TestGenerateContainerfile_ServiceHandlerError(t *testing.T) {
 	orgID := uuid.New()
 	logger := log.InitLogs()
 
-	_, err := GenerateContainerfile(ctx, mockStore, mockServiceHandler, orgID, imageBuild, logger)
+	_, err := GenerateContainerfile(ctx, repoStore, mockServiceHandler, orgID, imageBuild, logger)
 
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "agent config")
 }
 
 func TestGenerateContainerfile_WithUserConfiguration(t *testing.T) {
-	mockStore := newMockStore()
-	mockStore.repositories["test-repo"] = createTestRepository("test-repo", "quay.io", nil)
+	repoStore := newMockRepositoryStore()
+	repoStore.repositories["test-repo"] = createTestRepository("test-repo", "quay.io", nil)
 
 	mockServiceHandler := newMockServiceHandler()
 	imageBuild := newTestImageBuild("test-build", "late")
@@ -363,7 +309,7 @@ func TestGenerateContainerfile_WithUserConfiguration(t *testing.T) {
 	orgID := uuid.New()
 	logger := log.InitLogs()
 
-	result, err := GenerateContainerfile(ctx, mockStore, mockServiceHandler, orgID, imageBuild, logger)
+	result, err := GenerateContainerfile(ctx, repoStore, mockServiceHandler, orgID, imageBuild, logger)
 
 	require.NoError(t, err)
 	require.NotNil(t, result)
@@ -383,8 +329,8 @@ func TestGenerateContainerfile_WithUserConfiguration(t *testing.T) {
 }
 
 func TestGenerateContainerfile_WithoutUserConfiguration(t *testing.T) {
-	mockStore := newMockStore()
-	mockStore.repositories["test-repo"] = createTestRepository("test-repo", "quay.io", nil)
+	repoStore := newMockRepositoryStore()
+	repoStore.repositories["test-repo"] = createTestRepository("test-repo", "quay.io", nil)
 
 	mockServiceHandler := newMockServiceHandler()
 	imageBuild := newTestImageBuild("test-build", "late")
@@ -394,7 +340,7 @@ func TestGenerateContainerfile_WithoutUserConfiguration(t *testing.T) {
 	orgID := uuid.New()
 	logger := log.InitLogs()
 
-	result, err := GenerateContainerfile(ctx, mockStore, mockServiceHandler, orgID, imageBuild, logger)
+	result, err := GenerateContainerfile(ctx, repoStore, mockServiceHandler, orgID, imageBuild, logger)
 
 	require.NoError(t, err)
 	require.NotNil(t, result)
@@ -406,6 +352,129 @@ func TestGenerateContainerfile_WithoutUserConfiguration(t *testing.T) {
 
 	// Verify Publickey is nil when no user configuration
 	require.Nil(t, result.Publickey)
+}
+
+func TestGenerateContainerfile_OnboardingTrue(t *testing.T) {
+	repoStore := newMockRepositoryStore()
+	repoStore.repositories["test-repo"] = createTestRepository("test-repo", "quay.io", nil)
+
+	mockServiceHandler := newMockServiceHandler()
+	imageBuild := newTestImageBuild("test-build", "late")
+	imageBuild.Spec.Onboarding = lo.ToPtr(true)
+
+	ctx := context.Background()
+	orgID := uuid.New()
+	logger := log.InitLogs()
+
+	result, err := GenerateContainerfile(ctx, repoStore, mockServiceHandler, orgID, imageBuild, logger)
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.True(t, result.BuildArgs.InstallOnboarding)
+}
+
+func TestGenerateContainerfile_OnboardingFalse(t *testing.T) {
+	repoStore := newMockRepositoryStore()
+	repoStore.repositories["test-repo"] = createTestRepository("test-repo", "quay.io", nil)
+
+	mockServiceHandler := newMockServiceHandler()
+	imageBuild := newTestImageBuild("test-build", "late")
+	imageBuild.Spec.Onboarding = lo.ToPtr(false)
+
+	ctx := context.Background()
+	orgID := uuid.New()
+	logger := log.InitLogs()
+
+	result, err := GenerateContainerfile(ctx, repoStore, mockServiceHandler, orgID, imageBuild, logger)
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.False(t, result.BuildArgs.InstallOnboarding)
+}
+
+func TestGenerateContainerfile_OnboardingNil(t *testing.T) {
+	repoStore := newMockRepositoryStore()
+	repoStore.repositories["test-repo"] = createTestRepository("test-repo", "quay.io", nil)
+
+	mockServiceHandler := newMockServiceHandler()
+	imageBuild := newTestImageBuild("test-build", "late")
+
+	ctx := context.Background()
+	orgID := uuid.New()
+	logger := log.InitLogs()
+
+	result, err := GenerateContainerfile(ctx, repoStore, mockServiceHandler, orgID, imageBuild, logger)
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.False(t, result.BuildArgs.InstallOnboarding)
+}
+
+func TestGenerateContainerfile_OnboardingWithEarlyBinding(t *testing.T) {
+	repoStore := newMockRepositoryStore()
+	repoStore.repositories["test-repo"] = createTestRepository("test-repo", "quay.io", nil)
+
+	mockServiceHandler := newMockServiceHandler()
+	imageBuild := newTestImageBuild("test-build", "early")
+	imageBuild.Spec.Onboarding = lo.ToPtr(true)
+
+	ctx := context.Background()
+	orgID := uuid.New()
+	logger := log.InitLogs()
+
+	result, err := GenerateContainerfile(ctx, repoStore, mockServiceHandler, orgID, imageBuild, logger)
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.True(t, result.BuildArgs.InstallOnboarding)
+	require.True(t, result.BuildArgs.EarlyBinding)
+}
+
+func TestContainerfileTemplate_OnboardingARG(t *testing.T) {
+	require.Contains(t, containerfileTemplate, "ARG INSTALL_ONBOARDING", "Template should declare INSTALL_ONBOARDING ARG")
+	require.Contains(t, containerfileTemplate, `if [ "${INSTALL_ONBOARDING}" = "true" ]`, "Template should have conditional for onboarding")
+	require.Contains(t, containerfileTemplate, "flightctl-onboarding", "Template should reference flightctl-onboarding package")
+	require.Contains(t, containerfileTemplate, "flightctl-onboarding-setup.service", "Template should enable flightctl-onboarding-setup.service")
+	require.Contains(t, containerfileTemplate, "$PACKAGES", "Template should use $PACKAGES variable for install")
+}
+
+func TestNofileUlimitArgs_ReflectsCurrentRlimit(t *testing.T) {
+	var want unix.Rlimit
+	err := unix.Getrlimit(unix.RLIMIT_NOFILE, &want)
+	require.NoError(t, err)
+
+	args := nofileUlimitArgs(log.InitLogs())
+
+	require.Equal(t, []string{"--ulimit", formatNofileUlimit(want)}, args)
+}
+
+func TestFormatNofileUlimit(t *testing.T) {
+	tests := []struct {
+		name  string
+		limit unix.Rlimit
+		want  string
+	}{
+		{
+			name:  "finite hard limit",
+			limit: unix.Rlimit{Cur: 1024, Max: 4096},
+			want:  "nofile=1024:4096",
+		},
+		{
+			name:  "soft equals hard (typical Kubernetes case)",
+			limit: unix.Rlimit{Cur: 1048576, Max: 1048576},
+			want:  "nofile=1048576:1048576",
+		},
+		{
+			name:  "infinite hard limit is capped to the soft limit",
+			limit: unix.Rlimit{Cur: 1024, Max: unix.RLIM_INFINITY},
+			want:  "nofile=1024:1024",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, formatNofileUlimit(tt.limit))
+		})
+	}
 }
 
 func TestInstallCACertInWorker_NilCaCrt(t *testing.T) {
@@ -432,4 +501,88 @@ func TestInstallCACertInWorker_ValidBase64FailsWithoutContainer(t *testing.T) {
 	err := installCACertInWorker(context.Background(), &encoded, "nonexistent-container", "registry.example.com", log.InitLogs())
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "failed to create cert dir in container")
+}
+
+func TestBuildLoginArgs(t *testing.T) {
+	httpScheme := coredomain.OciRepoSchemeHttp
+	skipVerify := true
+
+	tests := []struct {
+		name          string
+		containerName string
+		username      string
+		registry      string
+		ociSpec       *coredomain.OciRepoSpec
+		wantContains  []string
+		wantAbsent    []string
+	}{
+		{
+			name:          "When HTTPS registry it omits tls-verify flag",
+			containerName: "worker-container",
+			username:      "user1",
+			registry:      "registry.example.com",
+			ociSpec:       &coredomain.OciRepoSpec{},
+			wantContains:  []string{"exec", "-i", "worker-container", "podman", "login", "--authfile", containerAuthFile, "-u", "user1", "--password-stdin", "registry.example.com"},
+			wantAbsent:    []string{"--tls-verify=false"},
+		},
+		{
+			name:          "When HTTP registry it includes tls-verify=false",
+			containerName: "worker-container",
+			username:      "user1",
+			registry:      "registry.example.com",
+			ociSpec:       &coredomain.OciRepoSpec{Scheme: &httpScheme},
+			wantContains:  []string{"--tls-verify=false", "registry.example.com"},
+			wantAbsent:    nil,
+		},
+		{
+			name:          "When SkipServerVerification it includes tls-verify=false",
+			containerName: "worker-container",
+			username:      "user1",
+			registry:      "registry.example.com",
+			ociSpec:       &coredomain.OciRepoSpec{SkipServerVerification: &skipVerify},
+			wantContains:  []string{"--tls-verify=false", "registry.example.com"},
+			wantAbsent:    nil,
+		},
+		{
+			name:          "When nil ociSpec it omits tls-verify flag",
+			containerName: "worker-container",
+			username:      "user1",
+			registry:      "registry.example.com",
+			ociSpec:       nil,
+			wantContains:  []string{"exec", "-i", "worker-container", "registry.example.com"},
+			wantAbsent:    []string{"--tls-verify=false"},
+		},
+		{
+			name:          "When registry ends up last in args",
+			containerName: "c1",
+			username:      "admin",
+			registry:      "quay.io",
+			ociSpec:       &coredomain.OciRepoSpec{},
+			wantContains:  []string{"quay.io"},
+			wantAbsent:    nil,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			args := buildLoginArgs(tc.containerName, tc.username, tc.registry, tc.ociSpec)
+
+			for _, want := range tc.wantContains {
+				require.Contains(t, args, want)
+			}
+			for _, absent := range tc.wantAbsent {
+				require.NotContains(t, args, absent)
+			}
+
+			// Registry hostname must always be the last argument.
+			require.Equal(t, tc.registry, args[len(args)-1])
+		})
+	}
+}
+
+func TestAuthFileEnv(t *testing.T) {
+	env := authFileEnv()
+	require.Equal(t, containerAuthFile, env["REGISTRY_AUTH_FILE"],
+		"build and push execs must set REGISTRY_AUTH_FILE to the shared auth file path")
+	require.Len(t, env, 1, "authFileEnv should contain exactly one key")
 }

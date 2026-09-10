@@ -23,11 +23,12 @@ const startServicesTimeout = 2 * time.Minute
 //  5. Stops FlightCtl services (deployer.StopServices)
 //  6. Imports the database (deployer.RestoreDatabase)
 //  7. Restores PKI materials (deployer.RestorePKI)
-//  8. Restores service configuration (deployer.RestoreConfig)
-//  9. Retrieves service credentials via deployer.GetConfig
-//  10. Exposes DB and KV via deployer.ExposeService (no-op for Podman, port-forward for Kubernetes)
-//  11. Runs post-restoration device preparation (PrepareDevices)
-//  12. Starts FlightCtl services (deployer.StartServices) — deferred, always runs even on failure
+//  8. Restores encryption keys (deployer.RestoreEncryptionKeys)
+//  9. Restores service configuration (deployer.RestoreConfig)
+//  10. Retrieves service credentials via deployer.GetConfig
+//  11. Exposes DB and KV via deployer.ExposeService (no-op for Podman, port-forward for Kubernetes)
+//  12. Runs post-restoration device preparation (PrepareDevices)
+//  13. Starts FlightCtl services (deployer.StartServices) — deferred, always runs even on failure
 //
 // The deployer encapsulates all deployment-specific operations and credential extraction.
 // The temporary extraction directory is always cleaned up before Restore returns.
@@ -108,6 +109,12 @@ func Restore(
 	}
 	log.Info("PKI restore completed")
 
+	log.Info("Restoring encryption keys")
+	if err := deployer.RestoreEncryptionKeys(ctx, extractDir); err != nil {
+		return fmt.Errorf("encryption keys restore failed: %w", err)
+	}
+	log.Info("Encryption keys restore completed")
+
 	log.Info("Restoring service configuration")
 	if err := deployer.RestoreConfig(ctx, extractDir); err != nil {
 		return fmt.Errorf("service configuration restore failed: %w", err)
@@ -120,12 +127,22 @@ func Restore(
 		return fmt.Errorf("failed to retrieve service credentials: %w", err)
 	}
 
-	log.Info("Exposing database for post-restoration device preparation")
-	dbHost, dbPort, dbCleanup, err := deployer.ExposeService(ctx, "flightctl-db")
-	if err != nil {
-		return fmt.Errorf("failed to expose database service: %w", err)
+	var dbHost string
+	var dbPort int
+	if metadata.DatabaseIncluded {
+		log.Info("Exposing database for post-restoration device preparation")
+		var dbCleanup func()
+		dbHost, dbPort, dbCleanup, err = deployer.ExposeService(ctx, "flightctl-db")
+		if err != nil {
+			return fmt.Errorf("failed to expose database service: %w", err)
+		}
+		defer dbCleanup()
+	} else {
+		log.Info("Skipping database exposure (external database)")
+		// External database - use credentials from config
+		dbHost = cfg.Database.Hostname
+		dbPort = int(cfg.Database.Port)
 	}
-	defer dbCleanup()
 
 	log.Info("Exposing KV store for post-restoration device preparation")
 	kvHost, kvPort, kvCleanup, err := deployer.ExposeService(ctx, "flightctl-kv")
@@ -139,6 +156,22 @@ func Restore(
 	exposedCfg.Database.Port = uint(dbPort)
 	exposedCfg.KV.Hostname = kvHost
 	exposedCfg.KV.Port = uint(kvPort)
+
+	// For external database with TLS, prepare certificates.
+	// Kubernetes: extracts certs from ConfigMap/Secret to temporary files.
+	// Podman: no-op (certs already accessible as filesystem paths).
+	var certCleanup func()
+	if !metadata.DatabaseIncluded && exposedCfg.Database.SSLMode == "verify-full" {
+		log.Info("External database with TLS - preparing certificates")
+		var err error
+		certCleanup, err = deployer.SetupExternalDBCerts(ctx, &exposedCfg)
+		if err != nil {
+			return fmt.Errorf("failed to setup external database certificates: %w", err)
+		}
+		if certCleanup != nil {
+			defer certCleanup()
+		}
+	}
 
 	db, err := store.InitDB(&exposedCfg, log)
 	if err != nil {

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -19,6 +20,8 @@ import (
 	"github.com/flightctl/flightctl/internal/config"
 	coredomain "github.com/flightctl/flightctl/internal/domain"
 	"github.com/flightctl/flightctl/internal/flterrors"
+	"github.com/flightctl/flightctl/internal/instrumentation/encryption"
+	"github.com/flightctl/flightctl/internal/oci"
 	"github.com/flightctl/flightctl/internal/util"
 	"github.com/flightctl/flightctl/pkg/log"
 	"github.com/google/uuid"
@@ -76,16 +79,16 @@ func newImageExportWithImageBuildSource(name, imageBuildRef string) api.ImageExp
 	}
 }
 
-func setupRepositoriesForImageExport(repoStore *DummyRepositoryStore, ctx context.Context, orgId uuid.UUID, includeSource bool) {
+func setupRepositoriesForImageExport(t *testing.T, repoStore *DummyRepositoryStore, ctx context.Context, orgId uuid.UUID, includeSource bool) {
 	if includeSource {
 		// Create source repository (Read is fine for source)
-		sourceRepo := newOciRepository("source-registry", v1beta1.Read)
-		_, _ = repoStore.Create(ctx, orgId, sourceRepo, nil)
+		sourceRepo := newOciRepository(t, "source-registry", v1beta1.Read)
+		requireRepositoryCreate(t, repoStore, ctx, orgId, sourceRepo)
 	}
 
 	// Create destination repository (must be ReadWrite)
-	destRepo := newOciRepository("output-registry", v1beta1.ReadWrite)
-	_, _ = repoStore.Create(ctx, orgId, destRepo, nil)
+	destRepo := newOciRepository(t, "output-registry", v1beta1.ReadWrite)
+	requireRepositoryCreate(t, repoStore, ctx, orgId, destRepo)
 }
 
 // setupImageBuildForExport creates the ImageBuild that newValidImageExport references
@@ -101,7 +104,7 @@ func TestCreateImageExport(t *testing.T) {
 
 	// Set up repositories
 	repoStore := NewDummyRepositoryStore()
-	setupRepositoriesForImageBuild(repoStore, ctx, orgId)
+	setupRepositoriesForImageBuild(t, repoStore, ctx, orgId)
 	imageBuildStore := NewDummyImageBuildStore()
 
 	// Create the ImageBuild that will be referenced
@@ -126,7 +129,7 @@ func TestCreateImageExportDuplicate(t *testing.T) {
 
 	// Set up repositories
 	repoStore := NewDummyRepositoryStore()
-	setupRepositoriesForImageBuild(repoStore, ctx, orgId)
+	setupRepositoriesForImageBuild(t, repoStore, ctx, orgId)
 	imageBuildStore := NewDummyImageBuildStore()
 
 	// Create the ImageBuild that will be referenced
@@ -156,7 +159,7 @@ func TestCreateImageExportMissingFormats(t *testing.T) {
 
 	// Set up repositories
 	repoStore := NewDummyRepositoryStore()
-	setupRepositoriesForImageBuild(repoStore, ctx, orgId)
+	setupRepositoriesForImageBuild(t, repoStore, ctx, orgId)
 	imageBuildStore := NewDummyImageBuildStore()
 
 	// Create the ImageBuild that will be referenced
@@ -181,7 +184,7 @@ func TestCreateImageExportWithImageBuildRef(t *testing.T) {
 
 	// Set up repositories (destination only, source comes from ImageBuild)
 	repoStore := NewDummyRepositoryStore()
-	setupRepositoriesForImageExport(repoStore, ctx, orgId, false)
+	setupRepositoriesForImageExport(t, repoStore, ctx, orgId, false)
 	svc := NewImageExportService(NewDummyImageExportStore(), imageBuildStore, repoStore, nil, nil, nil, config.NewDefaultImageBuilderServiceConfig(), log.InitLogs())
 
 	// First create the ImageBuild that will be referenced
@@ -218,7 +221,7 @@ func TestGetImageExport(t *testing.T) {
 
 	// Set up repositories
 	repoStore := NewDummyRepositoryStore()
-	setupRepositoriesForImageBuild(repoStore, ctx, orgId)
+	setupRepositoriesForImageBuild(t, repoStore, ctx, orgId)
 	imageBuildStore := NewDummyImageBuildStore()
 
 	// Create the ImageBuild that will be referenced
@@ -257,7 +260,7 @@ func TestListImageExports(t *testing.T) {
 
 	// Set up repositories
 	repoStore := NewDummyRepositoryStore()
-	setupRepositoriesForImageBuild(repoStore, ctx, orgId)
+	setupRepositoriesForImageBuild(t, repoStore, ctx, orgId)
 	imageBuildStore := NewDummyImageBuildStore()
 
 	// Create the ImageBuild that will be referenced
@@ -288,7 +291,7 @@ func TestListImageExportsWithLimit(t *testing.T) {
 
 	// Set up repositories
 	repoStore := NewDummyRepositoryStore()
-	setupRepositoriesForImageBuild(repoStore, ctx, orgId)
+	setupRepositoriesForImageBuild(t, repoStore, ctx, orgId)
 	imageBuildStore := NewDummyImageBuildStore()
 
 	// Create the ImageBuild that will be referenced
@@ -321,9 +324,9 @@ func newShortTimeoutConfig() *config.ImageBuilderServiceConfig {
 }
 
 // Helper to set up service with KVStore and short timeout for delete tests
-func setupDeleteTestService(ctx context.Context, orgId uuid.UUID, kvStore *DummyKVStore) (ImageExportService, *DummyImageExportStore, *DummyImageBuildStore) {
+func setupDeleteTestService(t *testing.T, ctx context.Context, orgId uuid.UUID, kvStore *DummyKVStore) (ImageExportService, *DummyImageExportStore, *DummyImageBuildStore) {
 	repoStore := NewDummyRepositoryStore()
-	setupRepositoriesForImageBuild(repoStore, ctx, orgId)
+	setupRepositoriesForImageBuild(t, repoStore, ctx, orgId)
 	imageBuildStore := NewDummyImageBuildStore()
 	imageExportStore := NewDummyImageExportStore()
 
@@ -375,7 +378,7 @@ func TestDeleteImageExport_Pending_CancelSuccess(t *testing.T) {
 	orgId := uuid.New()
 
 	kvStore := NewDummyKVStore()
-	svc, _, _ := setupDeleteTestService(ctx, orgId, kvStore)
+	svc, _, _ := setupDeleteTestService(t, ctx, orgId, kvStore)
 
 	// Create ImageExport (starts in Pending state)
 	imageExport := newValidImageExport("delete-pending-success")
@@ -401,7 +404,7 @@ func TestDeleteImageExport_Converting_CancelSuccess(t *testing.T) {
 	orgId := uuid.New()
 
 	kvStore := NewDummyKVStore()
-	svc, imageExportStore, _ := setupDeleteTestService(ctx, orgId, kvStore)
+	svc, imageExportStore, _ := setupDeleteTestService(t, ctx, orgId, kvStore)
 
 	// Create ImageExport and set to Converting state
 	created := createImageExportWithStatus(ctx, svc, imageExportStore, orgId, "delete-converting-success", api.ImageExportConditionReasonConverting)
@@ -426,7 +429,7 @@ func TestDeleteImageExport_Pushing_CancelSuccess(t *testing.T) {
 	orgId := uuid.New()
 
 	kvStore := NewDummyKVStore()
-	svc, imageExportStore, _ := setupDeleteTestService(ctx, orgId, kvStore)
+	svc, imageExportStore, _ := setupDeleteTestService(t, ctx, orgId, kvStore)
 
 	// Create ImageExport and set to Pushing state
 	created := createImageExportWithStatus(ctx, svc, imageExportStore, orgId, "delete-pushing-success", api.ImageExportConditionReasonPushing)
@@ -451,7 +454,7 @@ func TestDeleteImageExport_CancelTimeout(t *testing.T) {
 	orgId := uuid.New()
 
 	kvStore := NewDummyKVStore()
-	svc, _, _ := setupDeleteTestService(ctx, orgId, kvStore)
+	svc, _, _ := setupDeleteTestService(t, ctx, orgId, kvStore)
 
 	// Create ImageExport (starts in Pending state - cancelable)
 	imageExport := newValidImageExport("delete-timeout")
@@ -482,7 +485,7 @@ func TestDeleteImageExport_Completed_NoCancelAttempt(t *testing.T) {
 	orgId := uuid.New()
 
 	kvStore := NewDummyKVStore()
-	svc, imageExportStore, _ := setupDeleteTestService(ctx, orgId, kvStore)
+	svc, imageExportStore, _ := setupDeleteTestService(t, ctx, orgId, kvStore)
 
 	// Create ImageExport and set to Completed state (not cancelable)
 	imageExport := newValidImageExport("delete-completed")
@@ -527,7 +530,7 @@ func TestDeleteImageExport_Failed_NoCancelAttempt(t *testing.T) {
 	orgId := uuid.New()
 
 	kvStore := NewDummyKVStore()
-	svc, imageExportStore, _ := setupDeleteTestService(ctx, orgId, kvStore)
+	svc, imageExportStore, _ := setupDeleteTestService(t, ctx, orgId, kvStore)
 
 	// Create ImageExport and set to Failed state (not cancelable)
 	created := createImageExportWithStatus(ctx, svc, imageExportStore, orgId, "delete-failed", api.ImageExportConditionReasonFailed)
@@ -554,7 +557,7 @@ func TestDeleteImageExport_Canceled_NoCancelAttempt(t *testing.T) {
 	orgId := uuid.New()
 
 	kvStore := NewDummyKVStore()
-	svc, imageExportStore, _ := setupDeleteTestService(ctx, orgId, kvStore)
+	svc, imageExportStore, _ := setupDeleteTestService(t, ctx, orgId, kvStore)
 
 	// Create ImageExport and set to Canceled state (not cancelable)
 	created := createImageExportWithStatus(ctx, svc, imageExportStore, orgId, "delete-canceled", api.ImageExportConditionReasonCanceled)
@@ -581,7 +584,7 @@ func TestDeleteImageExport_Canceling_NoCancelAttempt(t *testing.T) {
 	orgId := uuid.New()
 
 	kvStore := NewDummyKVStore()
-	svc, imageExportStore, _ := setupDeleteTestService(ctx, orgId, kvStore)
+	svc, imageExportStore, _ := setupDeleteTestService(t, ctx, orgId, kvStore)
 
 	// Create ImageExport and set to Canceling state (not cancelable - already canceling)
 	created := createImageExportWithStatus(ctx, svc, imageExportStore, orgId, "delete-canceling", api.ImageExportConditionReasonCanceling)
@@ -608,7 +611,7 @@ func TestDeleteImageExportNotFound(t *testing.T) {
 	orgId := uuid.New()
 
 	kvStore := NewDummyKVStore()
-	svc, _, _ := setupDeleteTestService(ctx, orgId, kvStore)
+	svc, _, _ := setupDeleteTestService(t, ctx, orgId, kvStore)
 
 	// Delete is idempotent - deleting non-existent resource returns success
 	status := svc.Delete(ctx, orgId, "nonexistent")
@@ -622,7 +625,7 @@ func TestUpdateImageExportStatus(t *testing.T) {
 
 	// Set up repositories
 	repoStore := NewDummyRepositoryStore()
-	setupRepositoriesForImageBuild(repoStore, ctx, orgId)
+	setupRepositoriesForImageBuild(t, repoStore, ctx, orgId)
 	imageBuildStore := NewDummyImageBuildStore()
 
 	// Create the ImageBuild that will be referenced
@@ -699,7 +702,7 @@ func TestDownloadImageExportNotReadyNoStatus(t *testing.T) {
 
 	// Set up repositories
 	repoStore := NewDummyRepositoryStore()
-	setupRepositoriesForImageBuild(repoStore, ctx, orgId)
+	setupRepositoriesForImageBuild(t, repoStore, ctx, orgId)
 	imageBuildStore := NewDummyImageBuildStore()
 	setupImageBuildForExport(imageBuildStore, ctx, orgId)
 	imageExportStore := NewDummyImageExportStore()
@@ -722,7 +725,7 @@ func TestDownloadImageExportNotReadyNoConditions(t *testing.T) {
 
 	// Set up repositories
 	repoStore := NewDummyRepositoryStore()
-	setupRepositoriesForImageBuild(repoStore, ctx, orgId)
+	setupRepositoriesForImageBuild(t, repoStore, ctx, orgId)
 	imageBuildStore := NewDummyImageBuildStore()
 	setupImageBuildForExport(imageBuildStore, ctx, orgId)
 	imageExportStore := NewDummyImageExportStore()
@@ -748,7 +751,7 @@ func TestDownloadImageExportNotReadyNoReadyCondition(t *testing.T) {
 
 	// Set up repositories
 	repoStore := NewDummyRepositoryStore()
-	setupRepositoriesForImageBuild(repoStore, ctx, orgId)
+	setupRepositoriesForImageBuild(t, repoStore, ctx, orgId)
 	imageBuildStore := NewDummyImageBuildStore()
 	setupImageBuildForExport(imageBuildStore, ctx, orgId)
 	imageExportStore := NewDummyImageExportStore()
@@ -782,7 +785,7 @@ func TestDownloadImageExportNotReadyFalseStatus(t *testing.T) {
 
 	// Set up repositories
 	repoStore := NewDummyRepositoryStore()
-	setupRepositoriesForImageBuild(repoStore, ctx, orgId)
+	setupRepositoriesForImageBuild(t, repoStore, ctx, orgId)
 	imageBuildStore := NewDummyImageBuildStore()
 	setupImageBuildForExport(imageBuildStore, ctx, orgId)
 	imageExportStore := NewDummyImageExportStore()
@@ -819,7 +822,7 @@ func TestDownloadImageExportMissingManifestDigest(t *testing.T) {
 
 	// Set up repositories
 	repoStore := NewDummyRepositoryStore()
-	setupRepositoriesForImageBuild(repoStore, ctx, orgId)
+	setupRepositoriesForImageBuild(t, repoStore, ctx, orgId)
 	imageBuildStore := NewDummyImageBuildStore()
 	setupImageBuildForExport(imageBuildStore, ctx, orgId)
 	imageExportStore := NewDummyImageExportStore()
@@ -854,7 +857,7 @@ func TestDownloadImageExportEmptyManifestDigest(t *testing.T) {
 
 	// Set up repositories
 	repoStore := NewDummyRepositoryStore()
-	setupRepositoriesForImageBuild(repoStore, ctx, orgId)
+	setupRepositoriesForImageBuild(t, repoStore, ctx, orgId)
 	imageBuildStore := NewDummyImageBuildStore()
 	setupImageBuildForExport(imageBuildStore, ctx, orgId)
 	imageExportStore := NewDummyImageExportStore()
@@ -890,8 +893,8 @@ func TestDownloadImageExportDestinationRepositoryNotFound(t *testing.T) {
 
 	// Set up repositories - don't create destination repository
 	repoStore := NewDummyRepositoryStore()
-	sourceRepo := newOciRepository("input-registry", v1beta1.Read)
-	_, _ = repoStore.Create(ctx, orgId, sourceRepo, nil)
+	sourceRepo := newOciRepository(t, "input-registry", v1beta1.Read)
+	requireRepositoryCreate(t, repoStore, ctx, orgId, sourceRepo)
 
 	// Create ImageBuild with destination repository that doesn't exist
 	imageBuildStore := NewDummyImageBuildStore()
@@ -913,6 +916,69 @@ func TestDownloadImageExportDestinationRepositoryNotFound(t *testing.T) {
 	require.True(errors.Is(err, ErrRepositoryNotFound))
 }
 
+func TestDownloadImageExportDestinationNamespaceRejected(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	orgId := uuid.New()
+
+	repoStore := NewDummyRepositoryStore()
+	sourceRepo := newOciRepository(t, "input-registry", v1beta1.Read)
+	requireRepositoryCreate(t, repoStore, ctx, orgId, sourceRepo)
+	destRepo := newOciRepositoryCustom(t, "output-registry", v1beta1.ReadWrite, nil, lo.ToPtr("my-org"))
+	requireRepositoryCreate(t, repoStore, ctx, orgId, destRepo)
+
+	imageBuildStore := NewDummyImageBuildStore()
+	imageBuild := newValidImageBuild("test-image-build")
+	_, err := imageBuildStore.Create(ctx, orgId, &imageBuild)
+	require.NoError(err)
+
+	imageExportStore := NewDummyImageExportStore()
+	svc := NewImageExportService(imageExportStore, imageBuildStore, repoStore, nil, nil, nil, config.NewDefaultImageBuilderServiceConfig(), log.InitLogs())
+
+	imageExport := newReadyImageExport("test-export", "sha256:abc123")
+	_, err = imageExportStore.Create(ctx, orgId, &imageExport)
+	require.NoError(err)
+
+	_, err = svc.Download(ctx, orgId, "test-export")
+	require.Error(err)
+	require.ErrorIs(err, ErrInvalidImageDest)
+	require.Contains(err.Error(), "namespace")
+}
+
+func TestDownloadImageExportDestinationRepositoryMismatchRejected(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	orgId := uuid.New()
+
+	repoStore := NewDummyRepositoryStore()
+	sourceRepo := newOciRepository(t, "input-registry", v1beta1.Read)
+	requireRepositoryCreate(t, repoStore, ctx, orgId, sourceRepo)
+	destRepo := newOciRepositoryCustom(t, "output-registry", v1beta1.ReadWrite, lo.ToPtr("my-org/diffs"), nil)
+	requireRepositoryCreate(t, repoStore, ctx, orgId, destRepo)
+
+	imageBuildStore := NewDummyImageBuildStore()
+	imageBuild := newValidImageBuild("test-image-build")
+	_, err := imageBuildStore.Create(ctx, orgId, &imageBuild)
+	require.NoError(err)
+
+	imageExportStore := NewDummyImageExportStore()
+	svc := NewImageExportService(imageExportStore, imageBuildStore, repoStore, nil, nil, nil, config.NewDefaultImageBuilderServiceConfig(), log.InitLogs())
+
+	imageExport := newReadyImageExport("test-export", "sha256:abc123")
+	_, err = imageExportStore.Create(ctx, orgId, &imageExport)
+	require.NoError(err)
+
+	_, err = svc.Download(ctx, orgId, "test-export")
+	require.Error(err)
+	require.ErrorIs(err, ErrInvalidImageDest)
+	require.Contains(err.Error(), "imageName")
+}
+
+func TestImageExportRegistryOnlyDestRef(t *testing.T) {
+	require := require.New(t)
+	require.Equal("quay.io/output-image", oci.RepoDestRef("quay.io", "output-image"))
+}
+
 func TestDownloadImageExportInvalidManifestDigest(t *testing.T) {
 	require := require.New(t)
 	ctx := context.Background()
@@ -920,7 +986,7 @@ func TestDownloadImageExportInvalidManifestDigest(t *testing.T) {
 
 	// Set up repositories
 	repoStore := NewDummyRepositoryStore()
-	setupRepositoriesForImageBuild(repoStore, ctx, orgId)
+	setupRepositoriesForImageBuild(t, repoStore, ctx, orgId)
 	imageBuildStore := NewDummyImageBuildStore()
 
 	// Create the ImageBuild that will be referenced
@@ -1032,7 +1098,7 @@ func TestDownloadImageExportWithRedirect(t *testing.T) {
 	// Set up repositories pointing to test server
 	repoStore := NewDummyRepositoryStore()
 	destRepo := newOciRepositoryWithRegistry("output-registry", v1beta1.ReadWrite, registryHostname, &scheme, true)
-	_, err = repoStore.Create(ctx, orgId, destRepo, nil)
+	_, err = repoStore.Create(ctx, orgId, destRepo)
 	require.NoError(err)
 
 	// Create ImageBuild with destination
@@ -1127,7 +1193,7 @@ func TestDownloadImageExportWithBlobReader(t *testing.T) {
 	// Set up repositories pointing to test server
 	repoStore := NewDummyRepositoryStore()
 	destRepo := newOciRepositoryWithRegistry("output-registry", v1beta1.ReadWrite, registryHostname, &scheme, true)
-	_, err = repoStore.Create(ctx, orgId, destRepo, nil)
+	_, err = repoStore.Create(ctx, orgId, destRepo)
 	require.NoError(err)
 
 	// Create ImageBuild with destination
@@ -1222,7 +1288,7 @@ func TestDownloadImageExportManifestWrongLayerCount(t *testing.T) {
 	// Set up repositories pointing to test server
 	repoStore := NewDummyRepositoryStore()
 	destRepo := newOciRepositoryWithRegistry("output-registry", v1beta1.ReadWrite, registryHostname, &scheme, true)
-	_, err = repoStore.Create(ctx, orgId, destRepo, nil)
+	_, err = repoStore.Create(ctx, orgId, destRepo)
 	require.NoError(err)
 
 	// Create ImageBuild with destination
@@ -1681,4 +1747,340 @@ func TestListCompletedForBuild_StoreError(t *testing.T) {
 	require.Error(err)
 	require.Contains(err.Error(), "database unavailable")
 	require.Nil(result)
+}
+
+// newOciRepositoryWithRegistryAndAuth creates a test OCI repository with credentials.
+// The password is stored encrypted to match what the GORM encryption plugin produces on save.
+func newOciRepositoryWithRegistryAndAuth(t *testing.T, name string, accessMode v1beta1.OciRepoSpecAccessMode, registryHostname string, scheme *v1beta1.OciRepoSpecScheme, skipVerification bool, username, password string) *v1beta1.Repository {
+	t.Helper()
+	repo := newOciRepositoryWithRegistry(name, accessMode, registryHostname, scheme, skipVerification)
+	ociSpec, err := repo.Spec.AsOciRepoSpec()
+	if err != nil {
+		t.Fatalf("newOciRepositoryWithRegistryAndAuth: %v", err)
+	}
+	encryptedPassword, err := encryption.Encrypt(context.Background(), []byte(password))
+	if err != nil {
+		t.Fatalf("newOciRepositoryWithRegistryAndAuth encrypt: %v", err)
+	}
+	ociAuth := &v1beta1.OciAuth{}
+	if err := ociAuth.FromDockerAuth(v1beta1.DockerAuth{
+		AuthType: v1beta1.Docker,
+		Username: username,
+		Password: string(encryptedPassword),
+	}); err != nil {
+		t.Fatalf("newOciRepositoryWithRegistryAndAuth FromDockerAuth: %v", err)
+	}
+	ociSpec.OciAuth = ociAuth
+	if err := repo.Spec.FromOciRepoSpec(ociSpec); err != nil {
+		t.Fatalf("newOciRepositoryWithRegistryAndAuth FromOciRepoSpec: %v", err)
+	}
+	return repo
+}
+
+// TestDownloadImageExportWithBasicAuth tests that Download succeeds when the registry
+// requires HTTP Basic authentication (nginx-style, not Bearer token).
+func TestDownloadImageExportWithBasicAuth(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	orgId := uuid.New()
+
+	const username = "testuser"
+	const password = "testpassword"
+
+	manifestDigest := "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+	layerDigest := "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+	blobContent := []byte("test blob content via basic auth")
+
+	manifest := ocispec.Manifest{
+		MediaType: ocispec.MediaTypeImageManifest,
+		Config: ocispec.Descriptor{
+			MediaType: ocispec.MediaTypeImageConfig,
+			Digest:    digest.Digest("sha256:config123"),
+			Size:      100,
+		},
+		Layers: []ocispec.Descriptor{
+			{
+				MediaType: "application/vnd.oci.image.layer.v1.tar+gzip",
+				Digest:    digest.Digest(layerDigest),
+				Size:      int64(len(blobContent)),
+			},
+		},
+	}
+	manifestBytes, err := json.Marshal(manifest)
+	require.NoError(err)
+
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// All endpoints require Basic auth
+		u, p, ok := r.BasicAuth()
+		if !ok || u != username || p != password {
+			w.Header().Set("Www-Authenticate", `Basic realm="Private Registry"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		switch r.URL.Path {
+		case "/v2/":
+			w.WriteHeader(http.StatusOK)
+		case "/v2/test-image/manifests/" + manifestDigest:
+			w.Header().Set("Content-Type", ocispec.MediaTypeImageManifest)
+			w.Header().Set("Content-Length", strconv.Itoa(len(manifestBytes)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(manifestBytes)
+		case "/v2/test-image/blobs/" + layerDigest:
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Header().Set("Content-Length", strconv.Itoa(len(blobContent)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(blobContent)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ts.Close()
+
+	registryHostname := strings.TrimPrefix(ts.URL, "https://")
+	scheme := v1beta1.Https
+
+	repoStore := NewDummyRepositoryStore()
+	destRepo := newOciRepositoryWithRegistryAndAuth(t, "output-registry", v1beta1.ReadWrite, registryHostname, &scheme, true, username, password)
+	_, err = repoStore.Create(ctx, orgId, destRepo)
+	require.NoError(err)
+
+	imageBuildStore := NewDummyImageBuildStore()
+	imageBuild := newValidImageBuild("test-image-build")
+	imageBuild.Spec.Destination.Repository = "output-registry"
+	imageBuild.Spec.Destination.ImageName = "test-image"
+	imageBuild.Spec.Destination.ImageTag = "v1.0"
+	_, err = imageBuildStore.Create(ctx, orgId, &imageBuild)
+	require.NoError(err)
+
+	imageExportStore := NewDummyImageExportStore()
+	svc := NewImageExportService(imageExportStore, imageBuildStore, repoStore, nil, nil, nil, config.NewDefaultImageBuilderServiceConfig(), log.InitLogs())
+
+	imageExport := newReadyImageExport("test-export", manifestDigest)
+	_, err = imageExportStore.Create(ctx, orgId, &imageExport)
+	require.NoError(err)
+
+	result, err := svc.Download(ctx, orgId, "test-export")
+	require.NoError(err)
+	require.NotNil(result)
+	require.Equal(http.StatusOK, result.StatusCode)
+
+	defer result.BlobReader.Close()
+	readContent, err := io.ReadAll(result.BlobReader)
+	require.NoError(err)
+	require.Equal(blobContent, readContent)
+}
+
+// TestDownloadImageExportWithBasicAuthWrongCredentials tests that Download fails
+// at the blob fetch when wrong Basic credentials are supplied.
+// The manifest endpoint is open so that fetchAndParseManifest succeeds;
+// only the blob endpoint enforces authentication; auth.Client handles the
+// Basic challenge-response and the wrong credentials cause blob fetch to fail.
+func TestDownloadImageExportWithBasicAuthWrongCredentials(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	orgId := uuid.New()
+
+	const correctUser = "correctuser"
+	const correctPass = "correctpass"
+
+	manifestDigest := "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+	layerDigest := "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+
+	manifest := ocispec.Manifest{
+		MediaType: ocispec.MediaTypeImageManifest,
+		Config: ocispec.Descriptor{
+			MediaType: ocispec.MediaTypeImageConfig,
+			Digest:    digest.Digest("sha256:config123"),
+			Size:      100,
+		},
+		Layers: []ocispec.Descriptor{
+			{
+				MediaType: "application/vnd.oci.image.layer.v1.tar+gzip",
+				Digest:    digest.Digest(layerDigest),
+				Size:      32,
+			},
+		},
+	}
+	manifestBytes, err := json.Marshal(manifest)
+	require.NoError(err)
+
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/":
+			// Probe endpoint: always challenge so the probe returns "Basic".
+			w.Header().Set("Www-Authenticate", `Basic realm="Private Registry"`)
+			w.WriteHeader(http.StatusUnauthorized)
+		case "/v2/test-image/manifests/" + manifestDigest:
+			// Manifest is publicly readable so fetchAndParseManifest succeeds.
+			w.Header().Set("Content-Type", ocispec.MediaTypeImageManifest)
+			w.Header().Set("Content-Length", strconv.Itoa(len(manifestBytes)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(manifestBytes)
+		case "/v2/test-image/blobs/" + layerDigest:
+			// Blob requires correct credentials; wrong credentials are rejected.
+			u, p, ok := r.BasicAuth()
+			if !ok || u != correctUser || p != correctPass {
+				w.Header().Set("Www-Authenticate", `Basic realm="Private Registry"`)
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ts.Close()
+
+	registryHostname := strings.TrimPrefix(ts.URL, "https://")
+	scheme := v1beta1.Https
+
+	repoStore := NewDummyRepositoryStore()
+	destRepo := newOciRepositoryWithRegistryAndAuth(t, "output-registry", v1beta1.ReadWrite, registryHostname, &scheme, true, "wronguser", "wrongpass")
+	_, cerr := repoStore.Create(ctx, orgId, destRepo)
+	require.NoError(cerr)
+
+	imageBuildStore := NewDummyImageBuildStore()
+	imageBuild := newValidImageBuild("test-image-build")
+	imageBuild.Spec.Destination.Repository = "output-registry"
+	imageBuild.Spec.Destination.ImageName = "test-image"
+	imageBuild.Spec.Destination.ImageTag = "v1.0"
+	_, cerr = imageBuildStore.Create(ctx, orgId, &imageBuild)
+	require.NoError(cerr)
+
+	imageExportStore := NewDummyImageExportStore()
+	svc := NewImageExportService(imageExportStore, imageBuildStore, repoStore, nil, nil, nil, config.NewDefaultImageBuilderServiceConfig(), log.InitLogs())
+
+	imageExport := newReadyImageExport("test-export", manifestDigest)
+	_, cerr = imageExportStore.Create(ctx, orgId, &imageExport)
+	require.NoError(cerr)
+
+	_, dlErr := svc.Download(ctx, orgId, "test-export")
+	require.Error(dlErr)
+	require.ErrorIs(dlErr, ErrExternalServiceUnavailable)
+}
+
+// TestDownloadImageExportWithBearerAuth tests that Download succeeds end-to-end
+// when the registry uses Bearer token authentication. The mock server:
+//  1. Returns a Bearer challenge on /v2/ (handled internally by auth.Client).
+//  2. Issues a token from the realm endpoint when presented with valid credentials.
+//  3. Requires the Bearer token on manifest and blob requests.
+func TestDownloadImageExportWithBearerAuth(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+	orgId := uuid.New()
+
+	const username = "testuser"
+	const password = "testpassword"
+	const issuedToken = "test-bearer-token-abc123"
+
+	manifestDigest := "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+	layerDigest := "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+	blobContent := []byte("test blob content via bearer auth")
+
+	manifest := ocispec.Manifest{
+		MediaType: ocispec.MediaTypeImageManifest,
+		Config: ocispec.Descriptor{
+			MediaType: ocispec.MediaTypeImageConfig,
+			Digest:    digest.Digest("sha256:config123"),
+			Size:      100,
+		},
+		Layers: []ocispec.Descriptor{
+			{
+				MediaType: "application/vnd.oci.image.layer.v1.tar+gzip",
+				Digest:    digest.Digest(layerDigest),
+				Size:      int64(len(blobContent)),
+			},
+		},
+	}
+	manifestBytes, err := json.Marshal(manifest)
+	require.NoError(err)
+
+	// ts.URL is not known until the server starts, so we capture it via a closure variable.
+	var tsURL string
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/":
+			// Probe endpoint: always returns Bearer challenge; auth.Client handles the negotiation.
+			realm := tsURL + "/token"
+			w.Header().Set("Www-Authenticate", `Bearer realm="`+realm+`",service="registry.example.com",scope="repository:test-image:pull"`)
+			w.WriteHeader(http.StatusUnauthorized)
+
+		case "/token":
+			// Token endpoint: assert scope=repository:test-image:pull so the test
+			// verifies that AppendRepositoryScope propagates the pull scope into the
+			// token request, then validate credentials and issue a token.
+			if scope := r.URL.Query().Get("scope"); scope != "repository:test-image:pull" {
+				http.Error(w, "missing or wrong scope: "+scope, http.StatusBadRequest)
+				return
+			}
+			u, p, ok := r.BasicAuth()
+			if !ok || u != username || p != password {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"token":"` + issuedToken + `"}`))
+
+		case "/v2/test-image/manifests/" + manifestDigest:
+			// Manifest is publicly readable so fetchAndParseManifest (oras) succeeds;
+			// blob GET uses auth.Client which attaches the cached Bearer token.
+			w.Header().Set("Content-Type", ocispec.MediaTypeImageManifest)
+			w.Header().Set("Content-Length", strconv.Itoa(len(manifestBytes)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(manifestBytes)
+
+		case "/v2/test-image/blobs/" + layerDigest:
+			// Blob requires a valid Bearer token; return a proper challenge on 401
+			// so auth.Client can fetch/retry with the token.
+			if r.Header.Get("Authorization") != "Bearer "+issuedToken {
+				realm := tsURL + "/token"
+				w.Header().Set("Www-Authenticate", `Bearer realm="`+realm+`",service="registry.example.com",scope="repository:test-image:pull"`)
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Header().Set("Content-Length", strconv.Itoa(len(blobContent)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(blobContent)
+
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ts.Close()
+	tsURL = ts.URL
+
+	registryHostname := strings.TrimPrefix(ts.URL, "https://")
+	scheme := v1beta1.Https
+
+	repoStore := NewDummyRepositoryStore()
+	destRepo := newOciRepositoryWithRegistryAndAuth(t, "output-registry", v1beta1.ReadWrite, registryHostname, &scheme, true, username, password)
+	_, err = repoStore.Create(ctx, orgId, destRepo)
+	require.NoError(err)
+
+	imageBuildStore := NewDummyImageBuildStore()
+	imageBuild := newValidImageBuild("test-image-build")
+	imageBuild.Spec.Destination.Repository = "output-registry"
+	imageBuild.Spec.Destination.ImageName = "test-image"
+	imageBuild.Spec.Destination.ImageTag = "v1.0"
+	_, err = imageBuildStore.Create(ctx, orgId, &imageBuild)
+	require.NoError(err)
+
+	imageExportStore := NewDummyImageExportStore()
+	svc := NewImageExportService(imageExportStore, imageBuildStore, repoStore, nil, nil, nil, config.NewDefaultImageBuilderServiceConfig(), log.InitLogs())
+
+	imageExport := newReadyImageExport("test-export", manifestDigest)
+	_, err = imageExportStore.Create(ctx, orgId, &imageExport)
+	require.NoError(err)
+
+	result, err := svc.Download(ctx, orgId, "test-export")
+	require.NoError(err)
+	require.NotNil(result)
+	require.Equal(http.StatusOK, result.StatusCode)
+
+	defer result.BlobReader.Close()
+	readContent, err := io.ReadAll(result.BlobReader)
+	require.NoError(err)
+	require.Equal(blobContent, readContent)
 }

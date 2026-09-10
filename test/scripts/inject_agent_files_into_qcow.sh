@@ -27,6 +27,7 @@ REGISTRY_ADDRESS="${REGISTRY_ADDRESS:-}"
 REGISTRY_HOSTNAME="${REGISTRY_HOSTNAME:-e2e-registry}"
 E2E_CA="${E2E_CA:-bin/e2e-certs/pki/CA/ca.crt}"
 SOURCE_REPO="quay.io/flightctl"
+MIRROR_REGISTRY="${MIRROR_REGISTRY:-}"
 
 log()   { echo "[info] $*"; }
 dbg()   { echo "[debug] $*"; }
@@ -81,6 +82,19 @@ if [[ "$SOURCE_REPO" != */* ]]; then
   fail "SOURCE_REPO must include registry and namespace (e.g. quay.io/flightctl)"
 fi
 SOURCE_REPO_PATH="${SOURCE_REPO#*/}"
+# quay.io/flightctl-tests holds fixture images referenced directly by e2e specs
+# (not built locally, so they don't go through SOURCE_REPO's bundle upload). Remap
+# it the same way so devices pull from the local mirror (see
+# MirrorExternalTestImages) instead of the real quay.io on every fresh VM.
+TESTS_SOURCE_REPO="quay.io/flightctl-tests"
+TESTS_SOURCE_REPO_PATH="${TESTS_SOURCE_REPO#*/}"
+
+# Auto-detect mirror registry from OCP ImageTagMirrorSet if not explicitly set
+if [[ -z "$MIRROR_REGISTRY" ]] && command -v oc &>/dev/null; then
+  MIRROR_REGISTRY=$(oc get imagetagmirrorset -o \
+    jsonpath='{range .items[*].spec.imageTagMirrors[*]}{.source}{" "}{.mirrors[0]}{"\n"}{end}' 2>/dev/null \
+    | awk '$1 == "quay.io" || index($1, "quay.io/") == 1 {print $2; exit}') || true
+fi
 
 log "QCOW=$QCOW"
 log "AGENT_DIR=$AGENT_DIR"
@@ -91,6 +105,7 @@ log "REG_TLS_HOSTPORT=$REG_TLS_HOSTPORT"
 log "IPV6_ONLY=${IPV6_ONLY:-false}"
 log "E2E_CA=$E2E_CA"
 log "SOURCE_REPO=$SOURCE_REPO"
+log "MIRROR_REGISTRY=${MIRROR_REGISTRY:-<not set>}"
 
 sudo modprobe nbd max_part=16 || true
 
@@ -242,8 +257,10 @@ write_registry_remap() {
   # Private registry is on port 5002 (same host, different port)
   local private_host="${REG_TLS_HOSTPORT%:*}"
   local private_dest="${private_host}:5002/${SOURCE_REPO_PATH}"
+  local tests_dest="${REG_TLS_HOSTPORT}/${TESTS_SOURCE_REPO_PATH}"
   log "Configuring registry remap $remap_file ($SOURCE_REPO -> $dest)"
   log "Configuring registry remap $remap_file (${SOURCE_REPO}-private -> $private_dest)"
+  log "Configuring registry remap $remap_file ($TESTS_SOURCE_REPO -> $tests_dest)"
   sudo install -d "$config_dir"
   sudo tee "$remap_file" >/dev/null <<EOF
 [[registry]]
@@ -253,8 +270,63 @@ location = "${dest}"
 [[registry]]
 prefix = "${SOURCE_REPO}-private"
 location = "${private_dest}"
+
+[[registry]]
+prefix = "${TESTS_SOURCE_REPO}"
+location = "${tests_dest}"
 EOF
   sudo chown root:root "$remap_file"
+}
+
+write_mirror_registry() {
+  local base="$1"
+  if [[ -z "${MIRROR_REGISTRY:-}" ]]; then
+    log "No mirror registry configured - skipping"
+    return
+  fi
+  local config_dir="$base/containers/registries.conf.d"
+  local mirror_file="$config_dir/100-mirror-registry.conf"
+  log "Configuring mirror registry remap: quay.io -> $MIRROR_REGISTRY"
+  sudo install -d "$config_dir"
+  sudo tee "$mirror_file" >/dev/null <<EOF
+[[registry]]
+prefix = "quay.io:443"
+location = "${MIRROR_REGISTRY}"
+insecure = true
+
+[[registry]]
+prefix = "quay.io"
+location = "${MIRROR_REGISTRY}"
+insecure = true
+
+[[registry]]
+prefix = "registry.redhat.io"
+location = "${MIRROR_REGISTRY}"
+insecure = true
+
+[[registry]]
+prefix = "registry.access.redhat.com"
+location = "${MIRROR_REGISTRY}"
+insecure = true
+EOF
+  sudo chown root:root "$mirror_file"
+
+  local policy_file="$base/containers/policy.json"
+  log "Writing permissive policy.json for mirror registry"
+  sudo tee "$policy_file" >/dev/null <<EOF
+{
+  "default": [{"type": "insecureAcceptAnything"}],
+  "transports": {
+    "docker": {
+      "${MIRROR_REGISTRY}": [{"type": "insecureAcceptAnything"}]
+    },
+    "docker-daemon": {
+      "": [{"type": "insecureAcceptAnything"}]
+    }
+  }
+}
+EOF
+  sudo chown root:root "$policy_file"
 }
 
 # Inject /etc/hosts entry so VM can resolve the host's hostname
@@ -303,6 +375,16 @@ EOF
     fi
   fi
 
+  # For quadlet environment, add flightctl-vm.local entry
+  if [[ -n "${QUADLET_HOST:-}" ]] && [[ "$QUADLET_HOST" != "localhost" ]]; then
+    if ! sudo grep -qF -- "flightctl-vm.local" "$hosts_file" 2>/dev/null; then
+      log "Adding FlightCtl VM hosts entry: $QUADLET_HOST -> flightctl-vm.local"
+      echo "$QUADLET_HOST flightctl-vm.local" | sudo tee -a "$hosts_file" >/dev/null
+    else
+      log "FlightCtl VM hosts entry already exists"
+    fi
+  fi
+
   # Add registry hostname entry for IPv6 mode
   if [[ "${IPV6_ONLY:-false}" == "true" ]]; then
     if ! sudo grep -qF -- "$REGISTRY_HOSTNAME" "$hosts_file" 2>/dev/null; then
@@ -321,6 +403,7 @@ EOF
 copy_into "$DEPLOY_ETC"
 inject_registry_ca "$DEPLOY_ETC"
 write_registry_remap "$DEPLOY_ETC"
+write_mirror_registry "$DEPLOY_ETC"
 inject_hosts_entry "$DEPLOY_ETC"
 
 # Also mirror to on-disk etc so it shows under guest /sysroot/etc
@@ -328,6 +411,7 @@ if [[ "$SYSROOT_ETC" != "$DEPLOY_ETC" ]]; then
   copy_into "$SYSROOT_ETC"
   inject_registry_ca "$SYSROOT_ETC"
   write_registry_remap "$SYSROOT_ETC"
+  write_mirror_registry "$SYSROOT_ETC"
   inject_hosts_entry "$SYSROOT_ETC"
 fi
 

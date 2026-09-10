@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bufio"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +12,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/sirupsen/logrus"
 )
@@ -18,10 +21,133 @@ import (
 const (
 	agentBundlePattern = "agent-images-bundle-*.tar"
 	appBundleName      = "app-images-bundle.tar"
+
+	// uploadConcurrency bounds how many images are copied out of a bundle at once.
+	// This is I/O-bound work (reading tar offsets, pushing to a local registry), so
+	// running several in parallel overlaps their I/O wait without oversubscribing the
+	// runner's CPU.
+	uploadConcurrency = 4
+
+	// perCopyTimeout bounds a single "skopeo copy" invocation. Without it, a hung
+	// copy would pin an uploadConcurrency semaphore slot indefinitely and block aux
+	// startup forever; the largest observed single-image copy in CI is well under
+	// this budget.
+	perCopyTimeout = 5 * time.Minute
+
+	// externalCopyRetries bounds retries for copyExternalImage only: unlike the
+	// bundle copies (copyImageFromBundle), it pulls from the real quay.io over the
+	// internet, so it's exposed to transient upstream blips (seen in CI: a one-off
+	// EOF reading a config blob from quay's CDN). A single such blip previously
+	// failed the whole aux-service startup (see MirrorExternalTestImages), taking
+	// down every e2e shard sharing it.
+	externalCopyRetries   = 3
+	externalCopyRetryWait = 5 * time.Second
+
+	// bundleCopyRetries bounds retries for copying images out of the local app/agent
+	// bundles into the local registry. CI has seen one-off local-registry 500s while
+	// checking or writing blobs; retrying keeps those transient startup blips from
+	// failing an entire shard before any spec code runs.
+	bundleCopyRetries   = 3
+	bundleCopyRetryWait = 5 * time.Second
 )
 
+// externalTestImages are quay.io/flightctl-tests fixture images that e2e specs
+// reference directly (not built locally, so they never appear in an app/agent
+// bundle - see UploadImages). Without mirroring, every fresh VM pulls each of these
+// straight from the real quay.io the first time a spec needs it, which is slow and
+// adds a hard external dependency to the test run. Mirroring them into the local
+// registry once here lets the device-side registry remap
+// (quay.io/flightctl-tests -> local registry, see inject_agent_files_into_qcow.sh)
+// serve them locally instead. Keep this list in sync with the literal
+// "quay.io/flightctl-tests/..." refs used under test/. Deliberately excludes
+// quay.io/flightctl-tests/does-not-exist:never, which tests rely on staying absent.
+var externalTestImages = []string{
+	"quay.io/flightctl-tests/alpine:v1",
+	"quay.io/flightctl-tests/nginx:v1",
+	"quay.io/flightctl-tests/nginx:1.28-alpine-slim",
+	"quay.io/flightctl-tests/nginx-config-artifact:latest",
+	"quay.io/flightctl-tests/nginx-html-artifact-image:latest",
+	"quay.io/flightctl-tests/quadlet-app-artifact:latest",
+	"quay.io/flightctl-tests/quadlet-app-artifact:with-image-ref",
+	"quay.io/flightctl-tests/quadlet-test/quadlet-app-artifact:with-image-ref",
+	"quay.io/flightctl-tests/model-artifact:latest",
+	"quay.io/flightctl-tests/busybox-dummy-artifact:latest",
+}
+
+// MirrorExternalTestImages copies each image in externalTestImages from the real
+// quay.io straight into the local registry, in parallel across images. Only called
+// when the registry container was just created (see StartServices) - a reused
+// registry already has these from a previous run.
+func (s *Services) MirrorExternalTestImages(ctx context.Context) error {
+	logrus.Infof("Mirroring %d external test image(s) into registry %s", len(externalTestImages), s.Registry.URL)
+
+	sem := make(chan struct{}, uploadConcurrency)
+	errCh := make(chan error, len(externalTestImages))
+	var wg sync.WaitGroup
+	for _, ref := range externalTestImages {
+		wg.Add(1)
+		go func(ref string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			errCh <- s.copyExternalImage(ctx, ref)
+		}(ref)
+	}
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		if err != nil {
+			return err
+		}
+	}
+	logrus.Info("External test image mirroring completed")
+	return nil
+}
+
+// copyExternalImage copies a single image reference directly from quay.io to the
+// registry, retrying on transient failures since it depends on the real, external
+// quay.io rather than resources local to the CI run. Bounded by perCopyTimeout per
+// attempt so a hung skopeo process can't block the uploadConcurrency semaphore
+// indefinitely.
+func (s *Services) copyExternalImage(ctx context.Context, ref string) error {
+	path := ref
+	if idx := strings.Index(ref, "/"); idx != -1 {
+		path = ref[idx+1:]
+	}
+	src := fmt.Sprintf("docker://%s", ref)
+	dst := fmt.Sprintf("docker://%s/%s", s.Registry.URL, path)
+
+	var lastErr error
+	for attempt := 1; attempt <= externalCopyRetries; attempt++ {
+		copyCtx, cancel := context.WithTimeout(ctx, perCopyTimeout)
+		copyCmd := exec.CommandContext(copyCtx, "skopeo", "copy", "--dest-tls-verify=false", src, dst)
+		output, err := copyCmd.CombinedOutput()
+		timedOut := copyCtx.Err() != nil
+		cancel()
+
+		if timedOut {
+			lastErr = fmt.Errorf("skopeo copy for %s did not complete within %s: %w", ref, perCopyTimeout, copyCtx.Err())
+		} else if err != nil {
+			lastErr = fmt.Errorf("skopeo copy failed for %s: %w, output: %s", ref, err, string(output))
+		} else {
+			return nil
+		}
+
+		if attempt < externalCopyRetries {
+			logrus.Warnf("Retrying external image mirror for %s (attempt %d/%d): %v", ref, attempt, externalCopyRetries, lastErr)
+			select {
+			case <-ctx.Done():
+				return lastErr
+			case <-time.After(externalCopyRetryWait):
+			}
+		}
+	}
+	return lastErr
+}
+
 // UploadImages uploads all image bundles to the registry.
-func (s *Services) UploadImages() error {
+func (s *Services) UploadImages(ctx context.Context) error {
 	projectRoot, err := getProjectRoot()
 	if err != nil {
 		return fmt.Errorf("failed to get project root: %w", err)
@@ -37,7 +163,7 @@ func (s *Services) UploadImages() error {
 		len(bundles), s.Registry.URL)
 	for _, bundle := range bundles {
 		logrus.Infof("Uploading bundle: %s", filepath.Base(bundle))
-		if err := s.uploadBundle(bundle); err != nil {
+		if err := s.uploadBundle(ctx, bundle); err != nil {
 			return fmt.Errorf("failed to upload bundle %s: %w", bundle, err)
 		}
 	}
@@ -57,29 +183,18 @@ func (s *Services) findImageBundles(projectRoot string) []string {
 	return bundles
 }
 
-func getImageDigest(imageRef string, tlsVerify bool) string {
-	tlsArg := fmt.Sprintf("--tls-verify=%v", tlsVerify)
-	cmd := exec.Command("skopeo", "inspect", tlsArg, "--format", "{{.Digest}}", imageRef)
-	output, err := cmd.Output()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(output))
-}
-
-func (s *Services) imageNeedsPush(localRef, registryRef string) bool {
-	localDigest := getImageDigest("containers-storage:"+localRef, false)
-	if localDigest == "" {
-		return true
-	}
-	registryDigest := getImageDigest("docker://"+registryRef, false)
-	if registryDigest == "" {
-		return true
-	}
-	return localDigest != registryDigest
-}
-
-func (s *Services) uploadBundle(bundlePath string) error {
+// uploadBundle copies every image in the bundle straight from the archive to the
+// registry via "skopeo copy docker-archive:...", in parallel across images. This is
+// only called when the registry container was just created (see StartServices), so
+// the registry is always empty here - there's no digest check to skip redundant
+// pushes because every image needs pushing.
+//
+// This intentionally skips "podman load": loading a bundle of bootc images means
+// extracting a full OS root filesystem (many small files) into local containers
+// storage just to immediately read it back out for push. skopeo streams the already
+// packaged layer blobs directly from the tar to the registry without ever touching
+// local storage.
+func (s *Services) uploadBundle(ctx context.Context, bundlePath string) error {
 	refs, err := extractImageRefs(bundlePath)
 	if err != nil {
 		return err
@@ -87,36 +202,68 @@ func (s *Services) uploadBundle(bundlePath string) error {
 	if len(refs) == 0 {
 		return nil
 	}
-	loadCmd := exec.Command("podman", "load", "-i", bundlePath)
-	if output, err := loadCmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("podman load -i %s failed: %w, output: %s", bundlePath, err, string(output))
-	}
-	var needsPush []string
+
+	sem := make(chan struct{}, uploadConcurrency)
+	errCh := make(chan error, len(refs))
+	var wg sync.WaitGroup
 	for _, ref := range refs {
-		path := ref
-		if idx := strings.Index(ref, "/"); idx != -1 {
-			path = ref[idx+1:]
-		}
-		registryRef := fmt.Sprintf("%s/%s", s.Registry.URL, path)
-		if s.imageNeedsPush(ref, registryRef) {
-			needsPush = append(needsPush, ref)
-		}
+		wg.Add(1)
+		go func(ref string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			errCh <- s.copyImageFromBundle(ctx, bundlePath, ref)
+		}(ref)
 	}
-	if len(needsPush) == 0 {
-		return nil
-	}
-	for _, ref := range needsPush {
-		path := ref
-		if idx := strings.Index(ref, "/"); idx != -1 {
-			path = ref[idx+1:]
-		}
-		dst := fmt.Sprintf("%s/%s", s.Registry.URL, path)
-		pushCmd := exec.Command("podman", "push", "--tls-verify=false", ref, dst)
-		if output, err := pushCmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("podman push failed for %s: %w, output: %s", ref, err, string(output))
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		if err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// copyImageFromBundle copies a single image reference out of a multi-image
+// docker-archive bundle directly to the registry. It retries transient local
+// registry failures and keeps each skopeo invocation bounded by perCopyTimeout
+// so a hung copy can't block the uploadConcurrency semaphore indefinitely.
+func (s *Services) copyImageFromBundle(ctx context.Context, bundlePath, ref string) error {
+	path := ref
+	if idx := strings.Index(ref, "/"); idx != -1 {
+		path = ref[idx+1:]
+	}
+	src := fmt.Sprintf("docker-archive:%s:%s", bundlePath, ref)
+	dst := fmt.Sprintf("docker://%s/%s", s.Registry.URL, path)
+
+	var lastErr error
+	for attempt := 1; attempt <= bundleCopyRetries; attempt++ {
+		copyCtx, cancel := context.WithTimeout(ctx, perCopyTimeout)
+		copyCmd := exec.CommandContext(copyCtx, "skopeo", "copy", "--dest-tls-verify=false", src, dst)
+		output, err := copyCmd.CombinedOutput()
+		timedOut := copyCtx.Err() != nil
+		cancel()
+
+		if timedOut {
+			lastErr = fmt.Errorf("skopeo copy for %s did not complete within %s: %w", ref, perCopyTimeout, copyCtx.Err())
+		} else if err != nil {
+			lastErr = fmt.Errorf("skopeo copy failed for %s: %w, output: %s", ref, err, string(output))
+		} else {
+			return nil
+		}
+
+		if attempt < bundleCopyRetries {
+			logrus.Warnf("Retrying bundle image upload for %s (attempt %d/%d): %v", ref, attempt, bundleCopyRetries, lastErr)
+			select {
+			case <-ctx.Done():
+				return lastErr
+			case <-time.After(bundleCopyRetryWait):
+			}
+		}
+	}
+	return lastErr
 }
 
 func extractImageRefs(bundlePath string) ([]string, error) {

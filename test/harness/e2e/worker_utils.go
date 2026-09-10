@@ -6,6 +6,7 @@ import (
 	"os"
 	"sync"
 
+	"github.com/flightctl/flightctl/test/e2e/infra/auxiliary"
 	"github.com/onsi/ginkgo/v2"
 	"github.com/sirupsen/logrus"
 )
@@ -16,6 +17,10 @@ const E2ESetupAbortExitCode = 2
 
 // E2ESetupAbortStderrMarker is written to stderr on setup abort so CI can detect it from logs.
 const E2ESetupAbortStderrMarker = "FLIGHTCTL_E2E_SETUP_ABORT=1"
+
+// NeedVMLabel marks specs that require a live VM/agent during suites that
+// otherwise use a no-VM harness by default.
+const NeedVMLabel = "needvm"
 
 var (
 	// Per-worker storage
@@ -90,6 +95,71 @@ func SetupWorkerHarnessWithoutVM() (*Harness, context.Context, error) {
 
 	logrus.Infof("✅ [SetupWorkerHarnessWithoutVM] Worker %d: Harness setup completed (no VM)", workerID)
 	return harness, suiteCtx, nil
+}
+
+// AuxServicesFuture represents an in-flight auxiliary.Get call. Aux service setup
+// (registry, image bundle upload, git server, prometheus) and VM/harness setup are
+// independent of each other (aux uses podman networking, VM setup uses libvirt), so
+// starting aux in the background and waiting on it after VM setup overlaps the two
+// instead of paying both latencies sequentially. On the first package to run in a
+// shard, aux setup is dominated by the agent image bundle upload (~100s).
+type AuxServicesFuture struct {
+	result chan *auxiliary.Services
+}
+
+// StartAuxServicesAsync starts auxiliary.Get(ctx) in the background and returns
+// immediately. Call Wait on the returned future once aux services are needed
+// (typically right after VM/harness setup in BeforeSuite).
+func StartAuxServicesAsync(ctx context.Context) *AuxServicesFuture {
+	future := &AuxServicesFuture{result: make(chan *auxiliary.Services, 1)}
+	go func() {
+		future.result <- auxiliary.Get(ctx)
+	}()
+	return future
+}
+
+// StartAuxServicesAsyncWith starts only the requested auxiliary services in the
+// background and returns immediately. Unlike StartAuxServicesAsync (which starts
+// the full default set via auxiliary.Get), this lets a suite opt out of services
+// it does not use — e.g. the onboarding suite needs only the registry and not the
+// git server, whose image is built from a local Dockerfile context and can fail to
+// unpack under restrictive rootless subuid ranges. Fails the process on error,
+// matching auxiliary.Get's behavior.
+func StartAuxServicesAsyncWith(ctx context.Context, services ...auxiliary.Service) *AuxServicesFuture {
+	future := &AuxServicesFuture{result: make(chan *auxiliary.Services, 1)}
+	go func() {
+		auxiliary.ConfigureDockerHost()
+		svcs, err := auxiliary.StartServices(ctx, services)
+		if err != nil {
+			logrus.Fatalf("failed to start aux services: %v", err)
+		}
+		future.result <- svcs
+	}()
+	return future
+}
+
+// Wait blocks until aux service setup completes and returns the services.
+func (f *AuxServicesFuture) Wait() *auxiliary.Services {
+	return <-f.result
+}
+
+// CurrentSpecNeedsVM reports whether the currently running Ginkgo spec is
+// labeled as requiring VM setup.
+func CurrentSpecNeedsVM() bool {
+	for _, label := range ginkgo.CurrentSpecReport().Labels() {
+		if label == NeedVMLabel {
+			return true
+		}
+	}
+	return false
+}
+
+// StoreWorkerHarness stores a harness and context for the given worker ID.
+// Use this when setting up a harness outside of SetupWorkerHarness (e.g., with
+// a fresh VM) so that GetWorkerHarness/GetWorkerContext can retrieve them.
+func StoreWorkerHarness(workerID int, harness *Harness, ctx context.Context) {
+	workerHarnesses.Store(workerID, harness)
+	workerContexts.Store(workerID, ctx)
 }
 
 // GetWorkerHarness retrieves the harness for the current worker.

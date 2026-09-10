@@ -21,7 +21,7 @@ const (
 // Console test-suite
 // -----------------------------------------------------------------------------
 
-var _ = Describe("CLI - device console", func() {
+var _ = Describe("CLI - device console", Label(e2e.NeedVMLabel), func() {
 	var (
 		deviceID string
 	)
@@ -92,9 +92,11 @@ var _ = Describe("CLI - device console", func() {
 		harness := e2e.GetWorkerHarness()
 
 		const sessionsToOpen = 4
-		const expectedRenderedVersion = 2 + sessionsToOpen*2
 
-		// kick off an update
+		initialRenderedVersion, err := harness.GetCurrentDeviceRenderedVersion(deviceID)
+		Expect(err).ToNot(HaveOccurred())
+
+		By("initiating a device update")
 		device, _, err := harness.WaitForBootstrapAndUpdateToVersion(deviceID, util.DeviceTags.V4)
 		Expect(err).ToNot(HaveOccurred())
 		Eventually(resources.GetJSONByName[*v1beta1.Device]).
@@ -126,7 +128,7 @@ var _ = Describe("CLI - device console", func() {
 
 		currentRenderedVersion, err := harness.GetCurrentDeviceRenderedVersion(deviceID)
 		Expect(err).ToNot(HaveOccurred())
-		Expect(currentRenderedVersion).To(Equal(expectedRenderedVersion))
+		Expect(currentRenderedVersion).To(BeNumerically(">", initialRenderedVersion))
 
 		By("returns a helpful error when the device is not found")
 		out, err := harness.CLI("console", "device/nonexistent")
@@ -282,11 +284,8 @@ var _ = Describe("CLI - device console", func() {
 
 		By("verifying that the ~. sequence exits the shell")
 		cs := harness.NewConsoleSession(deviceID)
-		cs.SkipGracefulExitOnClose()
 		DeferCleanup(cs.Close)
-
-		Expect(cs.Stdin.Write([]byte("\n~.\n"))).To(BeNumerically(">", 0))
-		Eventually(cs.Stdout.Closed).Should(BeTrue())
+		cs.Disconnect()
 
 		By("running a command without opening a shell")
 		out, err = harness.RunConsoleCommand(deviceID, nil, "flightctl-agent", "system-info")

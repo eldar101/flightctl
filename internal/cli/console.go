@@ -15,7 +15,6 @@ import (
 
 	api "github.com/flightctl/flightctl/api/core/v1beta1"
 	"github.com/flightctl/flightctl/internal/client"
-	"github.com/flightctl/flightctl/internal/util"
 	"github.com/samber/lo"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -134,6 +133,7 @@ func (o *ConsoleOptions) Validate(args []string) error {
 	if o.tty && o.noTTY {
 		return fmt.Errorf("--tty and --notty are mutually exclusive")
 	}
+
 	return nil
 }
 
@@ -151,10 +151,9 @@ func (o *ConsoleOptions) Run(ctx context.Context, flagArgs, passThroughArgs []st
 	refresher := client.NewAccessTokenRefresher(config, o.ConfigFilePath, 8080)
 	refresher.Start(ctx)
 	accessToken := refresher.GetAccessToken()
-	o.analyzeResponseAndExit(ctx, name, o.connectViaWS(ctx, config, name, accessToken, passThroughArgs))
 
-	// unreachable
-	return nil
+	analyzeResponseAndExit(ctx, &o.GlobalOptions, name, o.connectViaWS(ctx, config, name, accessToken, passThroughArgs))
+	return nil // unreachable
 }
 
 // NewWebSocketExecClient creates a WebSocketExecutor
@@ -246,7 +245,7 @@ type rawReader struct {
 func newRawReader(cancel context.CancelFunc, termState **term.State) *rawReader {
 	return &rawReader{
 		cancel:    cancel,
-		state:     normal,
+		state:     newline, // treat start-of-session as "after newline" so ~. works immediately
 		termState: termState,
 	}
 }
@@ -271,31 +270,86 @@ func (e *rawReader) Read(p []byte) (int, error) {
 		return 0, io.EOF
 	}
 
+	// When in tilde state, we have a buffered ~ that was NOT yet forwarded to
+	// the remote. Read the next character to resolve the escape sequence.
+	if e.state == tilde {
+		if len(p) < 2 {
+			// No room to prepend ~; flush it and reset state.
+			e.state = normal
+			p[0] = '~'
+			return 1, nil
+		}
+		n, err := os.Stdin.Read(p[1:])
+		if n == 0 {
+			return 0, err
+		}
+		switch p[1] {
+		case '.':
+			// Escape sequence complete: disconnect without sending anything.
+			e.state = disconnected
+			e.cancel()
+			return 0, nil
+		case '~':
+			// Double tilde: send one ~ to the remote and stay in tilde state
+			// so the second ~ can itself be escaped or trigger another sequence.
+			p[0] = '~'
+			return 1, err
+		default:
+			// Not an escape: send the buffered ~ followed by the new character.
+			e.state = normal
+			p[0] = '~'
+			return 1 + n, err
+		}
+	}
+
 	n, err := os.Stdin.Read(p)
+	out := 0
 	for i := 0; i < n; i++ {
-		switch p[i] {
+		b := p[i]
+		switch b {
 		case '\n', '\r':
 			e.state = newline
 		case '~':
 			if e.state == newline {
+				if i+1 < n {
+					// Next byte is already in the buffer — resolve the escape
+					// immediately rather than deferring to the next Read call,
+					// which would re-read stdin and drop the already-buffered byte.
+					i++
+					switch p[i] {
+					case '.':
+						e.state = disconnected
+						e.cancel()
+						return out, nil
+					case '~':
+						// ~~ sends one literal ~; state stays tilde so
+						// chained escapes can still trigger on the same line.
+						p[out] = '~'
+						out++
+						continue
+					default:
+						// Not an escape: forward ~ then the current byte.
+						e.state = normal
+						p[out] = '~'
+						out++
+						p[out] = p[i]
+						out++
+						continue
+					}
+				}
+				// Next byte not yet available — defer to the next Read.
 				e.state = tilde
-				continue
-			}
-			e.state = normal
-		case '.':
-			if e.state == tilde {
-				e.state = disconnected
-				e.cancel()
-				// Return data up to the start of the sequence
-				return util.Max(i-2, 0), nil
+				return out, nil
 			}
 			e.state = normal
 		default:
 			e.state = normal
 		}
+		p[out] = b
+		out++
 	}
 
-	return n, err
+	return out, err
 }
 
 func (o *ConsoleOptions) connectViaWS(ctx context.Context, config *client.Config, deviceName, token string, passThroughArgs []string) error {
@@ -355,7 +409,11 @@ func (o *ConsoleOptions) connectViaWS(ctx context.Context, config *client.Config
 	return wsClient.StreamWithContext(ctx, options)
 }
 
-func (o *ConsoleOptions) emitUpgradeFailureError(ctx context.Context, name string, origErr error) {
+// emitUpgradeFailureError prints a clean, user-facing error message for a console
+// WebSocket upgrade failure, using o (shared by the device console and app console
+// commands via their embedded GlobalOptions) to look up additional context when the
+// error message itself doesn't carry a recognizable status code.
+func emitUpgradeFailureError(ctx context.Context, o *GlobalOptions, name string, origErr error) {
 	// Try to parse error message for HTTP status code and message
 	// Format: "websocket: bad handshake (409 Conflict): Device is decommissioned"
 	errStr := origErr.Error()
@@ -413,7 +471,9 @@ func (o *ConsoleOptions) emitUpgradeFailureError(ctx context.Context, name strin
 	fmt.Fprintf(os.Stderr, "Error for device %s: %v\n", name, origErr)
 }
 
-func (o *ConsoleOptions) analyzeResponseAndExit(ctx context.Context, name string, err error) {
+// analyzeResponseAndExit inspects err and terminates the process with an appropriate exit
+// code. Shared by the device console and app console commands.
+func analyzeResponseAndExit(ctx context.Context, o *GlobalOptions, name string, err error) {
 	var exitCode int
 	if errors.Is(err, context.Canceled) {
 		// If the context was canceled, we exit with code 130 (SIGINT)
@@ -425,7 +485,13 @@ func (o *ConsoleOptions) analyzeResponseAndExit(ctx context.Context, name string
 			exitCode = concreteErr.Code
 		case *httpstream.UpgradeFailureError:
 			exitCode = 255
-			o.emitUpgradeFailureError(ctx, name, err)
+			emitUpgradeFailureError(ctx, o, name, err)
+		case *ConsoleSessionError:
+			exitCode = 255
+			// %q escapes control characters (e.g. terminal escape sequences) so a
+			// misbehaving or compromised device cannot inject terminal actions via
+			// this agent-controlled error text.
+			fmt.Fprintf(os.Stderr, "Error for device %s: %q\n", name, concreteErr.Message)
 		default:
 			exitCode = 255
 			fmt.Fprintf(os.Stderr, "Unexpected error type %T: %+v\n", err, err)

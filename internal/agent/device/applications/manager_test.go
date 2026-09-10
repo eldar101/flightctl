@@ -162,6 +162,8 @@ func TestManager(t *testing.T) {
 					mockExecPodmanEvents(mockExec, bootTime),
 
 					// remove quadlet app (second AfterUpdate after syncProviders)
+					mockSystemdMgr.EXPECT().ListUnitsByMatchPattern(gomock.Any(), []string{target}).Return(
+						[]client.SystemDUnitListEntry{{Unit: target, LoadState: "loaded"}}, nil),
 					mockExecSystemdListDependencies(mockSystemdMgr, appID, services),
 					mockSystemdMgr.EXPECT().Stop(gomock.Any(), target).Return(nil),
 					mockSystemdMgr.EXPECT().ListUnitsByMatchPattern(gomock.Any(), services).Return([]client.SystemDUnitListEntry{{Unit: services[0], LoadState: "loaded"}}, nil),
@@ -197,6 +199,8 @@ func TestManager(t *testing.T) {
 					mockExecPodmanEvents(mockExec, bootTime),
 
 					// update: stop current quadlet app (remove phase)
+					mockSystemdMgr.EXPECT().ListUnitsByMatchPattern(gomock.Any(), []string{target}).Return(
+						[]client.SystemDUnitListEntry{{Unit: target, LoadState: "loaded"}}, nil),
 					mockExecSystemdListDependencies(mockSystemdMgr, appID, services),
 					mockSystemdMgr.EXPECT().Stop(gomock.Any(), target).Return(nil),
 					mockSystemdMgr.EXPECT().ListUnitsByMatchPattern(gomock.Any(), services).Return([]client.SystemDUnitListEntry{{Unit: services[0], LoadState: "loaded"}}, nil),
@@ -416,6 +420,7 @@ func mockExecPodmanEvents(mockExec *executer.MockExecuter, sinceTime time.Time) 
 			"--filter", "event=sync",
 			"--filter", "event=remove",
 			"--filter", "event=exited",
+			"--filter", "event=health_status",
 		},
 	).Return(exec.CommandContext(context.Background(), "echo", `{}`))
 }
@@ -1130,6 +1135,199 @@ func TestCollectOCITargetsDeferredDependencies(t *testing.T) {
 				require.NoError(err)
 				require.NotNil(result)
 			}
+		})
+	}
+}
+
+func TestManagerResolveConsole(t *testing.T) {
+	newTestManager := func(t *testing.T) (*manager, *gomock.Controller) {
+		t.Helper()
+		ctrl := gomock.NewController(t)
+		testLog := log.NewPrefixLogger("test")
+		tmpDir := t.TempDir()
+		readWriter := fileio.NewReadWriter(
+			fileio.NewReader(fileio.WithReaderRootDir(tmpDir)),
+			fileio.NewWriter(fileio.WithWriterRootDir(tmpDir)),
+		)
+		execMock := executer.NewMockExecuter(ctrl)
+		podman := client.NewPodman(testLog, execMock, readWriter, testutil.NewPollConfig())
+		systemdMgr := systemd.NewMockManager(ctrl)
+		systemdMgr.EXPECT().AddExclusions(gomock.Any()).AnyTimes()
+		systemdMgr.EXPECT().RemoveExclusions(gomock.Any()).AnyTimes()
+		var podmanFactory client.PodmanFactory = func(_ v1beta1.Username) (*client.Podman, error) { return podman, nil }
+		var systemdFactory systemd.ManagerFactory = func(_ v1beta1.Username) (systemd.Manager, error) { return systemdMgr, nil }
+		var rwFactory fileio.ReadWriterFactory = func(_ v1beta1.Username) (fileio.ReadWriter, error) { return readWriter, nil }
+		m := &manager{
+			podmanMonitor:     NewPodmanMonitor(testLog, podmanFactory, systemdFactory, "", rwFactory),
+			kubernetesMonitor: NewKubernetesMonitor(testLog, client.NewCLIClients(), rwFactory),
+			log:               testLog,
+		}
+		return m, ctrl
+	}
+
+	t.Run("When the app is tracked by podmanMonitor it should return a session from podmanMonitor", func(t *testing.T) {
+		require := require.New(t)
+		m, ctrl := newTestManager(t)
+		defer ctrl.Finish()
+		app := createTestVMApplication(require, "my-vm", v1beta1.ApplicationStatusRunning, v1beta1.CurrentProcessUsername)
+		err := m.podmanMonitor.Ensure(t.Context(), app)
+		require.NoError(err)
+		// The workload name comes from podman events and is the authoritative runtime name.
+		app.AddWorkload(&Workload{Name: "systemd-my-vm-compute", Status: StatusRunning})
+		sess, err := m.resolveConsole("my-vm", "serial")
+		require.NoError(err)
+		require.NotNil(sess)
+	})
+
+	t.Run("When the app is not found in any monitor it should return an error", func(t *testing.T) {
+		require := require.New(t)
+		m, ctrl := newTestManager(t)
+		defer ctrl.Finish()
+		_, err := m.resolveConsole("ghost-app", "serial")
+		require.Error(err)
+		require.Contains(err.Error(), "not found in any monitor")
+	})
+}
+
+func mockExecPodmanComposeStop(mockExec *executer.MockExecuter, name string) *gomock.Call {
+	workDir := fmt.Sprintf("%s/%s", lifecycle.ComposeAppPath, name)
+	id := lifecycle.GenerateAppID(name, v1beta1.CurrentProcessUsername)
+	args := []string{"compose", "-p", id, "stop"}
+	return mockExec.EXPECT().ExecuteWithContextFromDir(gomock.Any(), workDir, "podman", args).Return("", "", 0)
+}
+
+func mockExecPodmanComposeStart(mockExec *executer.MockExecuter, name string) *gomock.Call {
+	return mockExecPodmanComposeUp(mockExec, name, true, true)
+}
+
+func TestQueueLifecycle(t *testing.T) {
+	bootTime := time.Now()
+	const appName = "my-app"
+
+	type lifecycleIntent struct {
+		desiredState v1beta1.ApplicationDesiredState
+		restartGen   int
+	}
+
+	testCases := []struct {
+		name        string
+		stored      lifecycleIntent
+		first       lifecycleIntent
+		second      *lifecycleIntent
+		setupFirst  func(*executer.MockExecuter)
+		setupSecond func(*executer.MockExecuter)
+	}{
+		{
+			name:       "When desiredState transitions from running to stopped it should call podman compose stop",
+			stored:     lifecycleIntent{desiredState: v1beta1.ApplicationDesiredStateRunning},
+			first:      lifecycleIntent{desiredState: v1beta1.ApplicationDesiredStateStopped},
+			setupFirst: func(mockExec *executer.MockExecuter) { mockExecPodmanComposeStop(mockExec, appName) },
+		},
+		{
+			name:   "When desiredState is unchanged (running) it should not issue any call",
+			stored: lifecycleIntent{desiredState: v1beta1.ApplicationDesiredStateRunning},
+			first:  lifecycleIntent{desiredState: v1beta1.ApplicationDesiredStateRunning},
+			// no mock expectation
+		},
+		{
+			name:        "When desiredState transitions from stopped to running it should call podman compose up",
+			stored:      lifecycleIntent{desiredState: v1beta1.ApplicationDesiredStateRunning},
+			first:       lifecycleIntent{desiredState: v1beta1.ApplicationDesiredStateStopped},
+			second:      &lifecycleIntent{desiredState: v1beta1.ApplicationDesiredStateRunning},
+			setupFirst:  func(mockExec *executer.MockExecuter) { mockExecPodmanComposeStop(mockExec, appName) },
+			setupSecond: func(mockExec *executer.MockExecuter) { mockExecPodmanComposeStart(mockExec, appName) },
+		},
+		{
+			name:   "When restartGeneration increments it should restart the app via compose up",
+			stored: lifecycleIntent{desiredState: v1beta1.ApplicationDesiredStateRunning, restartGen: 0},
+			first:  lifecycleIntent{desiredState: v1beta1.ApplicationDesiredStateRunning, restartGen: 0},
+			second: &lifecycleIntent{desiredState: v1beta1.ApplicationDesiredStateRunning, restartGen: 1},
+			// no action on first call (same gen)
+			setupSecond: func(mockExec *executer.MockExecuter) {
+				gomock.InOrder(
+					mockExecPodmanComposeStop(mockExec, appName),
+					mockExecPodmanComposeStart(mockExec, appName),
+				)
+			},
+		},
+		{
+			name:       "When restartGeneration increments but desiredState is stopped it should not restart",
+			stored:     lifecycleIntent{desiredState: v1beta1.ApplicationDesiredStateRunning},
+			first:      lifecycleIntent{desiredState: v1beta1.ApplicationDesiredStateStopped},
+			second:     &lifecycleIntent{desiredState: v1beta1.ApplicationDesiredStateStopped, restartGen: 1},
+			setupFirst: func(mockExec *executer.MockExecuter) { mockExecPodmanComposeStop(mockExec, appName) },
+			// no second call: restart must not fire when desiredState is stopped
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			require := require.New(t)
+			ctx := context.Background()
+			testLog := log.NewPrefixLogger("test")
+			testLog.SetLevel(logrus.DebugLevel)
+
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+
+			mockReadWriter := fileio.NewMockReadWriter(ctrl)
+			mockExec := executer.NewMockExecuter(ctrl)
+			mockPodmanClient := client.NewPodman(testLog, mockExec, mockReadWriter, testutil.NewPollConfig())
+			mockSystemdMgr := systemd.NewMockManager(ctrl)
+			mockSystemdMgr.EXPECT().AddExclusions(gomock.Any()).AnyTimes()
+			mockSystemdMgr.EXPECT().RemoveExclusions(gomock.Any()).AnyTimes()
+
+			// PathExists is called during compose Up for start/restart
+			mockReadWriter.EXPECT().PathExists(gomock.Any()).Return(true, nil).AnyTimes()
+
+			var podmanFactory client.PodmanFactory = func(user v1beta1.Username) (*client.Podman, error) {
+				return mockPodmanClient, nil
+			}
+			var systemdFactory systemd.ManagerFactory = func(user v1beta1.Username) (systemd.Manager, error) {
+				return mockSystemdMgr, nil
+			}
+			var rwMockFactory fileio.ReadWriterFactory = func(username v1beta1.Username) (fileio.ReadWriter, error) {
+				return mockReadWriter, nil
+			}
+
+			monitor := NewPodmanMonitor(testLog, podmanFactory, systemdFactory, bootTime.Format(time.RFC3339), rwMockFactory)
+
+			id := lifecycle.GenerateAppID(appName, v1beta1.CurrentProcessUsername)
+			volumeManager, err := provider.NewVolumeManager(testLog, appName, v1beta1.AppTypeCompose, v1beta1.CurrentProcessUsername, nil)
+			require.NoError(err)
+
+			// Pre-register the app with the "stored" (previously converged) lifecycle intent.
+			monitor.apps[id] = &application{
+				id:   id,
+				path: fmt.Sprintf("%s/%s", lifecycle.ComposeAppPath, appName),
+				status: &v1beta1.DeviceApplicationStatus{
+					Name:    appName,
+					AppType: v1beta1.AppTypeCompose,
+				},
+				volume:            volumeManager,
+				desiredState:      tc.stored.desiredState,
+				restartGeneration: tc.stored.restartGen,
+			}
+
+			// First spec sync: queue lifecycle action based on the delta from stored state.
+			if tc.setupFirst != nil {
+				tc.setupFirst(mockExec)
+			}
+			monitor.QueueLifecycle(id, tc.first.desiredState, tc.first.restartGen)
+			err = monitor.ExecuteActions(ctx)
+			require.NoError(err)
+
+			if tc.second == nil {
+				return
+			}
+
+			// Second spec sync: queue lifecycle action based on the delta from the first.
+			if tc.setupSecond != nil {
+				tc.setupSecond(mockExec)
+			}
+			monitor.QueueLifecycle(id, tc.second.desiredState, tc.second.restartGen)
+			err = monitor.ExecuteActions(ctx)
+			require.NoError(err)
 		})
 	}
 }

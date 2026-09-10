@@ -25,6 +25,11 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
+      # make e2e-agent-images uses podman; pin crun so ubuntu-24.04 doesn't hit
+      # "unknown version specified" (apt ships crun 1.14.1).
+      - name: Setup dependencies
+        uses: ./.github/actions/setup-dependencies
+
       - name: Restore bootc-image-builder cache
         id: cache-bootc-restore
         uses: actions/cache/restore@v4
@@ -173,6 +178,11 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Save caches
+        # always(): populated during "Build agent images for flavor" above, so still worth
+        # saving even if a later step fails. main-only + cache-hit skip: see the "Save Go
+        # modules cache" step in pr-smoke-testing.yaml for why (restrict writes to main,
+        # avoid re-archiving on a hit).
+        if: always() && github.ref == 'refs/heads/main' && steps.cache-bootc-restore.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: |

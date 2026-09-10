@@ -30,8 +30,67 @@ telemetryGateway:
 {{- if .telemetryGateway.forward.endpoint }}
   forward:
     endpoint: {{.telemetryGateway.forward.endpoint}}
+    {{- with .telemetryGateway.forward.headers }}
+    headers:
+      {{- range $key, $val := . }}
+      {{ $key }}: {{ $val }}
+      {{- end }}
+    {{- end }}
+    {{- if or .telemetryGateway.forward.tls.insecureSkipTlsVerify .telemetryGateway.forward.tls.caFile .telemetryGateway.forward.tls.certFile .telemetryGateway.forward.tls.keyFile }}
     tls:
+      {{- if .telemetryGateway.forward.tls.insecureSkipTlsVerify }}
+      insecureSkipTlsVerify: true
+      {{- end }}
+      {{- if .telemetryGateway.forward.tls.caFile }}
+      caFile: {{ .telemetryGateway.forward.tls.caFile }}
+      {{- else }}
       caFile: /etc/flightctl/flightctl-telemetry-gateway/forward/ca.crt
+      {{- end }}
+      {{- if .telemetryGateway.forward.tls.certFile }}
+      certFile: {{ .telemetryGateway.forward.tls.certFile }}
+      {{- else }}
       certFile: /etc/flightctl/flightctl-telemetry-gateway/forward/client.crt
+      {{- end }}
+      {{- if .telemetryGateway.forward.tls.keyFile }}
+      keyFile: {{ .telemetryGateway.forward.tls.keyFile }}
+      {{- else }}
       keyFile: /etc/flightctl/flightctl-telemetry-gateway/forward/client.key
+      {{- end }}
+    {{- end }}
 {{- end}}
+
+{{- with .profiling }}
+{{- $pprof := .pprof }}
+{{- $pyroscope := .pyroscope }}
+{{- $pprofOn := false }}
+{{- $pyroscopeOn := false }}
+{{- if $pprof }}{{ if $pprof.enabled }}{{ $pprofOn = true }}{{ end }}{{ end }}
+{{- if $pyroscope }}{{ if $pyroscope.enabled }}{{ $pyroscopeOn = true }}{{ end }}{{ end }}
+{{- if or $pprofOn $pyroscopeOn }}
+profiling:
+{{- if $pprofOn }}
+  pprof:
+    enabled: true
+{{- if $pprof.port }}
+    port: {{ $pprof.port }}
+{{- end }}
+{{- end }}
+{{- if $pyroscopeOn }}
+  pyroscope:
+    enabled: true
+    serverAddress: {{ $pyroscope.serverAddress }}
+{{- if $pyroscope.applicationName }}
+    applicationName: {{ $pyroscope.applicationName }}
+{{- end }}
+{{- if $pyroscope.basicAuthUser }}
+    basicAuthUser: {{ $pyroscope.basicAuthUser }}
+{{- end }}
+{{- if $pyroscope.basicAuthPassword }}
+    basicAuthPassword: {{ $pyroscope.basicAuthPassword }}
+{{- end }}
+{{- if $pyroscope.tenantID }}
+    tenantID: {{ $pyroscope.tenantID }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

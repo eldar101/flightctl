@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -150,10 +151,10 @@ func (a *Agent) Run(ctx context.Context) error {
 
 	// TODO: replace wait with poll
 	backoff := wait.Backoff{
-		Cap:      1 * time.Minute,
-		Duration: 10 * time.Second,
+		Cap:      time.Duration(a.config.EnrollmentVerifyCap),
+		Duration: time.Duration(a.config.EnrollmentVerifyInterval),
 		Factor:   1.5,
-		Steps:    6,
+		Steps:    a.config.EnrollmentVerifySteps,
 	}
 
 	pollBackoff := poll.Config{
@@ -164,8 +165,18 @@ func (a *Agent) Run(ctx context.Context) error {
 		JitterFactor: 0.1,
 	}
 
+	specFetchErrorBackoff := poll.Config{
+		BaseDelay:    time.Duration(a.config.SpecFetchErrorBaseDelay),
+		MaxDelay:     time.Duration(a.config.SpecFetchErrorMaxDelay),
+		Factor:       2.0,
+		JitterFactor: 0.2,
+	}
+
 	// create os client
 	osClient := os.NewClient(a.log, exec)
+	caps := osClient.Capabilities(ctx)
+	a.log.Infof("OS mode detected: %s", caps.OsMode)
+	a.log.Infof("delta eligible: %t bootc=%q oci-delta=%q", caps.DeltaEligible, caps.BootcVersion, caps.OCIDeltaVersion)
 
 	// create podman client
 	podmanClientFactory := client.NewPodmanFactory(a.log, pollBackoff, rwFactory)
@@ -254,7 +265,9 @@ func (a *Agent) Run(ctx context.Context) error {
 		policyManager,
 		rootReadWriter,
 		osClient,
+		caps,
 		pollBackoff,
+		specFetchErrorBackoff,
 		deviceNotFoundHandler,
 		auditLogger,
 		a.log,
@@ -293,7 +306,22 @@ func (a *Agent) Run(ctx context.Context) error {
 	shutdownManager.Register("applications", applicationsManager.Shutdown)
 
 	// create os manager
-	osManager := os.NewManager(a.log, osClient, rootReadWriter, rootPodmanClient, pullConfigResolver)
+	rootSkopeoClient, err := skopeoClientFactory("")
+	if err != nil {
+		return fmt.Errorf("initialize root Skopeo client: %w", err)
+	}
+
+	osManager := os.NewManager(
+		a.log,
+		osClient,
+		caps,
+		rootReadWriter,
+		rootPodmanClient,
+		pullConfigResolver,
+		client.NewOCIDelta(a.log, exec, time.Duration(a.config.PullTimeout)),
+		rootSkopeoClient,
+		time.Duration(a.config.PullTimeout),
+	)
 
 	// create prefetch manager
 	prefetchManager := dependency.NewPrefetchManager(
@@ -325,9 +353,12 @@ func (a *Agent) Run(ctx context.Context) error {
 		csr,
 		a.config.DefaultLabels,
 		a.config.LabelFromSystemInfo,
+		caps,
 		statusManager,
 		rootSystemdClient,
 		identityProvider,
+		hookManager,
+		a.config.Enrollment.PreEnrollment.FailurePolicy,
 		backoff,
 		a.log,
 	)
@@ -339,10 +370,14 @@ func (a *Agent) Run(ctx context.Context) error {
 	statusManager.RegisterStatusExporter(osManager)
 	statusManager.RegisterStatusExporter(specManager)
 	statusManager.RegisterStatusExporter(systemInfoManager)
+	if len(a.config.Warnings) > 0 {
+		statusManager.RegisterStatusExporter(newConfigWarningExporter(a.config.Warnings))
+	}
 
 	// create config controller
 	configController := config.NewController(
 		rootReadWriter,
+		a.config.DataDir,
 		a.log,
 	)
 
@@ -389,6 +424,12 @@ func (a *Agent) Run(ctx context.Context) error {
 		a.log.Warnf("Failed to create gRPC client: %v", err)
 	}
 
+	// create a separate gRPC client for flightctl-remote-access
+	remoteAccessGrpcClient, err := identityProvider.CreateGRPCClient(&a.config.RemoteAccessService.Config)
+	if err != nil {
+		a.log.Warnf("Failed to create remote access gRPC client: %v", err)
+	}
+
 	// create console manager
 	consoleManager := console.NewManager(
 		grpcClient,
@@ -398,6 +439,8 @@ func (a *Agent) Run(ctx context.Context) error {
 		specManager.Watch(),
 		a.log,
 	)
+
+	applicationsManager.WithConsole(deviceName, remoteAccessGrpcClient)
 
 	applicationsController := applications.NewController(
 		podmanClientFactory,
@@ -431,6 +474,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		applicationsManager,
 		rootSystemdManager,
 		a.config.StatusUpdateInterval,
+		*a.config.StatusUpdateJitter,
 		hookManager,
 		osManager,
 		policyManager,
@@ -444,6 +488,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		prefetchManager,
 		pullConfigResolver,
 		pruningManager,
+		caps,
 		backoff,
 		a.log,
 	)
@@ -465,7 +510,9 @@ func (a *Agent) Run(ctx context.Context) error {
 	startAsync(reloadManager.Run)
 	startAsync(resourceManager.Run)
 	startAsync(prefetchManager.Run)
+	appConsoleWatcher := specManager.Watch()
 	startAsync(consoleManager.Run)
+	startAsync(func(ctx context.Context) { applicationsManager.RunConsole(ctx, appConsoleWatcher) })
 	startAsync(specManager.Publisher().Run)
 	startAsync(certManager.Run)
 
@@ -527,5 +574,26 @@ func wipeCertificateAndRestart(ctx context.Context, identityProvider identity.Pr
 	}
 
 	log.Info("Successfully wiped certificate and restarted flightctl-agent service")
+	return nil
+}
+
+// configWarningExporter surfaces config loading warnings (e.g. skipped drop-ins)
+// in the device summary on every status collection cycle.
+type configWarningExporter struct {
+	msg string
+}
+
+func newConfigWarningExporter(warnings []string) *configWarningExporter {
+	return &configWarningExporter{
+		msg: log.Truncate(strings.Join(warnings, "; "), status.MaxMessageLength),
+	}
+}
+
+func (e *configWarningExporter) Status(_ context.Context, s *v1beta1.DeviceStatus, _ ...status.CollectorOpt) error {
+	if s.Summary.Status != v1beta1.DeviceSummaryStatusOnline {
+		return nil
+	}
+	s.Summary.Status = v1beta1.DeviceSummaryStatusDegraded
+	s.Summary.Info = &e.msg
 	return nil
 }

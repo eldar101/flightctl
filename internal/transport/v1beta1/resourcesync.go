@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	apiv1beta1 "github.com/flightctl/flightctl/api/core/v1beta1"
+	resourcesyncservice "github.com/flightctl/flightctl/internal/service/resourcesync"
 	"github.com/flightctl/flightctl/internal/transport"
 )
 
@@ -17,7 +18,7 @@ func (h *TransportHandler) CreateResourceSync(w http.ResponseWriter, r *http.Req
 	}
 
 	domainRS := h.converter.ResourceSync().ToDomain(rs)
-	body, status := h.serviceHandler.CreateResourceSync(r.Context(), transport.OrgIDFromContext(r.Context()), domainRS)
+	body, status := resourcesyncservice.CreateResourceSyncFromUntrusted(r.Context(), h.resourcesync, transport.OrgIDFromContext(r.Context()), domainRS)
 	apiResult := h.converter.ResourceSync().FromDomain(body)
 	h.SetResponse(w, apiResult, status)
 }
@@ -25,14 +26,14 @@ func (h *TransportHandler) CreateResourceSync(w http.ResponseWriter, r *http.Req
 // (GET /api/v1/resourcesyncs)
 func (h *TransportHandler) ListResourceSyncs(w http.ResponseWriter, r *http.Request, params apiv1beta1.ListResourceSyncsParams) {
 	domainParams := h.converter.ResourceSync().ListParamsToDomain(params)
-	body, status := h.serviceHandler.ListResourceSyncs(r.Context(), transport.OrgIDFromContext(r.Context()), domainParams)
+	body, status := h.resourcesync.ListResourceSyncs(r.Context(), transport.OrgIDFromContext(r.Context()), domainParams)
 	apiResult := h.converter.ResourceSync().ListFromDomain(body)
 	h.SetResponse(w, apiResult, status)
 }
 
 // (GET /api/v1/resourcesyncs/{name})
 func (h *TransportHandler) GetResourceSync(w http.ResponseWriter, r *http.Request, name string) {
-	body, status := h.serviceHandler.GetResourceSync(r.Context(), transport.OrgIDFromContext(r.Context()), name)
+	body, status := h.resourcesync.GetResourceSync(r.Context(), transport.OrgIDFromContext(r.Context()), name)
 	apiResult := h.converter.ResourceSync().FromDomain(body)
 	h.SetResponse(w, apiResult, status)
 }
@@ -46,14 +47,14 @@ func (h *TransportHandler) ReplaceResourceSync(w http.ResponseWriter, r *http.Re
 	}
 
 	domainRS := h.converter.ResourceSync().ToDomain(rs)
-	body, status := h.serviceHandler.ReplaceResourceSync(r.Context(), transport.OrgIDFromContext(r.Context()), name, domainRS)
+	body, status := resourcesyncservice.ReplaceResourceSyncFromUntrusted(r.Context(), h.resourcesync, transport.OrgIDFromContext(r.Context()), name, domainRS)
 	apiResult := h.converter.ResourceSync().FromDomain(body)
 	h.SetResponse(w, apiResult, status)
 }
 
 // (DELETE /api/v1/resourcesyncs/{name})
 func (h *TransportHandler) DeleteResourceSync(w http.ResponseWriter, r *http.Request, name string) {
-	status := h.serviceHandler.DeleteResourceSync(r.Context(), transport.OrgIDFromContext(r.Context()), name)
+	status := h.resourcesync.DeleteResourceSync(r.Context(), transport.OrgIDFromContext(r.Context()), name)
 	h.SetResponse(w, nil, status)
 }
 
@@ -66,7 +67,7 @@ func (h *TransportHandler) PatchResourceSync(w http.ResponseWriter, r *http.Requ
 	}
 
 	domainPatch := h.converter.Common().PatchRequestToDomain(patch)
-	body, status := h.serviceHandler.PatchResourceSync(r.Context(), transport.OrgIDFromContext(r.Context()), name, domainPatch)
+	body, status := h.resourcesync.PatchResourceSync(r.Context(), transport.OrgIDFromContext(r.Context()), name, domainPatch)
 	apiResult := h.converter.ResourceSync().FromDomain(body)
 	h.SetResponse(w, apiResult, status)
 }

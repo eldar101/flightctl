@@ -175,7 +175,7 @@ var _ = Describe("RepoTester", func() {
 				}})
 			Expect(err).NotTo(HaveOccurred())
 
-			err = repotester.TestAccess(&api.Repository{Metadata: api.ObjectMeta{Name: lo.ToPtr("name")}, Spec: spec})
+			err = repotester.TestAccess(context.Background(), &api.Repository{Metadata: api.ObjectMeta{Name: lo.ToPtr("name")}, Spec: spec})
 			Expect(err).NotTo(HaveOccurred())
 		})
 	})
@@ -211,7 +211,7 @@ var _ = Describe("RepoTester", func() {
 				}})
 			Expect(err).NotTo(HaveOccurred())
 
-			err = repotester.TestAccess(&api.Repository{Metadata: api.ObjectMeta{Name: lo.ToPtr("name")}, Spec: spec})
+			err = repotester.TestAccess(context.Background(), &api.Repository{Metadata: api.ObjectMeta{Name: lo.ToPtr("name")}, Spec: spec})
 			Expect(err).NotTo(HaveOccurred())
 
 			select {
@@ -241,7 +241,7 @@ var _ = Describe("RepoTester", func() {
 				})
 				Expect(err).NotTo(HaveOccurred())
 
-				err = repotester.TestAccess(&api.Repository{Metadata: api.ObjectMeta{Name: lo.ToPtr("test-oci-repo")}, Spec: spec})
+				err = repotester.TestAccess(context.Background(), &api.Repository{Metadata: api.ObjectMeta{Name: lo.ToPtr("test-oci-repo")}, Spec: spec})
 				Expect(err).NotTo(HaveOccurred())
 			})
 		})
@@ -270,7 +270,7 @@ var _ = Describe("RepoTester", func() {
 				})
 				Expect(err).NotTo(HaveOccurred())
 
-				err = repotester.TestAccess(&api.Repository{Metadata: api.ObjectMeta{Name: lo.ToPtr("test-oci-repo")}, Spec: spec})
+				err = repotester.TestAccess(context.Background(), &api.Repository{Metadata: api.ObjectMeta{Name: lo.ToPtr("test-oci-repo")}, Spec: spec})
 				Expect(err).NotTo(HaveOccurred())
 			})
 		})
@@ -299,7 +299,7 @@ var _ = Describe("RepoTester", func() {
 				})
 				Expect(err).NotTo(HaveOccurred())
 
-				err = repotester.TestAccess(&api.Repository{Metadata: api.ObjectMeta{Name: lo.ToPtr("test-oci-repo")}, Spec: spec})
+				err = repotester.TestAccess(context.Background(), &api.Repository{Metadata: api.ObjectMeta{Name: lo.ToPtr("test-oci-repo")}, Spec: spec})
 				Expect(err).To(HaveOccurred())
 				Expect(err.Error()).To(ContainSubstring("invalid credentials"))
 			})
@@ -327,7 +327,7 @@ var _ = Describe("RepoTester", func() {
 				})
 				Expect(err).NotTo(HaveOccurred())
 
-				err = repotester.TestAccess(&api.Repository{Metadata: api.ObjectMeta{Name: lo.ToPtr("test-oci-repo")}, Spec: spec})
+				err = repotester.TestAccess(context.Background(), &api.Repository{Metadata: api.ObjectMeta{Name: lo.ToPtr("test-oci-repo")}, Spec: spec})
 				Expect(err).NotTo(HaveOccurred())
 			})
 		})
@@ -358,7 +358,7 @@ var _ = Describe("RepoTester", func() {
 				})
 				Expect(err).NotTo(HaveOccurred())
 
-				err = repotester.TestAccess(&api.Repository{Metadata: api.ObjectMeta{Name: lo.ToPtr("test-oci-repo")}, Spec: spec})
+				err = repotester.TestAccess(context.Background(), &api.Repository{Metadata: api.ObjectMeta{Name: lo.ToPtr("test-oci-repo")}, Spec: spec})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Test without credentials - should get anonymous token via scope
@@ -370,7 +370,7 @@ var _ = Describe("RepoTester", func() {
 				})
 				Expect(err).NotTo(HaveOccurred())
 
-				err = repotester.TestAccess(&api.Repository{Metadata: api.ObjectMeta{Name: lo.ToPtr("test-oci-repo-anon")}, Spec: specAnon})
+				err = repotester.TestAccess(context.Background(), &api.Repository{Metadata: api.ObjectMeta{Name: lo.ToPtr("test-oci-repo-anon")}, Spec: specAnon})
 				Expect(err).NotTo(HaveOccurred())
 
 				// Test with invalid credentials - should fail even though anonymous access is available
@@ -383,7 +383,7 @@ var _ = Describe("RepoTester", func() {
 				})
 				Expect(err).NotTo(HaveOccurred())
 
-				err = repotester.TestAccess(&api.Repository{Metadata: api.ObjectMeta{Name: lo.ToPtr("test-oci-repo-invalid")}, Spec: specInvalid})
+				err = repotester.TestAccess(context.Background(), &api.Repository{Metadata: api.ObjectMeta{Name: lo.ToPtr("test-oci-repo-invalid")}, Spec: specInvalid})
 				Expect(err).To(HaveOccurred())
 				Expect(err.Error()).To(ContainSubstring("invalid credentials"))
 			})
@@ -400,7 +400,7 @@ var _ = Describe("RepoTester", func() {
 				})
 				Expect(err).NotTo(HaveOccurred())
 
-				err = repotester.TestAccess(&api.Repository{Metadata: api.ObjectMeta{Name: lo.ToPtr("test-oci-repo")}, Spec: spec})
+				err = repotester.TestAccess(context.Background(), &api.Repository{Metadata: api.ObjectMeta{Name: lo.ToPtr("test-oci-repo")}, Spec: spec})
 				Expect(err).To(HaveOccurred())
 				Expect(err.Error()).To(ContainSubstring("failed to connect"))
 			})
@@ -423,7 +423,7 @@ var _ = Describe("RepoTester", func() {
 				})
 				Expect(err).NotTo(HaveOccurred())
 
-				err = repotester.TestAccess(&api.Repository{Metadata: api.ObjectMeta{Name: lo.ToPtr("test-oci-tls")}, Spec: spec})
+				err = repotester.TestAccess(context.Background(), &api.Repository{Metadata: api.ObjectMeta{Name: lo.ToPtr("test-oci-tls")}, Spec: spec})
 				Expect(err).NotTo(HaveOccurred())
 			})
 		})
@@ -453,7 +453,7 @@ var _ = Describe("RepoTester", func() {
 				})
 				Expect(err).NotTo(HaveOccurred())
 
-				err = repotester.TestAccess(&api.Repository{Metadata: api.ObjectMeta{Name: lo.ToPtr("test-oci-tls-auth")}, Spec: spec})
+				err = repotester.TestAccess(context.Background(), &api.Repository{Metadata: api.ObjectMeta{Name: lo.ToPtr("test-oci-tls-auth")}, Spec: spec})
 				Expect(err).NotTo(HaveOccurred())
 			})
 		})
@@ -475,7 +475,7 @@ var _ = Describe("RepoTester", func() {
 				})
 				Expect(err).NotTo(HaveOccurred())
 
-				err = repotester.TestAccess(&api.Repository{Metadata: api.ObjectMeta{Name: lo.ToPtr("test-oci-insecure")}, Spec: spec})
+				err = repotester.TestAccess(context.Background(), &api.Repository{Metadata: api.ObjectMeta{Name: lo.ToPtr("test-oci-insecure")}, Spec: spec})
 				Expect(err).NotTo(HaveOccurred())
 			})
 		})
@@ -496,9 +496,117 @@ var _ = Describe("RepoTester", func() {
 				})
 				Expect(err).NotTo(HaveOccurred())
 
-				err = repotester.TestAccess(&api.Repository{Metadata: api.ObjectMeta{Name: lo.ToPtr("test-oci-no-ca")}, Spec: spec})
+				err = repotester.TestAccess(context.Background(), &api.Repository{Metadata: api.ObjectMeta{Name: lo.ToPtr("test-oci-no-ca")}, Spec: spec})
 				Expect(err).To(HaveOccurred())
 				Expect(err.Error()).To(ContainSubstring("failed to connect"))
+			})
+		})
+
+		Context("with Basic auth registry and valid credentials", func() {
+			It("should successfully test access", func() {
+				mock := &MockOciRegistry{
+					RequireAuth:   true,
+					BasicAuth:     true,
+					ValidUsername: "testuser",
+					ValidPassword: "testpass",
+				}
+				server := httptest.NewServer(mock.Handler())
+				defer server.Close()
+
+				repotester := tasks.OciRepoTester{}
+
+				spec := api.RepositorySpec{}
+				err := spec.FromOciRepoSpec(api.OciRepoSpec{
+					Registry: registryHost(server.URL),
+					Type:     "oci",
+					Scheme:   lo.ToPtr(api.Http),
+					OciAuth:  newOciAuth("testuser", "testpass"),
+				})
+				Expect(err).NotTo(HaveOccurred())
+
+				err = repotester.TestAccess(context.Background(), &api.Repository{Metadata: api.ObjectMeta{Name: lo.ToPtr("test-oci-basic-auth")}, Spec: spec})
+				Expect(err).NotTo(HaveOccurred())
+			})
+		})
+
+		Context("with Basic auth registry and invalid credentials", func() {
+			It("should fail with an authentication error", func() {
+				mock := &MockOciRegistry{
+					RequireAuth:   true,
+					BasicAuth:     true,
+					ValidUsername: "testuser",
+					ValidPassword: "testpass",
+				}
+				server := httptest.NewServer(mock.Handler())
+				defer server.Close()
+
+				repotester := tasks.OciRepoTester{}
+
+				spec := api.RepositorySpec{}
+				err := spec.FromOciRepoSpec(api.OciRepoSpec{
+					Registry: registryHost(server.URL),
+					Type:     "oci",
+					Scheme:   lo.ToPtr(api.Http),
+					OciAuth:  newOciAuth("wronguser", "wrongpass"),
+				})
+				Expect(err).NotTo(HaveOccurred())
+
+				err = repotester.TestAccess(context.Background(), &api.Repository{Metadata: api.ObjectMeta{Name: lo.ToPtr("test-oci-basic-auth-invalid")}, Spec: spec})
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("authentication failed"))
+			})
+		})
+
+		Context("with Basic auth registry and no credentials configured", func() {
+			It("should fail with a credentials required error", func() {
+				mock := &MockOciRegistry{
+					RequireAuth: true,
+					BasicAuth:   true,
+				}
+				server := httptest.NewServer(mock.Handler())
+				defer server.Close()
+
+				repotester := tasks.OciRepoTester{}
+
+				spec := api.RepositorySpec{}
+				err := spec.FromOciRepoSpec(api.OciRepoSpec{
+					Registry: registryHost(server.URL),
+					Type:     "oci",
+					Scheme:   lo.ToPtr(api.Http),
+				})
+				Expect(err).NotTo(HaveOccurred())
+
+				err = repotester.TestAccess(context.Background(), &api.Repository{Metadata: api.ObjectMeta{Name: lo.ToPtr("test-oci-basic-auth-no-creds")}, Spec: spec})
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring("no credentials"))
+			})
+		})
+
+		Context("with Basic auth registry, TLS and valid credentials", func() {
+			It("should successfully test access", func() {
+				mock := &MockOciRegistry{
+					RequireAuth:   true,
+					BasicAuth:     true,
+					ValidUsername: "testuser",
+					ValidPassword: "testpass",
+				}
+				server, caCrtB64 := startTLSOciRegistryServer(mock)
+				defer server.Close()
+
+				repotester := tasks.OciRepoTester{}
+
+				spec := api.RepositorySpec{}
+				err := spec.FromOciRepoSpec(api.OciRepoSpec{
+					Registry: registryHost(server.URL),
+					Type:     "oci",
+					Scheme:   lo.ToPtr(api.Https),
+					CaCrt:    &caCrtB64,
+					OciAuth:  newOciAuth("testuser", "testpass"),
+				})
+				Expect(err).NotTo(HaveOccurred())
+
+				err = repotester.TestAccess(context.Background(), &api.Repository{Metadata: api.ObjectMeta{Name: lo.ToPtr("test-oci-basic-auth-tls")}, Spec: spec})
+				Expect(err).NotTo(HaveOccurred())
 			})
 		})
 	})

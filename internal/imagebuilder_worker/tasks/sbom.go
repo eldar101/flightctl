@@ -14,6 +14,7 @@ import (
 	"github.com/flightctl/flightctl/internal/imagebuilder_api/domain"
 	"github.com/flightctl/flightctl/internal/oci"
 	trustifyv2 "github.com/flightctl/flightctl/internal/trustify/v2"
+	"github.com/flightctl/flightctl/internal/vulnerability"
 	"github.com/google/uuid"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -213,7 +214,7 @@ func (c *Consumer) pushSBOMAsReferrer(
 	}
 	report([]byte("Starting SBOM push to destination registry\n"))
 
-	repoRef, err := oci.BuildOciRepoRef(ociSpec, destRef)
+	repoRef, err := oci.BuildOciRepoRef(ctx, ociSpec, destRef)
 	if err != nil {
 		return fmt.Errorf("failed to configure OCI repository reference: %w", err)
 	}
@@ -392,5 +393,5 @@ func (c *Consumer) shouldRunSBOMPipeline() bool {
 		return false
 	}
 	v := c.cfg.VulnerabilityReporting
-	return v != nil && v.Enabled && v.Trustify != nil
+	return v != nil && v.Enabled && vulnerability.RequiresSBOMUpload(v.EffectiveBackend())
 }

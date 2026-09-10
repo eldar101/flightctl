@@ -13,9 +13,9 @@ import (
 	"github.com/flightctl/flightctl/internal/imagebuilder_api/domain"
 	"github.com/flightctl/flightctl/internal/imagebuilder_api/store"
 	"github.com/flightctl/flightctl/internal/kvstore"
-	internalservice "github.com/flightctl/flightctl/internal/service"
 	"github.com/flightctl/flightctl/internal/service/common"
-	mainstore "github.com/flightctl/flightctl/internal/store"
+	"github.com/flightctl/flightctl/internal/service/events"
+	repositoryservice "github.com/flightctl/flightctl/internal/service/repository"
 	"github.com/flightctl/flightctl/internal/store/selector"
 	"github.com/flightctl/flightctl/internal/util/validation"
 	"github.com/flightctl/flightctl/internal/worker_client"
@@ -69,10 +69,10 @@ type ImageBuildService interface {
 // imageBuildService is the concrete implementation of ImageBuildService
 type imageBuildService struct {
 	store                 store.ImageBuildStore
-	repositoryStore       mainstore.Repository
+	repositories          repositoryservice.Service
 	imageExportService    ImageExportService
 	imagePromotionService ImagePromotionService
-	eventHandler          *internalservice.EventHandler
+	eventSvc              events.Service
 	queueProducer         queues.QueueProducer
 	kvStore               kvstore.KVStore
 	cfg                   *config.ImageBuilderServiceConfig
@@ -80,13 +80,13 @@ type imageBuildService struct {
 }
 
 // NewImageBuildService creates a new ImageBuildService
-func NewImageBuildService(s store.ImageBuildStore, repositoryStore mainstore.Repository, imageExportService ImageExportService, imagePromotionService ImagePromotionService, eventHandler *internalservice.EventHandler, queueProducer queues.QueueProducer, kvStore kvstore.KVStore, cfg *config.ImageBuilderServiceConfig, log logrus.FieldLogger) ImageBuildService {
+func NewImageBuildService(s store.ImageBuildStore, repositories repositoryservice.Service, imageExportService ImageExportService, imagePromotionService ImagePromotionService, eventSvc events.Service, queueProducer queues.QueueProducer, kvStore kvstore.KVStore, cfg *config.ImageBuilderServiceConfig, log logrus.FieldLogger) ImageBuildService {
 	return &imageBuildService{
 		store:                 s,
-		repositoryStore:       repositoryStore,
+		repositories:          repositories,
 		imageExportService:    imageExportService,
 		imagePromotionService: imagePromotionService,
-		eventHandler:          eventHandler,
+		eventSvc:              eventSvc,
 		queueProducer:         queueProducer,
 		kvStore:               kvStore,
 		cfg:                   cfg,
@@ -126,10 +126,10 @@ func (s *imageBuildService) Create(ctx context.Context, orgId uuid.UUID, imageBu
 	}
 	// Create event separately (no transaction)
 	var event *coredomain.Event
-	if result != nil && s.eventHandler != nil {
+	if result != nil && s.eventSvc != nil {
 		event = common.GetResourceCreatedOrUpdatedSuccessEvent(ctx, true, coredomain.ResourceKind(string(domain.ResourceKindImageBuild)), lo.FromPtr(result.Metadata.Name), nil, s.log, nil)
 		if event != nil {
-			s.eventHandler.CreateEvent(ctx, orgId, event)
+			s.eventSvc.CreateEvent(ctx, orgId, event)
 		}
 	}
 
@@ -464,8 +464,8 @@ func (s *imageBuildService) UpdateStatus(ctx context.Context, orgId uuid.UUID, i
 	)
 
 	// Publish a core event for audit/observability.
-	if s.eventHandler != nil {
-		s.eventHandler.CreateEvent(ctx, orgId, event)
+	if s.eventSvc != nil {
+		s.eventSvc.CreateEvent(ctx, orgId, event)
 	}
 
 	// Enqueue a worker event for terminal states that require downstream action:
@@ -605,7 +605,8 @@ func (s *imageBuildService) validate(ctx context.Context, orgId uuid.UUID, image
 		errs = append(errs, errors.New("spec.source.repository is required"))
 	} else {
 		// Validate source repository exists and is OCI type
-		repo, err := s.repositoryStore.Get(ctx, orgId, imageBuild.Spec.Source.Repository)
+		repo, status := s.repositories.GetRepository(ctx, orgId, imageBuild.Spec.Source.Repository)
+		err := statusToErr(status)
 		if errors.Is(err, flterrors.ErrResourceNotFound) {
 			errs = append(errs, fmt.Errorf("spec.source.repository: Repository %q not found", imageBuild.Spec.Source.Repository))
 		} else if err != nil {
@@ -617,6 +618,12 @@ func (s *imageBuildService) validate(ctx context.Context, orgId uuid.UUID, image
 			}
 			if specType != string(domain.RepoSpecTypeOci) {
 				errs = append(errs, fmt.Errorf("spec.source.repository: Repository %q must be of type 'oci', got %q", imageBuild.Spec.Source.Repository, specType))
+			} else {
+				ociSpec, err := repo.Spec.AsOciRepoSpec()
+				if err != nil {
+					return nil, fmt.Errorf("failed to get source repository OCI spec: %w", err)
+				}
+				errs = append(errs, ValidateImageSourceOciSpec(&ociSpec, "spec.source.repository")...)
 			}
 		}
 	}
@@ -627,7 +634,8 @@ func (s *imageBuildService) validate(ctx context.Context, orgId uuid.UUID, image
 		errs = append(errs, errors.New("spec.destination.repository is required"))
 	} else {
 		// Validate destination repository exists, is OCI type, and has ReadWrite access
-		repo, err := s.repositoryStore.Get(ctx, orgId, imageBuild.Spec.Destination.Repository)
+		repo, status := s.repositories.GetRepository(ctx, orgId, imageBuild.Spec.Destination.Repository)
+		err := statusToErr(status)
 		if errors.Is(err, flterrors.ErrResourceNotFound) {
 			errs = append(errs, fmt.Errorf("spec.destination.repository: Repository %q not found", imageBuild.Spec.Destination.Repository))
 		} else if err != nil {
@@ -648,6 +656,7 @@ func (s *imageBuildService) validate(ctx context.Context, orgId uuid.UUID, image
 				if accessMode != domain.ReadWrite {
 					errs = append(errs, fmt.Errorf("spec.destination.repository: Repository %q must have 'ReadWrite' access mode, got %q", imageBuild.Spec.Destination.Repository, accessMode))
 				}
+				errs = append(errs, ValidateImageDestOciSpec(&ociSpec, imageBuild.Spec.Destination.ImageName, "spec.destination.repository")...)
 			}
 		}
 	}

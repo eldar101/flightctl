@@ -22,7 +22,20 @@ import (
 	"github.com/flightctl/flightctl/internal/healthchecker"
 	"github.com/flightctl/flightctl/internal/kvstore"
 	"github.com/flightctl/flightctl/internal/service"
-	"github.com/flightctl/flightctl/internal/store"
+	catalogservice "github.com/flightctl/flightctl/internal/service/catalog"
+	certificatesigningrequestservice "github.com/flightctl/flightctl/internal/service/certificatesigningrequest"
+	deviceservice "github.com/flightctl/flightctl/internal/service/device"
+	enrollmentrequestservice "github.com/flightctl/flightctl/internal/service/enrollmentrequest"
+	"github.com/flightctl/flightctl/internal/service/events"
+	organizationservice "github.com/flightctl/flightctl/internal/service/organization"
+	"github.com/flightctl/flightctl/internal/service/tpmcsr"
+	catalogstore "github.com/flightctl/flightctl/internal/store/catalog"
+	certificatesigningrequeststore "github.com/flightctl/flightctl/internal/store/certificatesigningrequest"
+	devicestore "github.com/flightctl/flightctl/internal/store/device"
+	enrollmentrequeststore "github.com/flightctl/flightctl/internal/store/enrollmentrequest"
+	eventstore "github.com/flightctl/flightctl/internal/store/event"
+	fleetstore "github.com/flightctl/flightctl/internal/store/fleet"
+	organizationstore "github.com/flightctl/flightctl/internal/store/organization"
 	agenttransportv1beta1 "github.com/flightctl/flightctl/internal/transport/agent/v1beta1"
 	"github.com/flightctl/flightctl/internal/worker_client"
 	"github.com/flightctl/flightctl/pkg/queues"
@@ -32,18 +45,23 @@ import (
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"google.golang.org/grpc"
+	"gorm.io/gorm"
 )
 
 type AgentServer struct {
 	log                      logrus.FieldLogger
 	cfg                      *config.Config
-	store                    store.Store
+	db                       *gorm.DB
 	ca                       *crypto.CAClient
 	listener                 net.Listener
 	queuesProvider           queues.Provider
 	tlsConfig                *tls.Config
 	agentGrpcServer          *AgentGrpcServer
-	serviceHandler           service.Service
+	deviceSvc                deviceservice.Service
+	enrollmentRequestSvc     enrollmentrequestservice.Service
+	csrSvc                   certificatesigningrequestservice.Service
+	catalogSvc               catalogservice.Service
+	organizationSvc          organizationservice.Service
 	kvStore                  kvstore.KVStore
 	identityMapper           *service.IdentityMapper
 	agentAuthMiddleware      *fcmiddleware.AgentAuthMiddleware
@@ -55,7 +73,7 @@ func New(
 	ctx context.Context,
 	log logrus.FieldLogger,
 	cfg *config.Config,
-	st store.Store,
+	db *gorm.DB,
 	ca *crypto.CAClient,
 	listener net.Listener,
 	queuesProvider queues.Provider,
@@ -64,7 +82,7 @@ func New(
 	s := &AgentServer{
 		log:            log,
 		cfg:            cfg,
-		store:          st,
+		db:             db,
 		ca:             ca,
 		listener:       listener,
 		queuesProvider: queuesProvider,
@@ -83,9 +101,15 @@ func New(
 func (s *AgentServer) init(ctx context.Context) error {
 	s.log.Println("Initializing Agent-side API server")
 
-	healthchecker.HealthChecks.Initialize(ctx, s.store, s.log)
-	publisher, err := worker_client.QueuePublisher(ctx, s.queuesProvider)
+	deviceStore := devicestore.NewDeviceStore(s.db, s.log.WithField("pkg", "device-store"))
+	fleetStore := fleetstore.NewFleetStore(s.db, s.log.WithField("pkg", "fleet-store"))
+	enrollmentRequestStore := enrollmentrequeststore.NewEnrollmentRequestStore(s.db, s.log.WithField("pkg", "enrollmentrequest-store"))
+	csrStore := certificatesigningrequeststore.NewCertificateSigningRequestStore(s.db, s.log.WithField("pkg", "csr-store"))
+	eventStore := eventstore.NewEventStore(s.db, s.log.WithField("pkg", "event-store"))
+	catalogStore := catalogstore.NewCatalogStore(s.db, s.log.WithField("pkg", "catalog-store"))
+	organizationStore := organizationstore.NewOrganizationStore(s.db)
 
+	publisher, err := worker_client.QueuePublisher(ctx, s.queuesProvider)
 	if err != nil {
 		return err
 	}
@@ -95,11 +119,21 @@ func (s *AgentServer) init(ctx context.Context) error {
 	}
 	workerClient := worker_client.NewWorkerClient(publisher, s.log)
 
-	// Agent does not expose vulnerability features; keep disabled for agent-facing endpoints.
-	s.serviceHandler = service.WrapWithTracing(
-		service.NewServiceHandler(s.store, workerClient, s.kvStore, s.ca, s.log, s.cfg.Service.AgentEndpointAddress, s.cfg.Service.BaseUIUrl, s.cfg.Service.TPMCAPaths, false))
+	eventsSvc := events.NewServiceHandler(eventStore, workerClient, s.log)
 
-	s.agentGrpcServer = NewAgentGrpcServer(s.log, s.cfg, s.serviceHandler)
+	s.deviceSvc = deviceservice.WrapWithTracing(
+		deviceservice.NewDeviceServiceHandler(deviceStore, nil, fleetStore, eventsSvc, s.kvStore, s.cfg.Service.AgentEndpointAddress, s.log))
+	healthchecker.HealthChecks.Initialize(ctx, s.deviceSvc, s.log)
+	s.enrollmentRequestSvc = enrollmentrequestservice.WrapWithTracing(
+		enrollmentrequestservice.NewServiceHandler(enrollmentRequestStore, deviceStore, csrStore, s.ca, s.kvStore, eventsSvc, s.log, s.cfg.Service.TPMCAPaths, s.cfg.Service.AgentEndpointAddress, s.cfg.Service.BaseUIUrl))
+	s.csrSvc = certificatesigningrequestservice.WrapWithTracing(
+		certificatesigningrequestservice.NewServiceHandler(csrStore, tpmcsr.NewVerifier(s.enrollmentRequestSvc), s.ca, eventsSvc, s.log, s.cfg.Service.AgentEndpointAddress, s.cfg.Service.BaseUIUrl))
+	s.catalogSvc = catalogservice.WrapWithTracing(
+		catalogservice.NewServiceHandler(catalogStore, deviceStore, fleetStore, eventsSvc, s.log))
+	s.organizationSvc = organizationservice.WrapWithTracing(
+		organizationservice.NewServiceHandler(organizationStore))
+
+	s.agentGrpcServer = NewAgentGrpcServer(s.log, s.cfg, s.enrollmentRequestSvc)
 	return nil
 }
 
@@ -136,7 +170,7 @@ func (s *AgentServer) GetGRPCServer() *AgentGrpcServer {
 func (s *AgentServer) Run(ctx context.Context) error {
 	s.log.Println("Starting Agent-side API server")
 
-	httpAPIHandler, err := s.prepareHTTPHandler(ctx, s.serviceHandler)
+	httpAPIHandler, err := s.prepareHTTPHandler(ctx)
 	if err != nil {
 		return err
 	}
@@ -217,7 +251,7 @@ func isEnrollmentRequest(r *http.Request) bool {
 	return false
 }
 
-func (s *AgentServer) prepareHTTPHandler(ctx context.Context, serviceHandler service.Service) (http.Handler, error) {
+func (s *AgentServer) prepareHTTPHandler(ctx context.Context) (http.Handler, error) {
 	// Create agent authentication middleware for device operations
 	s.agentAuthMiddleware = fcmiddleware.NewAgentAuthMiddleware(s.ca, s.log)
 	go s.agentAuthMiddleware.Start()
@@ -227,8 +261,8 @@ func (s *AgentServer) prepareHTTPHandler(ctx context.Context, serviceHandler ser
 	go s.enrollmentAuthMiddleware.Start()
 
 	// Create identity mapping middleware (handles both user and agent identities)
-	orgProvisioner := service.NewOrgProvisioner(s.store, s.log)
-	s.identityMapper = service.NewIdentityMapper(s.store, orgProvisioner, s.log)
+	orgProvisioner := service.NewOrgProvisioner(s.catalogSvc, s.log)
+	s.identityMapper = service.NewIdentityMapper(s.organizationSvc, orgProvisioner, s.log)
 	s.identityMapper.Start()
 	identityMappingMiddleware := fcmiddleware.NewIdentityMappingMiddleware(s.identityMapper, s.log)
 
@@ -292,8 +326,7 @@ func (s *AgentServer) prepareHTTPHandler(ctx context.Context, serviceHandler ser
 	// Create versioning infrastructure
 	negotiator := versioning.NewNegotiator(versioning.V1Beta1, apimetaserver.MetadataResolver)
 
-	// Create handler for agent API
-	handlerV1Beta1 := agenttransportv1beta1.NewAgentTransportHandler(serviceHandler, convertv1beta1.NewConverter(), s.ca, s.log)
+	handlerV1Beta1 := agenttransportv1beta1.NewAgentTransportHandler(s.deviceSvc, s.enrollmentRequestSvc, s.csrSvc, convertv1beta1.NewConverter(), s.ca, s.log)
 
 	// Create version-specific router with OpenAPI validation
 	agentV1Beta1Swagger, err := agentv1beta1.GetSwagger()

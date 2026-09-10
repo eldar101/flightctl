@@ -102,9 +102,14 @@ func newHelmProvider(
 		return nil, fmt.Errorf("getting helm application: %w", err)
 	}
 
+	imageSpec, err := helmApp.AsImageApplicationProviderSpec()
+	if err != nil {
+		return nil, fmt.Errorf("getting helm image spec: %w", err)
+	}
+
 	appName := lo.FromPtr(helmApp.Name)
 	if appName == "" {
-		appName, err = helm.SanitizeReleaseName(helmApp.Image)
+		appName, err = helm.SanitizeReleaseName(imageSpec.Image)
 		if err != nil {
 			return nil, fmt.Errorf("creating release name: %w", err)
 		}
@@ -112,7 +117,7 @@ func newHelmProvider(
 
 	namespace := helm.AppNamespace(helmApp.Namespace, appName)
 
-	chartPath := clients.Helm().GetChartPath(helmApp.Image)
+	chartPath := clients.Helm().GetChartPath(imageSpec.Image)
 
 	volumeManager, err := NewVolumeManager(log, appName, v1beta1.AppTypeHelm, v1beta1.CurrentProcessUsername, nil)
 	if err != nil {
@@ -131,18 +136,21 @@ func newHelmProvider(
 		commandChecker: client.IsCommandAvailable,
 		namespace:      namespace,
 		spec: &ApplicationSpec{
-			Name:    appName,
-			ID:      fmt.Sprintf("%s_%s", namespace, appName),
-			AppType: v1beta1.AppTypeHelm,
-			Path:    chartPath,
-			HelmApp: &helmApp,
-			Volume:  volumeManager,
+			Name:              appName,
+			ID:                fmt.Sprintf("%s_%s", namespace, appName),
+			AppType:           v1beta1.AppTypeHelm,
+			Image:             imageSpec.Image,
+			Path:              chartPath,
+			HelmApp:           &helmApp,
+			Volume:            volumeManager,
+			DesiredState:      (*apiSpec).GetDesiredState(),
+			RestartGeneration: (*apiSpec).GetRestartGeneration(),
 		},
 	}, nil
 }
 
 func (p *helmProvider) chartRef() string {
-	return p.spec.HelmApp.Image
+	return p.spec.Image
 }
 
 func (p *helmProvider) values() map[string]interface{} {
@@ -182,7 +190,7 @@ func (p *helmProvider) Verify(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("validating application spec: %w", err)
 	}
-	if errs := v1beta1.ValidateHelmApplication(apiSpec, p.spec.Name, false); len(errs) > 0 {
+	if errs := v1beta1.ValidateHelmApplicationForAgent(apiSpec, p.spec.Name, false); len(errs) > 0 {
 		return fmt.Errorf("validating helm application: %w", errors.Join(errs...))
 	}
 
@@ -279,7 +287,7 @@ func (p *helmProvider) collectOCITargets(ctx context.Context, configProvider dep
 	var targets dependency.OCIPullTargetsByUser
 	targets = targets.Add(v1beta1.CurrentProcessUsername, dependency.OCIPullTarget{
 		Type:         dependency.OCITypeHelmChart,
-		Reference:    p.spec.HelmApp.Image,
+		Reference:    p.spec.Image,
 		PullPolicy:   v1beta1.PullIfNotPresent,
 		ClientOptsFn: helmPullOptions(configProvider),
 	})
