@@ -2,6 +2,32 @@
 
 Use the short checklist for normal tasks. Keep the full rules in this file and use only the relevant mini-template when needed.
 
+## Contents
+
+- [What to paste into chat vs. what to do yourself](#what-to-paste-into-chat-vs-what-to-do-yourself)
+- [Core routing and cost control](#core-routing-and-cost-control)
+  - [Daily checklist](#daily-checklist)
+  - [Model and effort selection](#model-and-effort-selection)
+  - [Compact task prompt](#compact-task-prompt)
+  - [Start-of-task commands](#start-of-task-commands)
+  - [RTK rules](#rtk-rules)
+  - [Ponytail rules](#ponytail-rules)
+- [FlightCtl implementation rules](#flightctl-implementation-rules)
+  - [E2E checklist](#e2e-checklist)
+  - [`ocp-edge-ci` checklist](#ocp-edge-ci-checklist)
+- [Task workflow templates](#task-workflow-templates)
+  - [Workflow 1: Verify an existing Jira bug](#workflow-1-verify-an-existing-jira-bug)
+  - [Workflow 2: Open a Jira bug](#workflow-2-open-a-jira-bug)
+  - [Workflow 3: Jira feature to automated tests to manual test cases](#workflow-3-jira-feature-to-automated-tests-to-manual-test-cases)
+  - [Workflow 4: Failed Jenkins, GitHub, or GitLab CI run](#workflow-4-failed-jenkins-github-or-gitlab-ci-run)
+  - [Workflow 5: Review another GitHub PR or GitLab MR](#workflow-5-review-another-github-pr-or-gitlab-mr)
+- [How to use the workflows](#how-to-use-the-workflows)
+  - [Responsibility summary](#responsibility-summary)
+- [Execution and handoff](#execution-and-handoff)
+  - [CLI rules](#cli-rules)
+  - [Cost-save trigger](#cost-save-trigger)
+  - [Final response template](#final-response-template)
+
 ## What to paste into chat vs. what to do yourself
 
 Use this table before every task.
@@ -29,7 +55,9 @@ Use this table before every task.
 
 Paste the problem and evidence. Codex reads the local repository and prepares the plan, commands, code, or comment. You run commands that require the real deployment or shared CI environment. Then paste the complete result back.
 
-## Daily checklist
+## Core routing and cost control
+
+### Daily checklist
 
 - Codex: local code, tests, Jenkins, `ocp-edge-ci`, Polarion, CLI, and UI.
 - Chai Bot: Jira, Slack, GitHub/GitLab research and cross-system lookup.
@@ -45,7 +73,7 @@ Paste the problem and evidence. Codex reads the local repository and prepares th
 - Do not make external changes without explicit authorization.
 - PR/MR review: use Workflow 5 and keep the checkout read-only.
 
-## Model and effort selection
+### Model and effort selection
 
 - Sol/high: architecture, unclear root cause, or risky cross-component design.
 - Terra/medium: normal implementation from a clear plan.
@@ -54,7 +82,7 @@ Paste the problem and evidence. Codex reads the local repository and prepares th
 - Ponytail `full`: finished-diff review.
 - Ponytail `off`: architecture, investigation, or delicate debugging.
 
-## Compact task prompt
+### Compact task prompt
 
 ```text
 Task: [one sentence]
@@ -76,7 +104,7 @@ Validate:
 [exact command]
 ```
 
-## Start-of-task commands
+### Start-of-task commands
 
 Run from `/Users/eweiss/flightctl`:
 
@@ -95,7 +123,7 @@ sed -n '1,240p' test/e2e/AGENTS.md
 sed -n '1,240p' test/e2e/GUIDELINES.md
 ```
 
-## RTK rules
+### RTK rules
 
 Use RTK for routine command output:
 
@@ -114,7 +142,7 @@ Use the normal command or `rtk proxy <command>` when output is truncated, exact 
 
 Do not treat condensed output as complete proof for difficult failures.
 
-## Ponytail rules
+### Ponytail rules
 
 Before writing code, ask:
 
@@ -132,7 +160,9 @@ After implementation:
 @ponytail-review
 ```
 
-## E2E checklist
+## FlightCtl implementation rules
+
+### E2E checklist
 
 - Read `test/AGENTS.md`, `test/e2e/AGENTS.md`, and the relevant guidelines.
 - Find the Jira and Polarion IDs.
@@ -173,7 +203,7 @@ DISCOVERY_PATH=/tmp/flightctl-e2e-discovery.json \
 test/scripts/run_e2e_tests.sh reports ./test/e2e/[suite]
 ```
 
-## `ocp-edge-ci` checklist
+### `ocp-edge-ci` checklist
 
 ```bash
 cd /Users/eweiss/flightctl/ocp-edge-ci
@@ -195,7 +225,7 @@ Before changing a profile:
 rg -n "flightctl_repo_branch|FLIGHTCTL_BACKEND_TAG|FLIGHTCTL_BACKEND_PREVIOUS_RELEASE_TAG|ocp-flightctl-gotests" ci-profiles-new
 ```
 
-## Full workflow templates
+## Task workflow templates
 
 Use only the workflow that matches the request. Do not paste this entire document into every prompt.
 
@@ -1064,7 +1094,9 @@ No strong net-new findings. I checked the live head, changed files, and existing
 
 Always paste only the matching workflow block and task-specific information.
 
-## CLI rules
+## Execution and handoff
+
+### CLI rules
 
 Use authenticated local tools for exact current state:
 
@@ -1079,7 +1111,7 @@ git show REF
 
 Do not create comments, labels, transitions, pushes, or other external changes unless explicitly requested.
 
-## Cost-save trigger
+### Cost-save trigger
 
 Switch away from Codex when logs exceed roughly 200 lines, the task requires many packages or the whole repository, the task spans multiple services, a new multi-file E2E suite is needed, large Helm/RPM/YAML/JSON/must-gather data is involved, the same context is being reread repeatedly, or the same operation is needed across many files or tickets.
 
@@ -1089,7 +1121,7 @@ Use this message:
 ⚠️ Cost-save: this is a high-context task. Switch to Gemini or Chai Bot for broad analysis. Return to Codex after the findings are narrowed to specific files and actions.
 ```
 
-## Final response template
+### Final response template
 
 ```text
 Completed:
