@@ -1,1152 +1,390 @@
 # FlightCtl AI Workflow Checklist
 
-Use the short checklist for normal tasks. Keep the full rules in this file and use only the relevant mini-template when needed.
+Choose one workflow. Paste only that workflow's data block into chat.
 
 ## Contents
 
-- [What to paste into chat vs. what to do yourself](#what-to-paste-into-chat-vs-what-to-do-yourself)
-- [Core routing and cost control](#core-routing-and-cost-control)
-  - [Daily checklist](#daily-checklist)
-  - [Model and effort selection](#model-and-effort-selection)
-  - [Compact task prompt](#compact-task-prompt)
-  - [Start-of-task commands](#start-of-task-commands)
-  - [RTK rules](#rtk-rules)
-  - [Ponytail rules](#ponytail-rules)
-- [FlightCtl implementation rules](#flightctl-implementation-rules)
-  - [E2E checklist](#e2e-checklist)
-  - [`ocp-edge-ci` checklist](#ocp-edge-ci-checklist)
-- [Task workflow templates](#task-workflow-templates)
-  - [Workflow 1: Verify an existing Jira bug](#workflow-1-verify-an-existing-jira-bug)
-  - [Workflow 2: Open a Jira bug](#workflow-2-open-a-jira-bug)
-  - [Workflow 3: Jira feature to automated tests to manual test cases](#workflow-3-jira-feature-to-automated-tests-to-manual-test-cases)
-  - [Workflow 4: Failed Jenkins, GitHub, or GitLab CI run](#workflow-4-failed-jenkins-github-or-gitlab-ci-run)
-  - [Workflow 5: Review another GitHub PR or GitLab MR](#workflow-5-review-another-github-pr-or-gitlab-mr)
-- [How to use the workflows](#how-to-use-the-workflows)
-  - [Responsibility summary](#responsibility-summary)
-- [Execution and handoff](#execution-and-handoff)
-  - [CLI rules](#cli-rules)
-  - [Cost-save trigger](#cost-save-trigger)
-  - [Final response template](#final-response-template)
+- [How to use this document](#how-to-use-this-document)
+- [Workflow 1: Verify a Jira bug](#workflow-1-verify-a-jira-bug)
+- [Workflow 2: Open a Jira bug](#workflow-2-open-a-jira-bug)
+- [Workflow 3: Feature to automated and manual tests](#workflow-3-feature-to-automated-and-manual-tests)
+- [Workflow 4: Fix failed CI](#workflow-4-fix-failed-ci)
+- [Workflow 5: Review a GitHub PR or GitLab MR](#workflow-5-review-a-github-pr-or-gitlab-mr)
+- [Common FlightCtl rules](#common-flightctl-rules)
 
-## What to paste into chat vs. what to do yourself
+## How to use this document
 
-Use this table before every task.
+1. Choose the workflow.
+2. Get only the data listed under "Get the data".
+3. Paste the workflow's "Paste this into chat" block.
+4. Codex inspects the local repository and prepares the plan, commands, code, or comment.
+5. You run commands that require the real deployment, VM, OCP cluster, Jenkins, or shared CI.
+6. Paste the complete result back.
+7. Approve all external Jira, GitHub, GitLab, push, comment, or transition actions.
 
-| Checklist section | Paste into chat | Do yourself | Why |
-|---|---|---|---|
-| Daily checklist | Only the relevant task type and goal | Nothing by default | These are standing rules; pasting all of them wastes context. |
-| Model and effort selection | Only if you want a specific model or effort level | Nothing by default | Codex can choose the smallest suitable level. |
-| Compact task prompt | Yes; fill in the task, files, rules, and validation | Nothing else unless stated | This gives Codex the exact scope. |
-| Start-of-task commands | Paste output only when Codex cannot access the repository or current state | Run commands when you want to provide current branch/build evidence | The commands are read-only, but output may be needed from your environment. |
-| RTK rules | Paste only filtered output or an error | Run noisy commands with `rtk`; use `rtk proxy` for exact output | RTK reduces command-output context. |
-| Ponytail rules | Do not paste the rules; use `@ponytail-review` when requested | Review or approve deletion/simplification suggestions | Ponytail is already installed as a tool rule. |
-| E2E checklist | Paste the feature workflow block, Jira details, and acceptance criteria | Run OCP/VM/deployment tests and return complete output | Those tests require your real environment and credentials. |
-| `ocp-edge-ci` checklist | Paste the issue/profile/job and desired change | Run remote CI, deployment, push, or approval actions | These actions can change shared CI state. |
-| Bug verification | Paste the full Jira bug, build, and environment | Run the generated verifier and paste its output back | Only your environment can prove the deployed behavior. |
-| Open Jira bug | Paste reproduction evidence and logs | Review and create the Jira issue | Creating an issue is an external write. |
-| Feature to tests | Paste the feature, subtickets, criteria, and Polarion IDs | Approve tests and run environment-specific validation | Codex can write code; you own final product/QE confirmation. |
-| Failed CI | Paste run URL/ID, SHA, failed job, and relevant log | Run CI/OCP-specific commands and approve pushes | Codex can diagnose locally; CI access and pushes affect shared systems. |
-| PR/MR review | Usually only paste the PR/MR URL and review mode | Decide whether to post findings | Codex can fetch live read-only data; posting comments is your decision. |
-| CLI rules | Paste command output only if Codex cannot run the CLI | Run or approve mutating CLI commands | Read-only lookup is safe; comments, transitions, pushes, and labels are external writes. |
-| Cost-save trigger | Paste only the matching workflow block | Switch to Gemini/Chai Bot when warned | The full checklist should remain a reference document. |
-| Final response template | Do not paste it at the start | Copy the completed result into Jira, Slack, or notes | It is a handoff format, not task context. |
+Do not paste this whole document into every chat.
 
-### Simple rule
+### Default routing
 
-Paste the problem and evidence. Codex reads the local repository and prepares the plan, commands, code, or comment. You run commands that require the real deployment or shared CI environment. Then paste the complete result back.
+- Codex/ChatGPT: local FlightCtl code, tests, CLI, Jenkinsfiles, ocp-edge-ci, Polarion, and UI.
+- Chai Bot: live Jira, Slack, GitHub/GitLab lookup, and cross-system research.
+- Gemini: very large logs, must-gathers, metrics, or broad multi-component analysis.
+- Claude/Opus: optional independent second opinion for high-risk design or review.
+- Scripts: repeated or bulk operations.
 
-## Core routing and cost control
+### Effort routing
 
-### Daily checklist
+- Sol/high or Claude/Opus: architecture, unclear root cause, or high-risk review.
+- Terra/medium: normal implementation, diagnosis, or review.
+- Luna/low: formatting, manual-test conversion, and repetitive work.
+- Ponytail lite: normal implementation.
+- Ponytail full: final diff or over-engineering review.
 
-- Codex: local code, tests, Jenkins, `ocp-edge-ci`, Polarion, CLI, and UI.
-- Chai Bot: Jira, Slack, GitHub/GitLab research and cross-system lookup.
-- Gemini: very large logs, must-gathers, metrics, or broad architecture.
-- Use `gh`, `glab`, Jira CLI, and `git` for exact current authenticated state.
-- Use RTK for compact shell output; use `rtk proxy <command>` when exact output is needed.
-- Use Ponytail `lite` for coding and `full` for completed-diff review.
-- Read the relevant `AGENTS.md` files before editing.
-- Search `test/harness` and `testutil` before adding helpers.
-- Preserve unrelated dirty-worktree changes.
-- Run targeted validation before broad validation.
-- Validate VM/OCP behavior on Linux or CI when macOS is not authoritative.
-- Do not make external changes without explicit authorization.
-- PR/MR review: use Workflow 5 and keep the checkout read-only.
+### Cost rule
 
-### Model and effort selection
+Switch to Gemini or Chai Bot when the task requires more than roughly 200 lines of logs, a whole repository, many packages, broad architecture, or repeated cross-system research. Return to Codex after the findings are reduced to specific files and actions.
 
-- Sol/high: architecture, unclear root cause, or risky cross-component design.
-- Terra/medium: normal implementation from a clear plan.
-- Luna/low: formatting, small edits, repetitive changes, or simple tests.
-- Ponytail `lite`: normal coding.
-- Ponytail `full`: finished-diff review.
-- Ponytail `off`: architecture, investigation, or delicate debugging.
+## Workflow 1: Verify a Jira bug
 
-### Compact task prompt
+### Purpose
 
-```text
-Task: [one sentence]
+Create a paste-ready verifier, run it against the real deployment, and produce a Jira verification comment.
 
-Repository/files: [exact path or paths]
-Jira: [ID or none]
-Polarion: [ID or unknown]
+### Get the data
 
-Do:
-1. [specific action]
-2. [specific action]
-
-Rules:
-- Preserve unrelated changes.
-- Reuse existing helpers and constants.
-- Do not make external changes without approval.
-
-Validate:
-[exact command]
-```
-
-### Start-of-task commands
-
-Run from `/Users/eweiss/flightctl`:
-
-```bash
-rtk git status
-rtk git branch --show-current
-rtk git log -1 --oneline
-```
-
-Read only the relevant instructions:
-
-```bash
-sed -n '1,240p' AGENTS.md
-sed -n '1,240p' test/AGENTS.md
-sed -n '1,240p' test/e2e/AGENTS.md
-sed -n '1,240p' test/e2e/GUIDELINES.md
-```
-
-### RTK rules
-
-Use RTK for routine command output:
-
-```bash
-rtk git status
-rtk git diff
-rtk rg "pattern" path
-rtk go test ./path/...
-rtk gh pr view NUMBER
-rtk gh run view RUN_ID
-rtk oc get pods
-rtk oc logs POD
-```
-
-Use the normal command or `rtk proxy <command>` when output is truncated, exact logs are required, CI or release evidence is being collected, or output and exit status disagree.
-
-Do not treat condensed output as complete proof for difficult failures.
-
-### Ponytail rules
-
-Before writing code, ask:
-
-- Does this already exist?
-- Can I reuse a harness, utility, constant, or dependency?
-- Can the standard library or native platform handle it?
-- Is this abstraction or helper necessary?
-- What is the smallest correct diff?
-
-Never remove required validation, diagnostics, cleanup, security, accessibility, labels, or coverage.
-
-After implementation:
-
-```text
-@ponytail-review
-```
-
-## FlightCtl implementation rules
-
-### E2E checklist
-
-- Read `test/AGENTS.md`, `test/e2e/AGENTS.md`, and the relevant guidelines.
-- Find the Jira and Polarion IDs.
-- Add the Polarion label to every `It`.
-- Add `sanity` only if total upstream E2E time remains below 40 minutes.
-- Add `Agent` only when the test runs on both cs9 and cs10.
-- Search `test/harness` and `testutil` before creating helpers.
-- Put constants and variables above tests.
-- Put helper functions at the bottom.
-- Reuse timeout constants.
-- Use one harness call in `BeforeEach`.
-- Keep `Expect` inside tests, not helpers.
-- Do not create inline helper functions.
-- Test successful output such as `200 OK` or `201 Created`.
-- Add logging and nil/empty/error handling.
-- Test OCP when the feature is expected to work on OCP.
-- Use the existing VM-pool pattern for VM tests.
-- Keep raw Kubernetes clients and commands inside the approved infrastructure layer.
-
-### E2E search commands
-
-```bash
-rg -n "func |Create|WaitFor|RunGet|ManageResource|CleanUp|Harness" test/harness testutil test/e2e
-rg -n "Label\\(|sanity|Agent|200 OK|201 Created" test/e2e
-rg -n "time\\.Second|BeforeEach|BeforeSuite" test/e2e/[suite]
-```
-
-### E2E validation commands
-
-```bash
-go test ./test/e2e/[suite] -run '^$'
-git diff --check
-```
-
-```bash
-DISCOVERY_ONLY=true \
-DISCOVERY_PATH=/tmp/flightctl-e2e-discovery.json \
-test/scripts/run_e2e_tests.sh reports ./test/e2e/[suite]
-```
-
-### `ocp-edge-ci` checklist
-
-```bash
-cd /Users/eweiss/flightctl/ocp-edge-ci
-rtk git status
-rtk git fetch upstream
-rtk git log -1 --oneline
-```
-
-Before changing a profile:
-
-- Classify it as latest/main or fixed-release.
-- Confirm the backend tag.
-- Confirm `flightctl_repo_branch`.
-- Confirm that fixed releases use the matching release tag and repository ref.
-- Check OCP, ACM, FIPS, Quadlet, disconnected, upgrade, and database variants.
-- Verify the failing CI run SHA matches the current branch or PR head.
-
-```bash
-rg -n "flightctl_repo_branch|FLIGHTCTL_BACKEND_TAG|FLIGHTCTL_BACKEND_PREVIOUS_RELEASE_TAG|ocp-flightctl-gotests" ci-profiles-new
-```
-
-## Task workflow templates
-
-Use only the workflow that matches the request. Do not paste this entire document into every prompt.
-
-### Workflow 1: Verify an existing Jira bug
-
-#### Best routing
-
-- Jira history or current comments: Chai Bot or Jira CLI.
-- Local code, deployment, CLI, or test verification: Codex, Terra/medium.
-- Large logs or must-gather data: Gemini first, then Codex for the exact verifier.
-- Shell output: RTK; use `rtk proxy` for exact evidence.
-- Use Ponytail `lite` only to keep the verifier minimal; do not remove diagnostic checks.
-
-#### Send this request
-
-```text
-Verify Jira bug [BUG-ID].
-
-I am providing the complete Jira issue and comments below.
-
-Do not fix the bug yet.
-First determine:
-1. What behavior is broken.
-2. What behavior proves the bug is fixed.
-3. Which FlightCtl component is involved.
-4. Which exact build, image, tag, or commit must be recorded.
-5. Which environment is required: kind, OCP, Quadlet, VM, or other.
-
-Search the local repository and existing harness/testutil helpers before inventing commands.
-Return:
-1. A short verification plan.
-2. One complete paste-ready shell block with no unresolved placeholders.
-3. The exact expected PASS evidence.
-4. A Jira verification comment after the block.
-
-Jira issue and comments:
-[PASTE THE COMPLETE JIRA ISSUE HERE]
-```
-
-#### Required verification pasteblock format
-
-The assistant must replace every bracketed value before returning the block.
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-BUG_ID="[BUG-ID]"
-BUILD="[EXACT FLIGHTCTL BUILD, TAG, IMAGE, OR COMMIT]"
-ENVIRONMENT="[OCP/KIND/QUADLET/VM]"
-
-echo "BUG: ${BUG_ID}"
-echo "BUILD: ${BUILD}"
-echo "ENVIRONMENT: ${ENVIRONMENT}"
-
-echo "--- build proof ---"
-[EXACT COMMAND THAT PROVES THE DEPLOYED BUILD]
-
-echo "--- preconditions ---"
-[EXACT COMMANDS THAT PROVE REQUIRED SERVICES, DEVICES, OR RESOURCES]
-
-echo "--- reproduce or verify ---"
-[EXACT COMMANDS THAT EXERCISE THE BUG OR FIX]
-
-echo "--- positive result ---"
-[EXACT COMMAND THAT PROVES THE EXPECTED SUCCESSFUL RESULT]
-
-echo "PASS: ${BUG_ID} verified on ${BUILD} in ${ENVIRONMENT}"
-```
-
-Do not return a generic block containing `[EXACT COMMAND]`. If the command cannot be determined, stop and ask for the missing environment or build information.
-
-#### Jira verification comment
-
-```markdown
-Verified [BUG-ID] on FlightCtl build [EXACT BUILD/TAG/IMAGE/COMMIT].
-
-Environment: [OCP/KIND/QUADLET/VM and version]
-Date: [YYYY-MM-DD]
-
-Verification steps:
-1. [Short step]
-2. [Short step]
-3. [Short step]
-
-Build evidence:
-- [Exact command or deployment/image evidence]
-
-Observed result:
-- [What was observed]
-
-Expected result:
-- [What should happen]
-
-Result: PASS — [one-sentence conclusion]
-```
-
-### Workflow 2: Open a Jira bug
-
-#### Best routing
-
-- Use the supplied evidence and local CLI/repository facts.
-- Use Chai Bot or Jira CLI only to check for duplicates or attach current issue context.
-- Do not create the Jira issue until the user reviews the draft.
-- No expensive model is needed unless the evidence is large or unclear.
-
-#### Send this request
-
-```text
-Draft a Jira bug from the information below.
-
-Do not create the Jira issue.
-Return only:
-1. Missing information I must provide.
-2. A Jira-ready description using the exact format below.
-3. A short suggested title.
-
-Use simple factual language. Separate observed results from expected results.
-Include the exact FlightCtl build, environment, CLI commands, and frequency when known.
-
-Evidence:
-[PASTE LOGS, STEPS, BUILD, ENVIRONMENT, AND OBSERVED RESULT HERE]
-```
-
-#### Jira-ready bug template
-
-```markdown
-#### Description of the problem:
-
-[Describe the broken behavior, affected component, FlightCtl build, and environment.]
-
-#### How reproducible:
-
-[Always / Often / Intermittent / Once]
-
-Reproduced: [number] out of [number] attempts.
-
-&nbsp;Steps to reproduce:
-
-1. [Describe the action.]  
-   Command: `[exact command]`
-2. [Describe the action.]  
-   Command: `[exact command]`
-3. [Describe the action.]  
-   Command: `[exact command]`
-
-&nbsp;Actual results:
-
-[What actually happened. Include exact error text or output.]
-
-&nbsp;Expected results:
-
-[What should have happened.]
-```
-
-Before posting, check:
-
-- Title identifies the component and failure.
-- Build and environment are included.
-- Steps are executable by another person.
-- Actual and expected results are not mixed.
-- Logs are short and relevant.
-- No credentials or tokens are included.
-
-### Workflow 3: Jira feature to automated tests to manual test cases
-
-#### Best routing
-
-- Jira parent, subtickets, comments, and links: Chai Bot or Jira CLI.
-- Local FlightCtl implementation and test patterns: Codex, Terra/medium.
-- Ambiguous architecture or many components: Sol/high or Gemini first.
-- Test implementation: Ponytail `lite`; final diff review: Ponytail `full`.
-- Use RTK for searches and test output; use `rtk proxy` for exact failures.
-
-#### Send this request
-
-```text
-Implement E2E coverage for feature [FEATURE-ID].
-
-Jira parent:
-[PASTE OR IDENTIFY PARENT ISSUE]
-
-Subtickets:
-[PASTE OR IDENTIFY SUBTICKETS]
-
-Do this in order:
-1. Learn the feature from the Jira parent, subtickets, comments, and links.
-2. Inspect the local FlightCtl implementation and existing test patterns.
-3. Build a requirement-to-test matrix.
-4. Decide whether to extend an existing suite or create a new suite.
-5. Search test/harness and testutil before creating helpers.
-6. Implement the automated tests.
-7. Validate the tests and report exact commands and results.
-8. After I approve the automated tests, translate every test case into a manual test case.
-
-Required E2E rules:
-- Find the Polarion ID for every It.
-- Add sanity only after checking the under-40-minute E2E budget.
-- Add Agent only when both cs9 and cs10 must run the test.
-- Constants and variables above tests.
-- Helpers at the bottom.
-- One harness call in BeforeEach.
-- No Expect inside helpers.
-- No inline helper functions.
-- Test positive output and errors.
-- Add logging, cleanup, and nil/empty/error handling.
-- Test OCP when required.
-```
-
-#### Requirement-to-test matrix
-
-Return this before coding:
-
-```markdown
-| Requirement | Automated scenario | Suite | Environment | Labels | Expected positive result |
-|---|---|---|---|---|---|
-| [Requirement] | [When ... it should ...] | [path] | [kind/OCP/etc.] | [Polarion, sanity, Agent] | [exact result] |
-```
-
-#### Automated-test completion report
-
-```text
-Automated tests completed.
-
-Changed files:
-- [path]
-
-Test cases:
-- [Polarion ID] — [short behavior]
-
-Validation:
-- [command] — PASS/FAIL
-- [command] — PASS/FAIL
-
-Environment limitation:
-- [None, or explain why Linux/OCP CI is required]
-
-Manual test cases are ready to generate after approval.
-```
-
-#### Manual test case template
-
-Create one case for each automated `It`:
-
-```markdown
-### [POLARION-ID] — [Test case title]
-
-#### Description of test case
-
-[What behavior this test verifies and why it matters.]
-
-#### Preconditions
-
-- FlightCtl build: [exact build]
-- Environment: [OCP/KIND/QUADLET/VM]
-- User/device/fleet state: [required state]
-- Login or credentials: [safe description; never include secrets]
-
-#### Steps
-
-1. **[Step description]**
-
-   CLI command:
-
-   ```bash
-   [exact command]
-   ```
-
-   Expected output:
-
-   ```text
-   [exact expected output, status, or observable result]
-   ```
-
-2. **[Step description]**
-
-   CLI command:
-
-   ```bash
-   [exact command]
-   ```
-
-   Expected output:
-
-   ```text
-   [exact expected output, status, or observable result]
-   ```
-
-#### Final expected result
-
-[One clear statement of the final successful behavior.]
-```
-
-Every manual step must contain a description, a runnable CLI command, and expected output. Do not write vague instructions such as “check that it works.”
-
-### Workflow 4: Failed Jenkins or GitHub CI run
-
-#### Best routing
-
-- GitHub CI: use `gh` for run metadata, failed logs, checks, and commit SHA.
-- GitLab CI: use `glab` for pipeline, job, trace, and artifact data.
-- Jenkins: use the supplied log or Jenkins UI; use Codex for Jenkinsfiles and `ocp-edge-ci` profiles.
-- Large logs: Gemini first for compression and event timeline.
-- Exact source fix: Codex, Terra/medium; Sol/high for cross-component root cause.
-- Use Ponytail `full` only after the root cause is understood.
-
-#### Send this request
-
-```text
-Diagnose and fix this failed CI run.
-
-Provider: [Jenkins/GitHub/GitLab]
-Run URL or ID: [URL/ID]
-Repository: [repository]
-Branch or PR/MR: [branch and number]
-Expected head SHA: [SHA if known]
-
-Do this in order:
-1. Verify the run belongs to the current branch or PR/MR head.
-2. Identify the first real failure and the terminal failed stage.
-3. Ignore later cascading failures unless they reveal a second root cause.
-4. Inspect the relevant source, test, workflow, Jenkinsfile, or ci-profile.
-5. Search callers and related implementations before editing.
-6. Fix the smallest root cause, not only the visible symptom.
-7. Run the narrowest regression test.
-8. Report the exact fix, validation, and any CI-only limitation.
-
-CI log or failure:
-[PASTE LOG OR PROVIDE URL/ID]
-```
-
-#### CI commands
-
-GitHub:
-
-```bash
-gh run view RUN_ID --json headSha,status,conclusion,workflowName,url
-gh run view RUN_ID --log-failed
-gh pr checks PR_NUMBER
-```
-
-GitLab:
-
-```bash
-glab ci status
-glab ci view PIPELINE_ID
-glab ci trace JOB_ID
-```
-
-Repository search:
-
-```bash
-rtk rg "FAILED|FAILURE|error|timeout|panic" path/to/relevant/files
-rtk git log -20 --oneline
-rtk git diff BASE...HEAD
-```
-
-Use `rtk proxy` for the full failed log when the compact output is insufficient.
-
-#### CI diagnosis report
-
-```markdown
-CI diagnosis: [PASS / FIXED / BLOCKED]
-
-Run:
-- Provider: [Jenkins/GitHub/GitLab]
-- URL/ID: [value]
-- Head SHA: [value]
-- Current expected SHA: [value]
-
-First real failure:
-- Stage/job: [value]
-- Test or command: [value]
-- Evidence: [short exact error]
-
-Root cause:
-[Plain-English explanation of why it failed.]
-
-Fix:
-- File: [path]
-- Change: [what changed]
-
-Validation:
-- [command] — PASS/FAIL
-- [command] — PASS/FAIL
-
-Remaining limitation:
-[None, or exact CI/environment limitation.]
-```
-
-### Workflow 5: Review another GitHub PR or GitLab MR
-
-#### Best routing
-
-- GitHub: use `gh` for the live PR, head SHA, checks, and review comments.
-- GitLab: use `glab` for the live MR, head SHA, pipelines, and discussions.
-- Local source and product-path understanding: Codex, Terra/medium.
-- Broad multi-component review: Sol/high or Gemini first, then Codex for findings.
-- Use RTK for routine metadata and searches; use `rtk proxy` for exact logs or API responses.
-- Use Ponytail `full` only as a final over-engineering check after correctness review.
-
-#### Send this request
-
-```text
-Review this FlightCtl PR/MR. Be strict but concise.
-
-Target:
-[PASTE THE GITHUB PR OR GITLAB MR URL]
-
-Review rules:
-- Keep the checkout read-only. Do not modify files.
-- Fetch the live PR/MR head and refresh the base branch first.
-- Confirm the fetched ref matches the current remote head SHA.
-- Inspect changed files from the fetched ref with numbered lines, not a stale local checkout.
-- Query existing review comments and discussions before commenting.
-- Do not repeat CodeRabbit, reviewer, or already-addressed findings.
-- Return only net-new actionable findings.
-
-Before commenting, build a short mental model:
-1. What FlightCtl feature is changing?
-2. Is it API, agent, service/store, CLI, deploy/Helm, test harness, or E2E?
-3. What user, device, or operator workflow does it affect?
-4. What is the normal happy path?
-5. What state is persisted, reconciled, cleaned up, or reported?
-6. What existing tests cover the same area?
-7. What existing helpers or patterns should this change reuse?
-
-Read the nearest context:
-- Root AGENTS.md.
-- Area AGENTS.md, if present.
-- Relevant docs under docs/.
-- Existing tests in the same package or suite.
-- Existing helpers in test/harness, test/util, and internal helpers.
-- API/OpenAPI/types when user-visible contracts are affected.
-- Callers and cleanup paths, not only the modified function.
-
-Do not comment until you can explain:
-- What the PR/MR is trying to prove or fix.
-- How the changed code is reached.
-- What would break in production, CI, upgrade, or E2E if it is wrong.
-- Whether the risk is introduced by this PR/MR or pre-existing.
-- Whether an existing thread already covers it.
-
-Prefer findings about:
-- Broken reconciliation or state transitions.
-- API/schema/backward-compatibility problems.
-- Missing cleanup or leaked resources.
-- Incorrect labels, selectors, or test IDs.
-- E2E assertions that only check no error.
-- Helpers with hidden Expect/failures.
-- Racy waits, unbounded retries, or sleeps.
-- Secret or sensitive-log exposure.
-- OCP/Linux-only assumptions without required validation.
-- CI jobs that appear green but did not run the focused test.
-
-Avoid:
-- Style-only comments.
-- Alternative designs without a concrete bug.
-- Large refactors.
-- Pre-existing unrelated issues.
-- Findings already covered by CodeRabbit or another reviewer.
-- Findings that need a long essay to justify.
-
-FlightCtl rules:
-- Prefer existing patterns.
-- Do not use Expect inside helper functions.
-- Put constants near the top and helpers at the bottom.
-- Avoid inline helper functions inside tests.
-- If checking only no error, also assert positive output or state.
-- Harden helpers for nil, empty, error, and useful logging cases.
-
-Output exactly one of these formats:
-
-If strong findings exist:
-path/to/file.go:123 - Short human review comment explaining the concrete risk and requested fix.
-
-If no strong findings exist:
-No strong net-new findings. I checked the live head, changed files, and existing review threads.
-```
-
-#### GitHub read-only commands
-
-```bash
-gh pr view PR_NUMBER --repo flightctl/flightctl \
-  --json number,title,state,baseRefName,headRefName,headRefOid,mergeCommit,statusCheckRollup,url
-
-gh api repos/flightctl/flightctl/pulls/PR_NUMBER/comments --paginate
-gh api repos/flightctl/flightctl/pulls/PR_NUMBER/reviews --paginate
-gh pr checks PR_NUMBER --repo flightctl/flightctl
-
-git fetch upstream main:refs/remotes/upstream/main
-git fetch upstream +pull/PR_NUMBER/head:refs/remotes/upstream/pr-PR_NUMBER
-git rev-parse refs/remotes/upstream/pr-PR_NUMBER
-git diff --stat refs/remotes/upstream/main...refs/remotes/upstream/pr-PR_NUMBER
-git diff --unified=80 refs/remotes/upstream/main...refs/remotes/upstream/pr-PR_NUMBER
-```
-
-Before reviewing, confirm that the SHA printed by `git rev-parse` equals the live `headRefOid` from `gh pr view`.
-
-#### GitLab read-only commands
-
-```bash
-glab mr view MR_NUMBER --repo GROUP/REPO
-glab api projects/URL_ENCODED_PROJECT/merge_requests/MR_NUMBER/discussions --paginate
-glab api projects/URL_ENCODED_PROJECT/merge_requests/MR_NUMBER/notes --paginate
-glab ci status
-
-git fetch upstream main:refs/remotes/upstream/main
-git fetch upstream +refs/merge-requests/MR_NUMBER/head:refs/remotes/upstream/mr-MR_NUMBER
-git rev-parse refs/remotes/upstream/mr-MR_NUMBER
-git diff --stat refs/remotes/upstream/main...refs/remotes/upstream/mr-MR_NUMBER
-git diff --unified=80 refs/remotes/upstream/main...refs/remotes/upstream/mr-MR_NUMBER
-```
-
-If the GitLab project uses a different MR ref, obtain the live source SHA from `glab mr view` and fetch that exact SHA into `refs/remotes/upstream/mr-MR_NUMBER`.
-
-#### Review procedure
-
-1. Confirm the repository, PR/MR number, base branch, live head SHA, and checkout status.
-2. Refresh the base branch and fetch the live head ref.
-3. Read project and area instructions.
-4. Read the PR/MR description, changed-file list, commits, checks, and existing threads.
-5. Build the product-path mental model before judging individual lines.
-6. Read surrounding callers, cleanup paths, tests, helpers, and API types.
-7. Check each candidate finding against current code logic.
-8. Discard findings that are speculative, pre-existing, duplicate, stylistic, or difficult to explain.
-9. Verify every final path and line anchor in the fetched head ref.
-10. Return only paste-ready findings.
-
-#### Finding validation checklist
-
-For every finding, confirm:
-
-- It reproduces from current code logic, not guessing.
-- It is introduced or made worse by this PR/MR.
-- It has a concrete production, CI, upgrade, or E2E failure mode.
-- The author can apply a clear fix.
-- The file and line exist in the live fetched ref.
-- No existing review thread already covers it.
-
-#### Final review output
-
-```text
-path/to/file.go:123 - [Concrete risk]. [Explain the failure scenario and request the specific fix.]
-```
-
-If there are no strong findings, return exactly:
-
-```text
-No strong net-new findings. I checked the live head, changed files, and existing review threads.
-```
-
-## How to use the workflows
-
-Do not paste this entire document into every chat. Paste only one workflow block and the information requested by that workflow.
-
-### 1. Verify an existing Jira bug
-
-#### You collect before starting
-
-- Complete Jira description and comments.
+- Jira bug description and comments.
 - Bug ID.
 - Exact FlightCtl build, tag, image, or commit.
 - Environment: OCP, kind, Quadlet, VM, or other.
-- Namespace or deployment details.
-- Relevant logs or previous verification attempts.
+- Namespace/deployment details.
+- Relevant previous logs.
 
-Never paste passwords, tokens, certificates, or customer-sensitive data.
+If the full Jira text is already available, do not look it up again. Otherwise run:
 
-#### Paste this into chat
+    jira issue view BUG-ID
 
-```text
-WORKFLOW: VERIFY JIRA BUG
+Use RTK for normal logs and rtk proxy for exact output. Never paste secrets or customer-specific data.
 
-Jira bug: [BUG-ID]
-FlightCtl build: [exact build/tag/image/commit]
-Environment: [OCP/kind/Quadlet/VM]
-Namespace or deployment: [value, if relevant]
+### Paste this into chat
 
-Jira description and comments:
-[PASTE THE FULL JIRA CONTENT HERE]
+    WORKFLOW: VERIFY JIRA BUG
 
-Additional evidence:
-[PASTE RELEVANT LOGS OR PREVIOUS RESULTS]
-```
+    Jira bug: [BUG-ID]
+    FlightCtl build: [exact build/tag/image/commit]
+    Environment: [OCP/kind/Quadlet/VM]
+    Namespace/deployment: [value or unknown]
 
-#### Codex will do
+    Jira description and comments:
+    [PASTE FULL CONTENT OR PROVIDE THE JIRA URL]
 
-- Understand the bug and comments.
-- Search local code, harness, and existing tests.
-- Identify the exact expected behavior.
-- Create one complete verification pasteblock.
-- Create a Jira verification comment.
+    Previous evidence:
+    [PASTE RELEVANT LOGS OR RESULTS]
 
-#### You do afterward
+### Rules for the chat
 
-Run the verification block against the real deployment and paste the complete output back into chat:
+- Do not fix the bug yet.
+- Identify the broken behavior and the proof of success.
+- Search existing harness/testutil helpers before inventing commands.
+- Return one complete verifier with no unresolved placeholders.
+- Include build proof, preconditions, reproduction, and a positive result.
+- After verification output is returned, write the Jira comment.
 
-```text
-Verification output:
-[PASTE COMPLETE OUTPUT HERE]
-```
+### Switch at these stages
 
-Codex then writes the final Jira comment with the exact build and result.
+1. Jira lookup: Chai Bot or Jira CLI. Skip this if the issue is pasted.
+2. Normal local inspection: Codex/Terra.
+3. Cross-component analysis: Codex/Sol or Claude/Opus.
+4. More than 200 lines of logs: Gemini first; give Codex only its short findings.
+5. Final verifier simplification: Ponytail lite; never remove proof or diagnostics.
 
-### 2. Open a Jira bug
+### You run afterward
 
-#### You collect before starting
+Run the verifier on the real deployment and paste all output back:
 
-- Exact build.
-- Environment.
-- Reproduction frequency.
-- Commands used.
-- Actual output.
-- Expected output.
-- Relevant logs.
-- Duplicate candidates, if known.
+    Verification output:
+    [PASTE COMPLETE OUTPUT HERE]
 
-#### Paste this into chat
+## Workflow 2: Open a Jira bug
 
-```text
-WORKFLOW: OPEN JIRA BUG
+### Purpose
 
-Suggested area/component: [API/agent/CLI/UI/E2E/etc.]
-Build: [exact build/tag/image/commit]
-Environment: [OCP/kind/Quadlet/VM]
-Reproducibility: [always/often/intermittent/once]
+Turn a reproduced failure into a Jira-ready title and description. Do not create the issue automatically.
 
-Steps I ran:
-1. [description]
-   Command: [command]
-2. [description]
-   Command: [command]
+### Get the data
 
-Actual result:
-[exact result or error]
+You must reproduce the failure and collect the build, environment, frequency, exact commands, actual output, expected output, and relevant logs.
 
-Expected result:
-[expected behavior]
+Use rtk proxy when exact failure text matters. Use Jira CLI or Chai Bot only to check duplicates.
 
-Logs:
-[relevant logs only]
-```
+### Paste this into chat
 
-#### Codex will do
+    WORKFLOW: OPEN JIRA BUG
 
-- Separate facts from assumptions.
-- Identify missing information.
-- Suggest a concise title.
-- Return the Jira-ready description.
+    Area/component: [API/agent/CLI/UI/E2E/etc.]
+    Build: [exact build/tag/image/commit]
+    Environment: [OCP/kind/Quadlet/VM]
+    Reproducibility: [always/often/intermittent/once]
 
-#### You do afterward
+    Steps:
+    1. [description]
+       Command: [command]
+    2. [description]
+       Command: [command]
 
-- Review the title and description.
-- Check that build and environment are included.
-- Confirm steps are executable.
-- Remove secrets and customer-specific information.
-- Create the Jira issue yourself after approval.
+    Actual result:
+    [exact result or error]
 
-Codex does not create, comment on, assign, or transition the issue automatically.
+    Expected result:
+    [expected behavior]
 
-### 3. Jira feature to automated tests to manual test cases
+    Relevant logs:
+    [logs only]
 
-#### You collect before starting
+### Rules for the chat
+
+- Return missing information, a suggested title, and Jira-ready Markdown.
+- Separate actual from expected results.
+- Include build and environment.
+- Do not create, comment on, assign, or transition the issue.
+
+### Switch at these stages
+
+1. Normal drafting: Luna/low or Codex/Terra.
+2. Duplicate lookup: Jira CLI or Chai Bot.
+3. Large or confusing logs: Gemini first.
+4. No Ponytail review is needed unless code or a reproduction script is being written.
+
+### You do afterward
+
+Review the title and body, remove secrets/customer data, then create the Jira issue yourself.
+
+## Workflow 3: Feature to automated and manual tests
+
+### Purpose
+
+Learn a Jira feature, implement E2E coverage, validate it, and translate each automated test into a manual case.
+
+### Get the data
 
 - Feature Jira URL or full text.
-- Parent issue and subtickets.
-- Comments containing acceptance criteria.
+- Parent issue, subtickets, comments, and acceptance criteria.
 - Polarion IDs, if known.
-- Required environments.
-- Whether you want automated tests, manual cases, or both.
+- Required environments: kind, OCP, Quadlet, or VM.
 
-You do not need to paste the whole repository or test folder. Codex can inspect the local checkout.
+If the issue is not pasted, run:
 
-#### Paste this into chat
+    jira issue view FEATURE-ID
 
-```text
-WORKFLOW: FEATURE TO TESTS
+Do not paste the whole repository or test folder. Codex can inspect the local checkout.
 
-Feature Jira:
-[URL OR FULL FEATURE TEXT]
+### Paste this into chat
 
-Subtickets:
-[URLS OR FULL SUBTICKET TEXT]
+    WORKFLOW: FEATURE TO TESTS
 
-Acceptance criteria:
-[PASTE THEM HERE]
+    Feature Jira:
+    [URL OR FULL FEATURE TEXT]
 
-Polarion IDs:
-[IDS OR UNKNOWN]
+    Subtickets/comments:
+    [PASTE OR IDENTIFY THEM]
 
-Required environments:
-[kind/OCP/Quadlet/VM]
+    Acceptance criteria:
+    [PASTE THEM HERE]
 
-Request:
-First create and validate the automated E2E tests.
-After that, translate each automated test into a manual test case.
-```
+    Polarion IDs:
+    [IDS OR UNKNOWN]
 
-#### Codex will do first
+    Required environments:
+    [kind/OCP/Quadlet/VM]
 
-1. Read the parent, subtickets, comments, and links.
-2. Inspect the local implementation.
-3. Search existing E2E suites, harness, and testutil.
-4. Create a requirement-to-test matrix.
-5. Choose an existing suite or create a new suite.
-6. Implement the automated tests.
-7. Run targeted validation.
-8. Report changed files and results.
+    Request:
+    Create and validate the automated E2E tests first.
+    After approval, translate every automated test into a manual test case.
 
-#### You do after automated tests are complete
+### Rules for the chat
 
-Review the automated-test report. Then send:
+- Read Jira requirements and the local implementation before coding.
+- Search test/harness and testutil before adding helpers.
+- Prefer an existing suite; create a suite only when necessary.
+- Add a Polarion label to every It.
+- Add sanity only if total upstream E2E time stays below 40 minutes.
+- Add Agent only when both cs9 and cs10 must run the test.
+- Put constants above tests and helpers at the bottom.
+- Use one harness call in BeforeEach.
+- Keep Expect inside tests, not helpers.
+- Test positive output/state as well as errors.
+- Add logging, cleanup, and nil/empty/error handling.
+- Test OCP when required.
 
-```text
-Translate the completed automated tests into manual test cases.
-Use the final test names and Polarion IDs from your previous response.
-```
+### Switch at these stages
 
-Every manual test case must contain:
+1. Learn the feature: Chai Bot/Jira CLI. If the issue is pasted, stay in Codex.
+2. Broad architecture: Sol/high or Gemini; return only a short design summary.
+3. Implement tests: Codex/Terra with Ponytail lite.
+4. Review the diff: fresh Codex reviewer, optional Claude/Opus, then Ponytail full.
+5. Convert tests to manual cases: Luna/low.
+6. Run OCP/VM tests: Linux/OCP CI or the real environment, not Mac-only VM evidence.
 
-- Title.
-- Description.
-- Preconditions.
-- Step description.
-- Exact CLI command.
-- Expected output for every step.
-- Final expected result.
+### After automated tests pass
 
-### 4. Failed Jenkins, GitHub, or GitLab CI
+Paste:
 
-#### You collect before starting
+    Translate the completed automated tests into manual test cases.
+    Use the final test names and Polarion IDs from your previous response.
 
-- CI provider.
-- Run URL or ID.
-- Branch and PR/MR number.
-- Current expected head SHA.
-- Failed job name.
-- First real failure.
-- Relevant failed log.
-- Recent changes, if known.
+Every manual case must contain a title, description, preconditions, step description, exact CLI command, expected output for every step, and final expected result.
 
-Do not paste an entire successful CI log. Paste the failed job and surrounding context.
+## Workflow 4: Fix failed CI
 
-#### GitHub commands
+### Purpose
 
-```bash
-gh run view RUN_ID --json headSha,status,conclusion,workflowName,url
-gh run view RUN_ID --log-failed
-gh pr checks PR_NUMBER
-```
+Find the first real failure, identify the root cause, make the smallest fix, and validate it.
 
-#### GitLab commands
+### Get the data
 
-```bash
-glab mr view MR_NUMBER --repo GROUP/REPO
-glab ci status
-glab ci trace JOB_ID
-```
+Collect the provider, run URL/ID, branch, PR/MR, expected head SHA, failed job, first real failure, and relevant failed log. Do not paste successful log noise.
 
-#### Paste this into chat
+GitHub:
 
-```text
-WORKFLOW: FIX FAILED CI
+    gh run view RUN_ID --json headSha,status,conclusion,workflowName,url
+    gh run view RUN_ID --log-failed
+    gh pr checks PR_NUMBER
 
-Provider: [Jenkins/GitHub/GitLab]
-Run URL or ID: [URL/ID]
-Repository: [repository]
-Branch: [branch]
-PR/MR: [number]
-Expected head SHA: [SHA if known]
-Failed job/stage: [value]
+GitLab:
 
-First failure:
-[PASTE THE FIRST REAL FAILURE]
+    glab mr view MR_NUMBER --repo GROUP/REPO
+    glab ci status
+    glab ci trace JOB_ID
 
-Relevant log:
-[PASTE FAILED LOG SECTION]
+Jenkins: copy the failed stage and surrounding console log from Jenkins.
 
-Recent change:
-[PR/MR description or changed files, if known]
-```
+### Paste this into chat
 
-#### Codex will do
+    WORKFLOW: FIX FAILED CI
+
+    Provider: [Jenkins/GitHub/GitLab]
+    Run URL or ID: [value]
+    Repository: [value]
+    Branch and PR/MR: [value]
+    Expected head SHA: [value]
+    Failed job/stage: [value]
+
+    First failure:
+    [PASTE FIRST REAL FAILURE]
+
+    Relevant log:
+    [PASTE FAILED LOG SECTION]
+
+    Recent change:
+    [PR/MR description or changed files]
+
+### Rules for the chat
 
 - Verify the run belongs to the current head SHA.
-- Find the first real failure.
+- Identify the first real failure, not only the last error.
 - Separate root cause from cascading failures.
-- Inspect the relevant source, workflow, Jenkinsfile, or CI profile.
-- Search callers and existing patterns.
-- Implement the smallest root-cause fix if requested.
-- Run the narrowest regression test.
-- Report remaining CI or environment limitations.
+- Inspect callers, tests, workflows, Jenkinsfiles, and CI profiles.
+- Fix the root cause, not only the visible symptom.
+- Do not push or comment without approval.
 
-#### You do afterward
+### Switch at these stages
 
-- Run any deployment-specific or CI-only command Codex provides.
-- Paste the complete result back into chat.
-- Approve any external push, comment, or PR/MR update separately.
+1. Get exact run state: gh, glab, or supplied Jenkins data.
+2. More than 200 lines of logs: Gemini; return a short event timeline.
+3. Normal source fix: Codex/Terra.
+4. Cross-component root cause: Codex/Sol or Claude/Opus.
+5. Final simplification/review: Ponytail full.
+6. OCP/deployment validation: user or Linux/OCP CI.
 
-### 5. Review another GitHub PR or GitLab MR
+### ocp-edge-ci check
 
-#### You collect before starting
+Before changing a profile, classify it as latest/main or fixed-release. Fixed releases must use the matching release tag and flightctl_repo_branch.
 
-Usually, only collect the PR/MR URL. Also state whether the review is read-only or whether you want paste-ready comments.
+    cd /Users/eweiss/flightctl/ocp-edge-ci
+    rtk git status
+    rg -n "flightctl_repo_branch|FLIGHTCTL_BACKEND_TAG|FLIGHTCTL_BACKEND_PREVIOUS_RELEASE_TAG|ocp-flightctl-gotests" ci-profiles-new
 
-#### Paste this into chat
+### You do afterward
 
-```text
-WORKFLOW: REVIEW PR/MR
+Run CI-only or deployment-specific commands provided by Codex. Paste the complete result back. Approve any push, comment, or PR/MR update separately.
 
-Target URL:
-[PASTE GITHUB PR OR GITLAB MR URL]
+## Workflow 5: Review a GitHub PR or GitLab MR
 
-Review mode:
-[read-only findings / prepare paste-ready comments]
+### Purpose
 
-Specific concern:
-[optional]
+Review the live change read-only and return only strong, net-new, paste-ready findings.
 
-Return only strong net-new findings.
-```
+### Get the data
 
-#### Codex will do
+Usually only the PR/MR URL and review mode are needed. Do not paste the full diff unless CLI access fails.
 
-- Fetch the live head.
-- Refresh the base branch.
-- Confirm the live head SHA.
-- Read project instructions and relevant docs.
-- Read changed files with surrounding context.
-- Inspect callers, cleanup paths, tests, helpers, and API types.
-- Query existing review comments and discussions.
-- Remove duplicate, speculative, stylistic, and pre-existing findings.
-- Verify every final line anchor against the live fetched ref.
+### Paste this into chat
 
-#### You do not need to paste
+    WORKFLOW: REVIEW PR/MR
 
-- The complete diff.
-- Existing review threads.
-- PR/MR comments.
-- Changed files.
+    Target URL:
+    [GITHUB PR OR GITLAB MR URL]
 
-Codex can fetch those with `gh` or `glab`.
+    Review mode:
+    [read-only findings / paste-ready comments]
 
-#### Review output
+    Specific concern:
+    [optional]
 
-If findings exist:
+### Rules for the chat
 
-```text
-path/to/file.go:123 - [Concrete risk]. [Failure scenario and requested fix.]
-```
+- Keep the checkout read-only.
+- Fetch the live head and refresh the base branch.
+- Confirm the fetched ref matches the live remote head SHA.
+- Read project instructions, docs, callers, cleanup paths, tests, helpers, and API types.
+- Query existing review comments/discussions before finding issues.
+- Do not repeat existing or already-addressed findings.
+- Comment only on concrete correctness, security, cleanup, CI, upgrade, E2E, or convention risks.
+- Verify every final line anchor in the live fetched ref.
+- Return only paste-ready findings.
 
-If no findings exist:
+### Switch at these stages
 
-```text
-No strong net-new findings. I checked the live head, changed files, and existing review threads.
-```
+1. Fetch PR/MR and threads: gh or glab.
+2. Broad cross-system research: Chai Bot.
+3. Very large diff/log set: Gemini; return a short risk summary.
+4. Normal product-path review: Codex/Terra.
+5. High-risk architecture/security review: Sol/high or Claude/Opus.
+6. Final over-engineering check: Ponytail full.
 
-### Responsibility summary
+GitHub read-only commands:
 
-- You provide the issue, URL, build, environment, and relevant evidence.
-- Codex inspects local source and generates plans, commands, tests, and comments.
-- You run commands that require access to the real deployment or CI environment.
-- You paste command results back to Codex.
-- You review and approve Jira, GitHub, GitLab, pushes, comments, and transitions.
+    gh pr view PR_NUMBER --repo flightctl/flightctl --json headRefOid,baseRefName,headRefName,url
+    gh api repos/flightctl/flightctl/pulls/PR_NUMBER/comments --paginate
+    gh api repos/flightctl/flightctl/pulls/PR_NUMBER/reviews --paginate
+    git fetch upstream main:refs/remotes/upstream/main
+    git fetch upstream +pull/PR_NUMBER/head:refs/remotes/upstream/pr-PR_NUMBER
+    git rev-parse refs/remotes/upstream/pr-PR_NUMBER
 
-Always paste only the matching workflow block and task-specific information.
+GitLab read-only commands:
 
-## Execution and handoff
+    glab mr view MR_NUMBER --repo GROUP/REPO
+    glab api projects/URL_ENCODED_PROJECT/merge_requests/MR_NUMBER/discussions --paginate
+    git fetch upstream main:refs/remotes/upstream/main
+    git fetch upstream +refs/merge-requests/MR_NUMBER/head:refs/remotes/upstream/mr-MR_NUMBER
+    git rev-parse refs/remotes/upstream/mr-MR_NUMBER
 
-### CLI rules
+### Review output
 
-Use authenticated local tools for exact current state:
+With findings:
 
-```bash
-gh pr view NUMBER
-gh pr checks NUMBER
-glab mr view NUMBER
-glab ci status
-jira issue view ISSUE
-git show REF
-```
+    path/to/file.go:123 - [Concrete risk]. [Failure scenario and requested fix.]
 
-Do not create comments, labels, transitions, pushes, or other external changes unless explicitly requested.
+Without findings:
 
-### Cost-save trigger
+    No strong net-new findings. I checked the live head, changed files, and existing review threads.
 
-Switch away from Codex when logs exceed roughly 200 lines, the task requires many packages or the whole repository, the task spans multiple services, a new multi-file E2E suite is needed, large Helm/RPM/YAML/JSON/must-gather data is involved, the same context is being reread repeatedly, or the same operation is needed across many files or tickets.
+## Common FlightCtl rules
 
-Use this message:
-
-```text
-⚠️ Cost-save: this is a high-context task. Switch to Gemini or Chai Bot for broad analysis. Return to Codex after the findings are narrowed to specific files and actions.
-```
-
-### Final response template
-
-```text
-Completed:
-- [what changed]
-
-Files:
-- [path]
-
-Validation:
-- [command] — PASS/FAIL
-- [command] — PASS/FAIL
-
-External changes:
-- None
-```
-
-If blocked:
-
-```text
-Blocked:
-[one exact blocker]
-
-Evidence:
-[command or file proving it]
-
-Needed:
-[one specific thing required to continue]
-```
+- Preserve unrelated dirty-worktree changes.
+- Use RTK for normal shell output and rtk proxy for exact evidence.
+- Never paste secrets or customer-specific data.
+- Search existing helpers before adding code.
+- Validate positive results, not only absence of errors.
+- Use Linux/OCP CI for definitive VM/OCP evidence.
+- Do not perform external writes without explicit approval.
+- Use @ponytail-review when a final diff simplification review is useful.
