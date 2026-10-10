@@ -7,6 +7,7 @@ import (
 	"maps"
 	"net/http"
 	"reflect"
+	"strings"
 	"time"
 
 	"github.com/flightctl/flightctl/internal/consts"
@@ -446,6 +447,12 @@ func (h *DeviceServiceHandler) ReplaceDeviceStatus(ctx context.Context, orgId uu
 			defer h.agentGate.Release(1)
 		}
 		incomingDevice.Status.LastSeen = lo.ToPtr(time.Now())
+		// Agent status updates are an explicit liveness signal. Persist it immediately
+		// because Status.LastSeen is stored outside the status JSON, while rendered
+		// device heartbeats are intentionally batched by the healthchecker.
+		if err := h.deviceStore.Healthcheck(ctx, orgId, []string{name}); err != nil {
+			return nil, common.StoreErrorToApiStatus(err, false, domain.DeviceKind, &name)
+		}
 	}
 
 	// UpdateServiceSideStatus() needs to know the latest .metadata.annotations[device-controller/renderedVersion]
@@ -465,6 +472,25 @@ func (h *DeviceServiceHandler) ReplaceDeviceStatus(ctx context.Context, orgId uu
 	result, before, err := h.deviceStore.UpdateStatus(ctx, orgId, deviceToStore, originalDevice)
 	h.callEventCallback(ctx, h.callbackDeviceUpdated, orgId, name, before, result, false, err)
 	return result, common.StoreErrorToApiStatus(err, false, domain.DeviceKind, &name)
+}
+
+func (h *DeviceServiceHandler) ReplaceServiceOwnedStatus(ctx context.Context, orgId uuid.UUID, name string, device domain.Device) (*domain.Device, domain.Status) {
+	if device.Metadata.Name == nil || *device.Metadata.Name == "" {
+		return nil, domain.StatusBadRequest("device name is required")
+	}
+	if name != *device.Metadata.Name {
+		return nil, domain.StatusBadRequest("resource name specified in metadata does not match name in path")
+	}
+	if device.Status == nil {
+		return nil, domain.StatusBadRequest("device status is required")
+	}
+	result, _, err := h.deviceStore.ReplaceServiceOwnedStatus(ctx, orgId, &device)
+	return result, common.StoreErrorToApiStatus(err, false, domain.DeviceKind, &name)
+}
+
+func (h *DeviceServiceHandler) ClearDeltaPreparingIfCurrent(ctx context.Context, orgID uuid.UUID, name string, generation int64) (bool, domain.Status) {
+	matched, err := h.deviceStore.ClearDeltaPreparingIfCurrent(ctx, orgID, name, generation)
+	return matched, common.StoreErrorToApiStatus(err, false, domain.DeviceKind, &name)
 }
 
 func (h *DeviceServiceHandler) PatchDeviceStatus(ctx context.Context, orgId uuid.UUID, name string, patch domain.PatchRequest) (*domain.Device, domain.Status) {
@@ -534,9 +560,53 @@ func applyDeviceStatusPatch(ctx context.Context, current *domain.Device, patch d
 	if !reflect.DeepEqual(current.Spec, patched.Spec) {
 		return nil, errors.New("spec is immutable")
 	}
+	// EnrollmentHooks is service-owned and must not be changed through generic status patches.
+	if err := rejectEnrollmentHooksChangeViaStatusPatch(current, patched); err != nil {
+		return nil, err
+	}
 	common.NilOutManagedObjectMetaProperties(&patched.Metadata)
 	patched.Metadata.ResourceVersion = nil
 	return patched, nil
+}
+
+func rejectEnrollmentHooksChangeViaStatusPatch(current, patched *domain.Device) error {
+	var before, after *domain.Condition
+	if current != nil && current.Status != nil {
+		before = domain.FindStatusCondition(current.Status.Conditions, domain.ConditionTypeDeviceEnrollmentHooks)
+	}
+	if patched != nil && patched.Status != nil {
+		after = domain.FindStatusCondition(patched.Status.Conditions, domain.ConditionTypeDeviceEnrollmentHooks)
+	}
+	if reflect.DeepEqual(before, after) {
+		return nil
+	}
+	if allowedAgentEnrollmentHooksOutcome(before, after) {
+		return nil
+	}
+	return errors.New("EnrollmentHooks condition cannot be modified via status patch; use the dedicated enrollment hook override endpoint")
+}
+
+// allowedAgentEnrollmentHooksOutcome permits the agent to report hook completion
+// from Pending to Succeeded / Failed / Continued over the generic status PATCH.
+// ManualOverride and all other mutations remain rejected.
+func allowedAgentEnrollmentHooksOutcome(before, after *domain.Condition) bool {
+	if before == nil || after == nil {
+		return false
+	}
+	if before.Type != domain.ConditionTypeDeviceEnrollmentHooks || after.Type != domain.ConditionTypeDeviceEnrollmentHooks {
+		return false
+	}
+	if before.Reason != domain.EnrollmentHooksReasonPending {
+		return false
+	}
+	switch after.Reason {
+	case domain.EnrollmentHooksReasonSucceeded, domain.EnrollmentHooksReasonContinued:
+		return after.Status == domain.ConditionStatusTrue
+	case domain.EnrollmentHooksReasonFailed:
+		return after.Status == domain.ConditionStatusFalse
+	default:
+		return false
+	}
 }
 
 func (h *DeviceServiceHandler) GetRenderedDevice(ctx context.Context, orgId uuid.UUID, name string, params domain.GetRenderedDeviceParams) (*domain.Device, domain.Status) {
@@ -584,10 +654,19 @@ func (h *DeviceServiceHandler) GetRenderedDevice(ctx context.Context, orgId uuid
 		}
 	}
 
+	// Gate on the existing rendered-device read so idle long-polls keep returning
+	// 204 without an extra store round-trip.
 	result, err := h.deviceStore.GetRendered(ctx, orgId, name, nil, h.agentEndpoint)
 	if err != nil {
 		h.log.Errorf("GetRenderedDevice %s/%s: failed to get rendered device: %v", orgId, name, err)
 		return nil, common.StoreErrorToApiStatus(err, false, domain.DeviceKind, &name)
+	}
+	if domain.IsDeviceEnrollmentHooksGated(result) {
+		reason := ""
+		if cond := domain.FindStatusCondition(result.Status.Conditions, domain.ConditionTypeDeviceEnrollmentHooks); cond != nil {
+			reason = cond.Reason
+		}
+		return nil, domain.StatusConflict(fmt.Sprintf("device is gated by enrollment hooks (reason: %s)", reason))
 	}
 	newVersion := result.Version()
 	if kvRenderedVersion != "" && newVersion != "" && kvRenderedVersion != newVersion {
@@ -611,6 +690,10 @@ func (h *DeviceServiceHandler) PatchDevice(ctx context.Context, orgId uuid.UUID,
 	// the patch against the CAS-fresh current on every attempt so ownership/spec checks stay correct.
 	if status := validateDevicePatch(ctx, orgId, h.catalogStore, currentObj, patch, name); status.Code != http.StatusOK {
 		return nil, status
+	}
+	mutateOptions := []devicestore.MutateOption{devicestore.WithTimestamp()}
+	if explicitRemovals, ok := managedLabelMapReplacement(patch); ok {
+		mutateOptions = append(mutateOptions, devicestore.WithManagedLabelMapReplacement(explicitRemovals))
 	}
 
 	var callbackStatus domain.Status
@@ -645,7 +728,7 @@ func (h *DeviceServiceHandler) PatchDevice(ctx context.Context, orgId uuid.UUID,
 		}
 		_ = common.UpdateServiceSideStatus(ctx, orgId, current, h.fleetStore, h.log)
 		return pruneLifecycleOnCurrent(h.log, current)
-	}, devicestore.WithTimestamp())
+	}, mutateOptions...)
 	h.callEventCallback(ctx, h.callbackDeviceUpdated, orgId, name, before, result, false, err)
 	if err != nil && callbackStatus.Code != 0 {
 		return result, callbackStatus
@@ -682,6 +765,24 @@ func applyDevicePatch(ctx context.Context, current *domain.Device, patch domain.
 	common.NilOutManagedObjectMetaProperties(&patched.Metadata)
 	patched.Metadata.ResourceVersion = nil
 	return patched, nil
+}
+
+func managedLabelMapReplacement(patch domain.PatchRequest) ([]string, bool) {
+	hasReplacement := false
+	var explicitRemovals []string
+	for _, operation := range patch {
+		switch {
+		case operation.Path == "/metadata/labels" && operation.Op == "remove":
+			// A whole-map removal is an explicit clear request. Leave managed keys absent
+			// so the store guard rejects clearing them.
+			return nil, false
+		case operation.Path == "/metadata/labels" && (operation.Op == "add" || operation.Op == "replace"):
+			hasReplacement = true
+		case operation.Op == "remove" && strings.HasPrefix(operation.Path, "/metadata/labels/"):
+			explicitRemovals = append(explicitRemovals, operation.Path)
+		}
+	}
+	return explicitRemovals, hasReplacement
 }
 
 func (h *DeviceServiceHandler) SetOutOfDate(ctx context.Context, orgId uuid.UUID, owner string) error {
@@ -766,7 +867,7 @@ func (h *DeviceServiceHandler) DecommissionDevice(ctx context.Context, orgId uui
 		// Former store DecommissionDevice did not bump generation; keep that contract.
 		m.PreserveGeneration = true
 		return nil
-	})
+	}, devicestore.WithDecommissionManagedLabelCleanup())
 	if err != nil {
 		return nil, common.StoreErrorToApiStatus(err, false, domain.DeviceKind, &name)
 	}
@@ -791,7 +892,14 @@ func applyDeviceDecommission(device *domain.Device, decom domain.DeviceDecommiss
 	device.Status = &status
 
 	device.Metadata.Owner = nil
+	// Clearing labels deletes their device_labels rows through the store trigger.
 	device.Metadata.Labels = nil
+	if annotations := lo.FromPtr(device.Metadata.Annotations); annotations != nil {
+		delete(annotations, domain.DeviceAnnotationManagedLabels)
+		if len(annotations) == 0 {
+			device.Metadata.Annotations = nil
+		}
+	}
 }
 
 func (h *DeviceServiceHandler) UpdateDeviceAnnotations(ctx context.Context, orgId uuid.UUID, name string, annotations map[string]string, deleteKeys []string) domain.Status {
@@ -799,7 +907,7 @@ func (h *DeviceServiceHandler) UpdateDeviceAnnotations(ctx context.Context, orgI
 	return common.StoreErrorToApiStatus(err, false, domain.DeviceKind, &name)
 }
 
-func (h *DeviceServiceHandler) UpdateRenderedDevice(ctx context.Context, orgId uuid.UUID, name, renderedConfig, renderedApplications, specHash, osImage string, configFingerprints []domain.DependencySyncConfigRefStatus, forceUpdate bool) domain.Status {
+func (h *DeviceServiceHandler) UpdateRenderedDevice(ctx context.Context, orgId uuid.UUID, name, renderedConfig, renderedApplications, specHash, osImage string, configFingerprints []domain.DependencySyncConfigRefStatus, forceUpdate bool, osHints *RenderedOSHints) domain.Status {
 	specValid := domain.Condition{
 		Type:   domain.ConditionTypeDeviceSpecValid,
 		Status: domain.ConditionStatusTrue,
@@ -819,7 +927,7 @@ func (h *DeviceServiceHandler) UpdateRenderedDevice(ctx context.Context, orgId u
 		if m.Device.Status != nil {
 			oldConditions = append([]domain.Condition(nil), m.Device.Status.Conditions...)
 		}
-		version, err := applyRenderedUpdate(m, renderedConfig, renderedApplications, specHash, osImage, configFingerprints, forceUpdate)
+		version, err := applyRenderedUpdate(m, renderedConfig, renderedApplications, specHash, osImage, configFingerprints, forceUpdate, osHints)
 		if err != nil {
 			return err
 		}
@@ -894,11 +1002,36 @@ func (h *DeviceServiceHandler) SetDeviceServiceConditions(ctx context.Context, o
 	}
 	if result != nil {
 		h.diffAndEmitConditionEvents(ctx, orgId, result, oldConditions, newConditions)
+		if enrollmentHooksConditionChanged(oldConditions, newConditions) {
+			// Use Load() so unit/integration tests that never Initialize the
+			// Bus do not plant an empty singleton that blocks later Initialize.
+			if vm := rendered.Bus.Load(); vm != nil {
+				if err := vm.NotifyEnrollmentHooks(ctx, orgId, name); err != nil {
+					h.log.Errorf("Failed to notify enrollment hooks watchers for device %s/%s: %v", orgId, name, err)
+				}
+			}
+		}
 	}
 	return domain.StatusOK()
 }
 
-// serviceConditionsFromDevice returns SpecValid / MultipleOwners conditions from
+// enrollmentHooksConditionChanged reports whether the EnrollmentHooks condition
+// reason, status, or message differs between old and new service conditions.
+func enrollmentHooksConditionChanged(oldConditions, newConditions []domain.Condition) bool {
+	oldCond := domain.FindStatusCondition(oldConditions, domain.ConditionTypeDeviceEnrollmentHooks)
+	newCond := domain.FindStatusCondition(newConditions, domain.ConditionTypeDeviceEnrollmentHooks)
+	if oldCond == nil && newCond == nil {
+		return false
+	}
+	if oldCond == nil || newCond == nil {
+		return true
+	}
+	return oldCond.Reason != newCond.Reason ||
+		oldCond.Status != newCond.Status ||
+		oldCond.Message != newCond.Message
+}
+
+// serviceConditionsFromDevice returns service-owned conditions from
 // Status.Conditions (agent and service conditions are stored separately but
 // exposed together by Get).
 func serviceConditionsFromDevice(device *domain.Device) []domain.Condition {
@@ -933,6 +1066,21 @@ func replaceServiceConditionsOnDevice(device *domain.Device, serviceConds []doma
 
 // diffAndEmitConditionEvents compares old and new conditions and emits events for condition changes
 func (h *DeviceServiceHandler) diffAndEmitConditionEvents(ctx context.Context, orgId uuid.UUID, device *domain.Device, oldConditions, newConditions []domain.Condition) {
+	oldEnrollmentHooksCondition := domain.FindStatusCondition(oldConditions, domain.ConditionTypeDeviceEnrollmentHooks)
+	newEnrollmentHooksCondition := domain.FindStatusCondition(newConditions, domain.ConditionTypeDeviceEnrollmentHooks)
+	wasEnrollmentHooksGated := oldEnrollmentHooksCondition != nil && oldEnrollmentHooksCondition.Status == domain.ConditionStatusFalse
+	isEnrollmentHooksGated := newEnrollmentHooksCondition != nil && newEnrollmentHooksCondition.Status == domain.ConditionStatusFalse
+	if wasEnrollmentHooksGated && !isEnrollmentHooksGated {
+		updates := &domain.ResourceUpdatedDetails{
+			UpdatedFields: []domain.ResourceUpdatedDetailsUpdatedFields{domain.UpdatedFieldEnrollmentHooksCondition},
+		}
+		event := common.GetResourceCreatedOrUpdatedSuccessEvent(ctx, false, domain.DeviceKind,
+			lo.FromPtr(device.Metadata.Name), updates, h.log, lo.FromPtr(device.Metadata.Annotations))
+		if event != nil {
+			h.events.CreateEvent(ctx, orgId, event)
+		}
+	}
+
 	// Track condition changes for MultipleOwners
 	oldMultipleOwnersCondition := domain.FindStatusCondition(oldConditions, domain.ConditionTypeDeviceMultipleOwners)
 	newMultipleOwnersCondition := domain.FindStatusCondition(newConditions, domain.ConditionTypeDeviceMultipleOwners)
@@ -960,6 +1108,15 @@ func (h *DeviceServiceHandler) diffAndEmitConditionEvents(ctx context.Context, o
 		common.EmitSpecValidEvents(ctx, device, oldSpecValidCondition, newSpecValidCondition,
 			createEvent, common.GetDeviceSpecValidEvent, common.GetDeviceSpecInvalidEvent,
 			h.log)
+	}
+
+	// Track condition changes for EnrollmentHooks
+	enrollmentHooksConditionChanged := common.HasConditionChanged(oldEnrollmentHooksCondition, newEnrollmentHooksCondition)
+
+	if enrollmentHooksConditionChanged {
+		createEvent := func(c context.Context, e *domain.Event) { h.events.CreateEvent(c, orgId, e) }
+		common.EmitEnrollmentHookEvents(ctx, device, oldEnrollmentHooksCondition, newEnrollmentHooksCondition,
+			createEvent, h.log)
 	}
 }
 
@@ -1172,10 +1329,13 @@ func (h *DeviceServiceHandler) processAwaitingReconnectIfNeeded(ctx context.Cont
 // remediation path for a stuck package-mode device. Unrelated updates that retain
 // the existing OS target are also not conflicts.
 func isPackageModeOsTargetConflict(existing *domain.Device, incoming *domain.Device) bool {
-	if existing.Status == nil || existing.Status.Capabilities == nil || existing.Status.Capabilities.OsMode == nil {
+	if existing.Status == nil {
 		return false
 	}
-	if *existing.Status.Capabilities.OsMode != domain.OsModePackage {
+	// Prefer status.systemInfo.osMode, falling back to the deprecated
+	// status.capabilities.osMode for devices reported by older agents.
+	osMode := domain.DeviceStatusOsMode(existing.Status)
+	if osMode == nil || *osMode != domain.OsModePackage {
 		return false
 	}
 

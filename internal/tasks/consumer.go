@@ -17,10 +17,13 @@ import (
 	catalogservice "github.com/flightctl/flightctl/internal/service/catalog"
 	dependencyrefservice "github.com/flightctl/flightctl/internal/service/dependencyref"
 	deviceservice "github.com/flightctl/flightctl/internal/service/device"
+	enrollmentrequestservice "github.com/flightctl/flightctl/internal/service/enrollmentrequest"
 	eventservice "github.com/flightctl/flightctl/internal/service/event"
 	fleetservice "github.com/flightctl/flightctl/internal/service/fleet"
+	labelsyncmappingservice "github.com/flightctl/flightctl/internal/service/labelsyncmapping"
 	repositoryservice "github.com/flightctl/flightctl/internal/service/repository"
 	templateversionservice "github.com/flightctl/flightctl/internal/service/templateversion"
+	enrollmenthooknotifysecrets "github.com/flightctl/flightctl/internal/store/enrollmenthooknotifysecrets"
 	"github.com/flightctl/flightctl/internal/worker_client"
 	"github.com/flightctl/flightctl/pkg/k8sclient"
 	"github.com/flightctl/flightctl/pkg/queues"
@@ -30,17 +33,42 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 )
 
-func dispatchTasks(fleetSvc fleetservice.Service, templateversionSvc templateversionservice.Service, deviceSvc deviceservice.Service, dependencyrefSvc dependencyrefservice.Service, repositorySvc repositoryservice.Service, catalogSvc catalogservice.Service, eventSvc eventservice.Service, k8sClient k8sclient.K8SClient, kvStore kvstore.KVStore, cfg *config.Config, workerMetrics *worker.WorkerCollector, encryptionMigrator *EncryptionMigrator, queuePublisher queues.QueueProducer) queues.ConsumeHandler {
+type TaskConsumer struct {
+	FleetSvc             fleetservice.Service
+	TemplateversionSvc   templateversionservice.Service
+	DeviceSvc            deviceservice.Service
+	DependencyrefSvc     dependencyrefservice.Service
+	RepositorySvc        repositoryservice.Service
+	CatalogSvc           catalogservice.Service
+	EventSvc             eventservice.Service
+	EnrollmentRequestSvc enrollmentrequestservice.Service
+	NotifySecretsStore   enrollmenthooknotifysecrets.Store
+	K8sClient            k8sclient.K8SClient
+	KVStore              kvstore.KVStore
+	Cfg                  *config.Config
+	WorkerMetrics        *worker.WorkerCollector
+	EncryptionMigrator   *EncryptionMigrator
+	QueuePublisher       queues.QueueProducer
+	WorkerClient         worker_client.WorkerClient
+	DeviceRenderer       *DeviceRenderLogic
+	LabelSyncMappingSvc  labelsyncmappingservice.Service
+}
+
+func (d TaskConsumer) dispatch() queues.ConsumeHandler {
 	return func(ctx context.Context, payload []byte, entryID string, consumer queues.QueueConsumer, log logrus.FieldLogger) error {
 		startTime := time.Now()
 
 		// Increment in-progress counter
-		if workerMetrics != nil {
-			workerMetrics.IncMessagesInProgress()
-			defer workerMetrics.DecMessagesInProgress()
+		if d.WorkerMetrics != nil {
+			d.WorkerMetrics.IncMessagesInProgress()
+			defer d.WorkerMetrics.DecMessagesInProgress()
 		}
 
-		// Add timeout for the entire event processing
+		// Preserve the worker root context before applying the per-event
+		// processing timeout. Long-running tasks (enrollment hook notify) use
+		// workerCtx so they keep shutdown cancellation without inheriting the
+		// short EventProcessingTimeout deadline.
+		workerCtx := ctx
 		ctx, cancel := context.WithTimeout(ctx, EventProcessingTimeout)
 		defer cancel()
 
@@ -48,9 +76,9 @@ func dispatchTasks(fleetSvc fleetservice.Service, templateversionSvc templatever
 		if err := json.Unmarshal(payload, &eventWithOrgId); err != nil {
 			log.WithError(err).Error("failed to unmarshal consume payload")
 			// Record unmarshal error as a permanent failure (parsing errors are not retryable)
-			if workerMetrics != nil {
-				workerMetrics.IncPermanentFailures()
-				workerMetrics.IncMessagesProcessed("permanent_failure")
+			if d.WorkerMetrics != nil {
+				d.WorkerMetrics.IncPermanentFailures()
+				d.WorkerMetrics.IncMessagesProcessed("permanent_failure")
 			}
 			// Complete the message successfully to remove it from queue (parsing errors are not retryable)
 			ackCtx, cancelAck := context.WithTimeout(context.Background(), AckTimeout)
@@ -76,59 +104,102 @@ func dispatchTasks(fleetSvc fleetservice.Service, templateversionSvc templatever
 		var taskName string
 		errorMessages := []string{}
 
-		if shouldRolloutFleet(ctx, eventWithOrgId.Event, log) {
-			taskName = "fleetRollout"
-			err = runTaskWithMetrics(taskName, workerMetrics, func() error {
-				return fleetRollout(ctx, eventWithOrgId.OrgId, eventWithOrgId.Event, fleetSvc, templateversionSvc, deviceSvc, dependencyrefSvc, log)
-			})
-			errorMessages = appendErrorMessage(errorMessages, taskName, err)
-		}
+		var ownershipErr error
 		if shouldReconcileDeviceOwnership(ctx, eventWithOrgId.Event, log) {
 			taskName = "fleetSelectorMatching"
-			err = runTaskWithMetrics(taskName, workerMetrics, func() error {
-				return fleetSelectorMatching(ctx, eventWithOrgId.OrgId, eventWithOrgId.Event, deviceSvc, fleetSvc, log)
+			ownershipErr = runTaskWithMetrics(taskName, d.WorkerMetrics, func() error {
+				return fleetSelectorMatching(ctx, eventWithOrgId.OrgId, eventWithOrgId.Event, d.DeviceSvc, d.FleetSvc, log)
+			})
+			errorMessages = appendErrorMessage(errorMessages, taskName, ownershipErr)
+		}
+		if shouldRolloutFleet(ctx, eventWithOrgId.Event, log) {
+			if ownershipErr != nil {
+				log.WithError(ownershipErr).Warn("skipping fleet rollout because device ownership reconciliation failed")
+			} else {
+				taskName = "fleetRollout"
+				err = runTaskWithMetrics(taskName, d.WorkerMetrics, func() error {
+					return fleetRollout(ctx, eventWithOrgId.OrgId, eventWithOrgId.Event, d.FleetSvc, d.TemplateversionSvc, d.DeviceSvc, d.DependencyrefSvc, log)
+				})
+				errorMessages = appendErrorMessage(errorMessages, taskName, err)
+			}
+		}
+		if shouldReconcileDeviceLabels(ctx, eventWithOrgId.Event) {
+			taskName = "deviceLabelReconciliation"
+			err = runTaskWithMetrics(taskName, d.WorkerMetrics, func() error {
+				logic, logicErr := NewDeviceLabelReconciliationLogic(log, d.LabelSyncMappingSvc, eventWithOrgId.OrgId, eventWithOrgId.Event)
+				if logicErr != nil {
+					return logicErr
+				}
+				return logic.Reconcile(ctx)
 			})
 			errorMessages = appendErrorMessage(errorMessages, taskName, err)
 		}
 		if shouldValidateFleet(ctx, eventWithOrgId.Event, log) {
 			taskName = "fleetValidation"
-			err = runTaskWithMetrics(taskName, workerMetrics, func() error {
-				return fleetValidate(ctx, eventWithOrgId.OrgId, eventWithOrgId.Event, fleetSvc, templateversionSvc, deviceSvc, repositorySvc, k8sClient, log)
+			err = runTaskWithMetrics(taskName, d.WorkerMetrics, func() error {
+				if eventWithOrgId.Event.InvolvedObject.Kind != domain.FleetKind {
+					log.Errorf("FleetValidate called with unexpected kind %s and reason %s", eventWithOrgId.Event.InvolvedObject.Kind, eventWithOrgId.Event.Reason)
+					return nil
+				}
+				logic := NewFleetValidateLogic(log, d.FleetSvc, d.TemplateversionSvc, d.DeviceSvc, d.RepositorySvc, d.K8sClient, eventWithOrgId.OrgId, eventWithOrgId.Event)
+				logic.WorkerClient = d.WorkerClient
+				if err := logic.CreateNewTemplateVersionIfFleetValid(ctx); err != nil {
+					if isInvalidFleetConfigError(err) {
+						log.WithError(err).Warn("fleet configuration is invalid; waiting for a fleet or dependency update")
+						return nil
+					}
+					return fmt.Errorf("validate fleet %s/%s: %w",
+						eventWithOrgId.OrgId,
+						eventWithOrgId.Event.InvolvedObject.Name,
+						err,
+					)
+				}
+				return nil
 			})
 			errorMessages = appendErrorMessage(errorMessages, taskName, err)
 		}
 		if shouldPopulateDependencyRefs(ctx, eventWithOrgId.Event, log) {
 			taskName = "populateDependencyRefs"
-			err = runTaskWithMetrics(taskName, workerMetrics, func() error {
-				return populateDependencyRefs(ctx, eventWithOrgId.OrgId, eventWithOrgId.Event, fleetSvc, deviceSvc, dependencyrefSvc, log)
+			err = runTaskWithMetrics(taskName, d.WorkerMetrics, func() error {
+				return populateDependencyRefs(ctx, eventWithOrgId.OrgId, eventWithOrgId.Event, d.FleetSvc, d.DeviceSvc, d.DependencyrefSvc, log)
 			})
 			errorMessages = appendErrorMessage(errorMessages, taskName, err)
 		}
 		if shouldRenderDevice(ctx, eventWithOrgId.Event, log) {
 			taskName = "deviceRender"
-			err = runTaskWithMetrics(taskName, workerMetrics, func() error {
-				return deviceRender(ctx, eventWithOrgId.OrgId, eventWithOrgId.Event, deviceSvc, repositorySvc, catalogSvc, k8sClient, kvStore, cfg, log)
+			err = runTaskWithMetrics(taskName, d.WorkerMetrics, func() error {
+				return deviceRender(ctx, eventWithOrgId.OrgId, eventWithOrgId.Event, d.DeviceRenderer, log)
 			})
 			errorMessages = appendErrorMessage(errorMessages, taskName, err)
 		}
 		if shouldUpdateRepositoryReferers(ctx, eventWithOrgId.Event, log) {
 			taskName = "repositoryUpdate"
-			err = runTaskWithMetrics(taskName, workerMetrics, func() error {
-				return repositoryUpdate(ctx, eventWithOrgId.OrgId, eventWithOrgId.Event, repositorySvc, eventSvc, log)
+			err = runTaskWithMetrics(taskName, d.WorkerMetrics, func() error {
+				return repositoryUpdate(ctx, eventWithOrgId.OrgId, eventWithOrgId.Event, d.RepositorySvc, d.EventSvc, log)
 			})
 			errorMessages = appendErrorMessage(errorMessages, taskName, err)
 		}
 		if shouldReconcileFleetApplicationLifecycle(ctx, eventWithOrgId.Event, log) {
 			taskName = "fleetApplicationLifecycle"
-			err = runTaskWithMetrics(taskName, workerMetrics, func() error {
-				return fleetApplicationLifecycle(ctx, eventWithOrgId.OrgId, eventWithOrgId.Event, fleetSvc, deviceSvc, eventSvc, log)
+			err = runTaskWithMetrics(taskName, d.WorkerMetrics, func() error {
+				return fleetApplicationLifecycle(ctx, eventWithOrgId.OrgId, eventWithOrgId.Event, d.FleetSvc, d.DeviceSvc, d.EventSvc, log)
+			})
+			errorMessages = appendErrorMessage(errorMessages, taskName, err)
+		}
+		if shouldEnrollmentHookNotify(eventWithOrgId.Event) {
+			taskName = "enrollmentHookNotify"
+			err = runTaskWithMetrics(taskName, d.WorkerMetrics, func() error {
+				// Use workerCtx (not the 10s event ctx) so notify can honor its
+				// own deadline while still stopping on worker shutdown.
+				return enrollmentHookNotify(workerCtx, eventWithOrgId.OrgId, eventWithOrgId.Event,
+					d.DeviceSvc, d.EnrollmentRequestSvc, d.NotifySecretsStore, d.EventSvc, log)
 			})
 			errorMessages = appendErrorMessage(errorMessages, taskName, err)
 		}
 		if shouldRunEncryptionMigration(eventWithOrgId.Event) {
 			taskName = "encryptionMigration"
-			err = runTaskWithMetrics(taskName, workerMetrics, func() error {
-				return runEncryptionMigrationBatch(ctx, eventWithOrgId.OrgId, eventWithOrgId.Event, encryptionMigrator, queuePublisher, log)
+			err = runTaskWithMetrics(taskName, d.WorkerMetrics, func() error {
+				return runEncryptionMigrationBatch(ctx, eventWithOrgId.OrgId, eventWithOrgId.Event, d.EncryptionMigrator, d.QueuePublisher, log)
 			})
 			errorMessages = appendErrorMessage(errorMessages, taskName, err)
 		}
@@ -142,7 +213,7 @@ func dispatchTasks(fleetSvc fleetservice.Service, templateversionSvc templatever
 			// ensure emission even if processing ctx timed out
 			emitCtx, cancelEmit := context.WithTimeout(context.Background(), AckTimeout)
 			defer cancelEmit()
-			EmitInternalTaskFailedEvent(emitCtx, eventWithOrgId.OrgId, errorMessage, eventWithOrgId.Event, eventSvc)
+			EmitInternalTaskFailedEvent(emitCtx, eventWithOrgId.OrgId, errorMessage, eventWithOrgId.Event, d.EventSvc)
 			returnErr = errors.New(errorMessage)
 		}
 
@@ -155,17 +226,14 @@ func dispatchTasks(fleetSvc fleetservice.Service, templateversionSvc templatever
 		}
 
 		// Record metrics only after successful completion
-		if workerMetrics != nil {
-			// Record processing duration
-			workerMetrics.ObserveProcessingDuration(time.Since(startTime))
+		if d.WorkerMetrics != nil {
+			d.WorkerMetrics.ObserveProcessingDuration(time.Since(startTime))
 
 			if len(errorMessages) > 0 {
-				// Record message queued for retry (actual retry/permanent failure determination happens in queue maintenance)
-				workerMetrics.IncMessagesProcessed("queued_for_retry")
+				d.WorkerMetrics.IncMessagesProcessed("queued_for_retry")
 			} else {
-				// Record successful processing
-				workerMetrics.IncMessagesProcessed("success")
-				workerMetrics.UpdateLastSuccessfulTask()
+				d.WorkerMetrics.IncMessagesProcessed("success")
+				d.WorkerMetrics.UpdateLastSuccessfulTask()
 			}
 		}
 
@@ -242,16 +310,18 @@ func shouldReconcileDeviceOwnership(ctx context.Context, event domain.Event, log
 
 	// If a device's labels were updated, return true
 	if event.Reason == domain.EventReasonResourceUpdated && event.InvolvedObject.Kind == domain.DeviceKind {
-		return hasUpdatedFields(event.Details, log, domain.Labels)
+		return hasUpdatedFields(event.Details, log, domain.Labels, domain.UpdatedFieldEnrollmentHooksCondition)
 	}
 
 	return false
 }
 
 func shouldValidateFleet(ctx context.Context, event domain.Event, log logrus.FieldLogger) bool {
-	// If a fleet's template was updated, return true
+	// Fleet template updates always need validation. A generic spec update can
+	// signal a delta-generation policy change that must supersede an in-flight
+	// prepare.
 	if event.Reason == domain.EventReasonResourceUpdated && event.InvolvedObject.Kind == domain.FleetKind {
-		return hasUpdatedFields(event.Details, log, domain.SpecTemplate)
+		return hasUpdatedFields(event.Details, log, domain.SpecTemplate, domain.Spec)
 	}
 
 	// If a fleet was created, return true
@@ -281,7 +351,8 @@ func shouldRenderDevice(ctx context.Context, event domain.Event, log logrus.Fiel
 		domain.EventReasonDependencyChangeDetected,
 		domain.EventReasonResourceCreated,
 		domain.EventReasonFleetRolloutDeviceSelected, domain.EventReasonDeviceConflictResolved,
-		domain.EventReasonDeviceDecommissioned, domain.EventReasonApplicationLifecycleChanged}, event.Reason) {
+		domain.EventReasonDeviceDecommissioned, domain.EventReasonApplicationLifecycleChanged,
+		domain.EventReasonDeltaGenerationCompleted}, event.Reason) {
 		return true
 	}
 
@@ -323,6 +394,10 @@ func shouldUpdateRepositoryReferers(ctx context.Context, event domain.Event, log
 	}
 
 	return false
+}
+
+func shouldEnrollmentHookNotify(event domain.Event) bool {
+	return event.Reason == domain.EventReasonEnrollmentRequestApproved
 }
 
 func shouldRunEncryptionMigration(event domain.Event) bool {
@@ -405,30 +480,14 @@ func hasUpdatedFields(details *domain.EventDetails, log logrus.FieldLogger, fiel
 	return false
 }
 
-func LaunchConsumers(ctx context.Context,
-	queuesProvider queues.Provider,
-	fleetSvc fleetservice.Service,
-	templateversionSvc templateversionservice.Service,
-	deviceSvc deviceservice.Service,
-	dependencyrefSvc dependencyrefservice.Service,
-	repositorySvc repositoryservice.Service,
-	catalogSvc catalogservice.Service,
-	eventSvc eventservice.Service,
-	k8sClient k8sclient.K8SClient,
-	kvStore kvstore.KVStore,
-	cfg *config.Config,
-	numConsumers, threadsPerConsumer int,
-	workerMetrics *worker.WorkerCollector,
-	encryptionMigrator *EncryptionMigrator,
-	queuePublisher queues.QueueProducer) error {
+func LaunchConsumers(ctx context.Context, queuesProvider queues.Provider, d TaskConsumer, numConsumers, threadsPerConsumer int) error {
 	totalConsumers := numConsumers * threadsPerConsumer
 
-	// Set active consumers metric
-	if workerMetrics != nil {
-		workerMetrics.SetConsumersActive(float64(totalConsumers))
+	if d.WorkerMetrics != nil {
+		d.WorkerMetrics.SetConsumersActive(float64(totalConsumers))
 		go func() {
 			<-ctx.Done()
-			workerMetrics.SetConsumersActive(0)
+			d.WorkerMetrics.SetConsumersActive(0)
 		}()
 	}
 
@@ -438,7 +497,7 @@ func LaunchConsumers(ctx context.Context,
 			return err
 		}
 		for j := 0; j != threadsPerConsumer; j++ {
-			if err = consumer.Consume(ctx, dispatchTasks(fleetSvc, templateversionSvc, deviceSvc, dependencyrefSvc, repositorySvc, catalogSvc, eventSvc, k8sClient, kvStore, cfg, workerMetrics, encryptionMigrator, queuePublisher)); err != nil {
+			if err = consumer.Consume(ctx, d.dispatch()); err != nil {
 				return err
 			}
 		}

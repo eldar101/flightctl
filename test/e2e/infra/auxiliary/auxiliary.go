@@ -6,9 +6,11 @@ package auxiliary
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"sync"
 
 	"github.com/sirupsen/logrus"
@@ -19,17 +21,22 @@ var (
 	svcs *Services
 )
 
-// Services holds the E2E aux services (registry, git, prometheus, jaeger, keycloak, trustify, file server).
+// ApplyDeltaWorkerRegistryRemap is set by infra/setup. It writes remap config
+// through InfraProvider and restarts the delta worker and render worker through Lifecycle.
+var ApplyDeltaWorkerRegistryRemap func(ctx context.Context, registryURL string) error
+
+// Services holds the E2E aux services (registry, git, prometheus, jaeger, keycloak, trustify, file server, telemetry HTTP collector).
 // Same for all deployment types; created once and reused. Each service is nil until started.
 // reuse is kept so Cleanup can no-op when reuse=true (containers stay running for the next run).
 type Services struct {
-	Registry   *Registry
-	GitServer  *GitServer
-	Prometheus *Prometheus
-	Jaeger     *Jaeger
-	Keycloak   *Keycloak
-	Trustify   *Trustify
-	FileServer *FileServer
+	Registry               *Registry
+	GitServer              *GitServer
+	Prometheus             *Prometheus
+	Jaeger                 *Jaeger
+	Keycloak               *Keycloak
+	Trustify               *Trustify
+	FileServer             *FileServer
+	TelemetryHTTPCollector *TelemetryHTTPCollector
 
 	reuse bool
 }
@@ -38,13 +45,14 @@ type Services struct {
 type Service string
 
 const (
-	ServiceRegistry   Service = "registry"
-	ServiceGitServer  Service = "git-server"
-	ServicePrometheus Service = "prometheus"
-	ServiceTracing    Service = "tracing"
-	ServiceKeycloak   Service = "keycloak"
-	ServiceTrustify   Service = "trustify"
-	ServiceFileServer Service = "file-server"
+	ServiceRegistry               Service = "registry"
+	ServiceGitServer              Service = "git-server"
+	ServicePrometheus             Service = "prometheus"
+	ServiceTracing                Service = "tracing"
+	ServiceKeycloak               Service = "keycloak"
+	ServiceTrustify               Service = "trustify"
+	ServiceFileServer             Service = "file-server"
+	ServiceTelemetryHTTPCollector Service = "telemetry-http-collector"
 )
 
 // AllServices is the default set of shared aux services (started by Get(ctx)).
@@ -65,7 +73,8 @@ func Get(ctx context.Context) *Services {
 }
 
 // StartServices starts only the requested aux services with reuse=true.
-// For registry, image bundles are uploaded when the container is freshly created (not reused).
+// Image bundles are always uploaded so registry manifests match the bundle
+// (reuse must not keep a docker-archive rewrite from an earlier run).
 func StartServices(ctx context.Context, services []Service) (*Services, error) {
 	network := GetDockerNetwork()
 	reuse := true
@@ -77,10 +86,10 @@ func StartServices(ctx context.Context, services []Service) (*Services, error) {
 			if err := s.Registry.Start(ctx, network, reuse); err != nil {
 				return nil, fmt.Errorf("failed to start registry: %w", err)
 			}
+			if err := s.UploadImages(ctx); err != nil {
+				return nil, fmt.Errorf("failed to upload images: %w", err)
+			}
 			if !s.Registry.Reused {
-				if err := s.UploadImages(ctx); err != nil {
-					return nil, fmt.Errorf("failed to upload images: %w", err)
-				}
 				if err := s.UploadCharts(); err != nil {
 					return nil, fmt.Errorf("failed to upload charts: %w", err)
 				}
@@ -91,7 +100,7 @@ func StartServices(ctx context.Context, services []Service) (*Services, error) {
 					return nil, fmt.Errorf("failed to mirror external test images: %w", err)
 				}
 			} else {
-				logrus.Info("Skipping artifact upload (registry container was reused)")
+				logrus.Info("Skipping chart/quadlet/external upload (registry container was reused)")
 			}
 		case ServiceGitServer:
 			s.GitServer = &GitServer{}
@@ -123,6 +132,11 @@ func StartServices(ctx context.Context, services []Service) (*Services, error) {
 			if err := s.FileServer.Start(ctx, network, reuse); err != nil {
 				return nil, fmt.Errorf("failed to start file server: %w", err)
 			}
+		case ServiceTelemetryHTTPCollector:
+			s.TelemetryHTTPCollector = &TelemetryHTTPCollector{}
+			if err := s.TelemetryHTTPCollector.Start(ctx, network, reuse); err != nil {
+				return nil, fmt.Errorf("failed to start telemetry HTTP collector: %w", err)
+			}
 		default:
 			return nil, fmt.Errorf("unknown service: %q", svc)
 		}
@@ -142,37 +156,74 @@ func (s *Services) Cleanup(ctx context.Context) {
 
 // serviceContainerNames maps each Service to its podman container name.
 var serviceContainerNames = map[Service]string{
-	ServiceRegistry:   registryContainerName,
-	ServiceGitServer:  gitServerContainerName,
-	ServicePrometheus: prometheusContainerName,
-	ServiceTracing:    jaegerContainerName,
-	ServiceKeycloak:   keycloakContainerName,
-	ServiceTrustify:   trustifyAPIContainer,
-	ServiceFileServer: fileServerContainerName,
+	ServiceRegistry:               registryContainerName,
+	ServiceGitServer:              gitServerContainerName,
+	ServicePrometheus:             prometheusContainerName,
+	ServiceTracing:                jaegerContainerName,
+	ServiceKeycloak:               keycloakContainerName,
+	ServiceTrustify:               trustifyAPIContainer,
+	ServiceFileServer:             fileServerContainerName,
+	ServiceTelemetryHTTPCollector: telemetryHTTPCollectorContainerName,
+}
+
+// telemetryCollectorContainerNameForProcess returns a process-specific
+// container name for parallel E2E workers.
+func telemetryCollectorContainerNameForProcess(baseName string) string {
+	if baseName == "" {
+		return ""
+	}
+	process := 1
+	if value, err := strconv.Atoi(os.Getenv("GINKGO_PARALLEL_PROCESS")); err == nil && value > 0 {
+		process = value
+	}
+	return fmt.Sprintf("%s-%d", baseName, process)
+}
+
+// telemetryHTTPCollectorContainerNameForProcess returns the current worker's
+// HTTP collector container name.
+func telemetryHTTPCollectorContainerNameForProcess() string {
+	return telemetryCollectorContainerNameForProcess(telemetryHTTPCollectorContainerName)
 }
 
 // StopServices force-removes the containers for the requested aux services.
 func StopServices(services []Service) error {
+	var removeErr error
 	for _, svc := range services {
-		name, ok := serviceContainerNames[svc]
+		names, ok := serviceContainerNamesForStop(svc)
 		if !ok {
 			return fmt.Errorf("unknown service: %q", svc)
 		}
-		logrus.Infof("Stopping aux container %s", name)
-		if err := podmanRemove(name); err != nil {
-			logrus.Warnf("Could not remove %s: %v", name, err)
+		for _, name := range names {
+			logrus.Infof("Stopping aux container %s", name)
+			if err := podmanRemove(name); err != nil {
+				logrus.Warnf("Could not remove %s: %v", name, err)
+				removeErr = errors.Join(removeErr, fmt.Errorf("remove %s: %w", name, err))
+			}
 		}
 		if svc == ServiceRegistry {
 			logrus.Infof("Stopping satellite container %s", privateRegistryContainerName)
 			if err := podmanRemove(privateRegistryContainerName); err != nil {
 				logrus.Warnf("Could not remove %s: %v", privateRegistryContainerName, err)
+				removeErr = errors.Join(removeErr, fmt.Errorf("remove %s: %w", privateRegistryContainerName, err))
 			}
 		}
 		if svc == ServiceTrustify {
 			StopTrustifyContainers()
 		}
 	}
-	return nil
+	return removeErr
+}
+
+// serviceContainerNamesForStop returns all container names owned by a service.
+func serviceContainerNamesForStop(svc Service) ([]string, bool) {
+	name, ok := serviceContainerNames[svc]
+	if !ok {
+		return nil, false
+	}
+	if svc != ServiceTelemetryHTTPCollector {
+		return []string{name}, true
+	}
+	return []string{telemetryHTTPCollectorContainerNameForProcess()}, true
 }
 
 func podmanRemove(containerName string) error {

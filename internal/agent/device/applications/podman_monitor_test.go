@@ -224,6 +224,8 @@ func TestListenForEvents(t *testing.T) {
 					inspectCount.Add(1)
 					return string(inspectBytes), "", 0
 				}).AnyTimes()
+			execMock.EXPECT().ExecuteWithContext(gomock.Any(), "podman", "image", "inspect", "--format", "{{.Digest}}", gomock.Any()).
+				Return("sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "", 0).AnyTimes()
 			podmanEventsCommandMock(execMock).Return(streamDataToStdout(t, reader))
 
 			podman := client.NewPodman(log, execMock, rw, util.NewPollConfig())
@@ -669,7 +671,10 @@ func TestVMHealthGatedCrashLoopSequence(t *testing.T) {
 		fileio.NewWriter(fileio.WithWriterRootDir(tmpDir)),
 	)
 	testLog := log.NewPrefixLogger("test")
-	podman := client.NewPodman(testLog, executer.NewMockExecuter(ctrl), rw, util.NewPollConfig())
+	mockExec := executer.NewMockExecuter(ctrl)
+	mockExec.EXPECT().ExecuteWithContext(gomock.Any(), "podman", "image", "inspect", "--format", "{{.Digest}}", "docker.io/library/alpine:latest").
+		Return("sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "", 0).Times(2)
+	podman := client.NewPodman(testLog, mockExec, rw, util.NewPollConfig())
 	var podmanFactory client.PodmanFactory = func(_ v1beta1.Username) (*client.Podman, error) { return podman, nil }
 	var systemdFactory systemd.ManagerFactory = func(_ v1beta1.Username) (systemd.Manager, error) { return systemdMgr, nil }
 	var rwFactory fileio.ReadWriterFactory = func(_ v1beta1.Username) (fileio.ReadWriter, error) { return rw, nil }
@@ -726,6 +731,69 @@ func TestVMHealthGatedCrashLoopSequence(t *testing.T) {
 	healthy.ID = "container-id-2"
 	monitor.handleEvent(t.Context(), healthy)
 	assertSummary("1/1", v1beta1.ApplicationStatusRunning, v1beta1.ApplicationsSummaryStatusHealthy)
+}
+
+func TestPodmanMonitorTracksWorkloadImageDigest(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	testLog := log.NewPrefixLogger("test")
+	execMock := executer.NewMockExecuter(ctrl)
+	digests := []string{"sha256:first", "sha256:second", ""}
+	var digestCalls int
+	execMock.EXPECT().ExecuteWithContext(gomock.Any(), "podman", "image", "inspect", "--format", "{{.Digest}}", "quay.io/acme/app:latest").
+		DoAndReturn(func(_ context.Context, _ string, _ ...string) (string, string, int) {
+			digest := digests[digestCalls]
+			digestCalls++
+			if digest == "" {
+				return "", "image digest unavailable", 125
+			}
+			return digest, "", 0
+		}).Times(3)
+	podman := client.NewPodman(testLog, execMock, fileio.NewMockReadWriter(ctrl), util.NewPollConfig())
+	monitor := &PodmanMonitor{
+		apps:          make(map[string]Application),
+		clientFactory: func(_ v1beta1.Username) (*client.Podman, error) { return podman, nil },
+		log:           testLog,
+	}
+	app := &application{workloads: []Workload{{ID: "container-1", Name: "app-container"}}}
+	event := &client.PodmanEvent{ID: "container-1", Image: "quay.io/acme/app:latest", Name: "app-container"}
+
+	monitor.updateApplicationStatus(t.Context(), app, event, StatusRunning, 0, podman)
+	workload, ok := app.Workload(event.Name)
+	require.True(t, ok)
+	require.Equal(t, []WorkloadImage{{Image: event.Image, Digest: "sha256:first"}}, workload.Images)
+
+	// The digest is cached for repeat events from the same container.
+	monitor.updateApplicationStatus(t.Context(), app, event, StatusRunning, 0, podman)
+	require.Equal(t, 1, digestCalls)
+
+	// A new container ID can have new content behind the same mutable tag.
+	event.ID = "container-2"
+	monitor.updateApplicationStatus(t.Context(), app, event, StatusRunning, 0, podman)
+	workload, ok = app.Workload(event.Name)
+	require.True(t, ok)
+	require.Equal(t, []WorkloadImage{{Image: event.Image, Digest: "sha256:second"}}, workload.Images)
+
+	// If a new container event has no image reference, keep the reference but
+	// discard the old container's digest until the image can be checked again.
+	event.ID = "container-3"
+	event.Image = ""
+	monitor.updateApplicationStatus(t.Context(), app, event, StatusRunning, 0, podman)
+	workload, ok = app.Workload(event.Name)
+	require.True(t, ok)
+	require.Equal(t, []WorkloadImage{{Image: "quay.io/acme/app:latest"}}, workload.Images)
+
+	// A later event with the image reference retries digest resolution.
+	event.Image = "quay.io/acme/app:latest"
+	monitor.updateApplicationStatus(t.Context(), app, event, StatusRunning, 0, podman)
+	workload, ok = app.Workload(event.Name)
+	require.True(t, ok)
+	require.Equal(t, []WorkloadImage{{Image: event.Image}}, workload.Images)
+	require.Equal(t, 3, digestCalls)
+
+	// Events with no image reference keep the last known snapshot.
+	event.Image = ""
+	monitor.updateApplicationStatus(t.Context(), app, event, StatusRunning, 0, podman)
+	require.Equal(t, []WorkloadImage{{Image: "quay.io/acme/app:latest"}}, workload.Images)
 }
 
 func createMockPodmanEvent(name string, username v1beta1.Username, service, status string, exitCode int) client.PodmanEvent {
@@ -1672,6 +1740,39 @@ func TestPodmanMonitorResolveConsole(t *testing.T) {
 		streamClient.EXPECT().Send(gomock.Any()).Return(nil).AnyTimes()
 		streamClient.EXPECT().CloseSend().Return(nil).AnyTimes()
 		sess.Run(t.Context(), streamClient)
+	})
+
+	t.Run("When the app has runAs it should create the console Podman client for that user", func(t *testing.T) {
+		require := require.New(t)
+		ctrl := gomock.NewController(t)
+		testLog := log.NewPrefixLogger("test")
+		tmpDir := t.TempDir()
+		readWriter := fileio.NewReadWriter(
+			fileio.NewReader(fileio.WithReaderRootDir(tmpDir)),
+			fileio.NewWriter(fileio.WithWriterRootDir(tmpDir)),
+		)
+		execMock := executer.NewMockExecuter(ctrl)
+		podman := client.NewPodman(testLog, execMock, readWriter, util.NewPollConfig())
+		requestedUser := v1beta1.CurrentProcessUsername
+		podmanFactory := func(user v1beta1.Username) (*client.Podman, error) {
+			requestedUser = user
+			return podman, nil
+		}
+		systemdMgr := systemd.NewMockManager(ctrl)
+		systemdMgr.EXPECT().AddExclusions(gomock.Any()).AnyTimes()
+		systemdMgr.EXPECT().RemoveExclusions(gomock.Any()).AnyTimes()
+		systemdFactory := func(_ v1beta1.Username) (systemd.Manager, error) { return systemdMgr, nil }
+		rwFactory := func(_ v1beta1.Username) (fileio.ReadWriter, error) { return readWriter, nil }
+		m := NewPodmanMonitor(testLog, podmanFactory, systemdFactory, "", rwFactory)
+
+		appUser := v1beta1.Username("flightctl")
+		app := createTestVMApplication(require, "my-vm", v1beta1.ApplicationStatusRunning, appUser)
+		require.NoError(m.Ensure(t.Context(), app))
+		app.AddWorkload(&Workload{Name: "systemd-my-vm-compute", Status: StatusRunning})
+
+		_, err := m.resolveConsole("my-vm", "serial")
+		require.NoError(err)
+		require.Equal(appUser, requestedUser)
 	})
 
 	t.Run("When the app is VM serial with no running workload it should return an error", func(t *testing.T) {

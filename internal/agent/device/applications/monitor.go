@@ -73,6 +73,7 @@ type handlerRegistration struct {
 
 // AppStatusResult holds the status result for a single application.
 type AppStatusResult struct {
+	ID      string
 	Status  v1beta1.DeviceApplicationStatus
 	Summary v1beta1.DeviceApplicationsSummaryStatus
 }
@@ -249,12 +250,9 @@ func (m *monitor) updateWithWorkloads(app Application) error {
 	defer m.mu.Unlock()
 
 	appID := app.ID()
-	oldApp, ok := m.apps[appID]
-	if !ok {
-		return errors.ErrAppNotFound
+	if oldApp, ok := m.apps[appID]; ok {
+		app.CopyWorkloadsFrom(oldApp)
 	}
-
-	app.CopyWorkloadsFrom(oldApp)
 	m.apps[appID] = app
 
 	action := lifecycle.Action{
@@ -448,6 +446,7 @@ func (m *monitor) Status() ([]AppStatusResult, error) {
 			continue
 		}
 		results = append(results, AppStatusResult{
+			ID:      app.ID(),
 			Status:  *appStatus,
 			Summary: appSummary,
 		})

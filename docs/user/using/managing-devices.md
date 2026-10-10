@@ -57,6 +57,16 @@ NAME                                                  APPROVAL  APPROVER  APPROV
 
 Once approved, the device will get issued its initial management certificate and get registered to the device inventory and is now ready to be managed.
 
+### Overriding a failed enrollment hook
+
+If a webhook or `AfterEnrolling` hook fails with the `Block` failure policy, the device's `EnrollmentHooks` condition is `False` with reason `Failed`. The device remains excluded from fleet matching and rendered specification delivery.
+
+An authorized administrator or operator can send a `POST` request to `/api/v1/devices/<device_name>/enrollmenthooks/override`. This sets the condition to `True` with reason `ManualOverride` and clears the gate. The request does not re-approve enrollment, rotate the device's management certificate, or rerun notification.
+
+The agent can report hook outcomes by changing `Pending` to `Succeeded`, `Continued`, or `Failed` through a device-status patch. Other condition changes and removal are rejected. Use the override endpoint to clear a recorded failure.
+
+For hook configuration, failure policies, and restart behavior, see [Using enrollment hooks](enrollment-hooks.md).
+
 ## Viewing the Device Inventory and Device Details
 
 Flight Control automatically gathers system information from each device to help identify its hardware, OS, and environment. This data is shown in the `status.systemInfo` field. Fields can optionally be promoted to labels during the enrollment process, this must be done manually or through external automation. Promoting fields to labels enables powerful grouping and querying capabilities, such as filtering devices by region or OS version. You can also define your own fields in `status.systemInfo.customInfo`, allowing the agent to collect user-defined metadata through custom commands.
@@ -69,15 +79,39 @@ Here are key considerations when using this feature:
 
 * **Custom Fields**: You can configure the agent to collect additional custom attributes specific to your environment. These are displayed under `systemInfo.customInfo` and can be used for labeling or grouping devices. See [Installing and configuring the Flight Control Agent](../installing/installing-agent.md) for example usage.
 
-* **Collection Timing**: System info is collected during process bootstrap and then cached. It refreshes only if the agent restarts or receives a reload signal (SIGHUP). This avoids unnecessary overhead during regular status updates.
+* **Collection Timing**: System info is collected at agent startup and then periodically re-collected on a configurable interval (see [`system-info-periodic`](../installing/installing-agent.md#periodic-system-info-collection)). The collection interval defaults to `status-update-interval`. Collection also refreshes when the agent receives a reload signal (SIGHUP).
 
 * **Reboot Awareness**: The agent tracks boot time and boot ID, allowing Flight Control to detect whether the device has rebooted. This is useful for update coordination and lifecycle monitoring.
 
 * **Partial Data**: Not all fields may be available on every device or on every process start. Collection is best-effort missing values errors or timeouts will result in empty values.
 
+### System info collection status
+
+The agent reports the health of system info collection in `status.systemInfoStatus`. The `summary` field provides an overall status with one of the following values: `Healthy`, `Degraded`, `Error`, or `Unknown`.
+
+The `statuses` field contains per-source details organized into two sub-maps:
+
+* `systemInfo`: Status entries for built-in collectors.
+* `customInfo`: Status entries for custom collector scripts.
+
+Each source status entry includes:
+
+| Field                | Description                                                     |
+|----------------------|-----------------------------------------------------------------|
+| `status`             | One of `Healthy`, `Degraded`, `Error`, or `Unknown`.            |
+| `message`            | A human-readable description of the status or error.            |
+| `lastTransitionTime` | Timestamp of the last status change for this source.            |
+
+The `SYSTEM INFO` column in `flightctl get devices` output displays the summary status for quick visibility across the fleet. To see per-source details, view the device in YAML or JSON format.
+
+> [!NOTE]
+> System info collection status is maintained in memory and is not persisted as device labels.
+
 ### OS mode
 
-Devices report an OS management mode in `status.capabilities.osMode`:
+Devices report an OS management mode in `status.systemInfo.osMode`. Devices
+running older agents report it in the deprecated `status.capabilities.osMode`
+field instead:
 
 | Value | Meaning |
 | ----- | ------- |
@@ -92,11 +126,11 @@ example `distroName` and `distroVersion`).
 To list package-mode devices:
 
 ```bash
-flightctl get devices --field-selector 'status.capabilities.osMode=package'
+flightctl get devices --field-selector 'status.systemInfo.osMode=package'
 ```
 
 To inspect OS mode on a single device, view the device YAML and look for
-`status.capabilities.osMode`:
+`status.systemInfo.osMode`:
 
 ```bash
 flightctl get device/<device_name> -o yaml
@@ -119,8 +153,8 @@ flightctl get devices
 The output will be a table similar to this:
 
 ```console
-NAME                                                  ALIAS    OWNER   SYSTEM  UPDATED     APPLICATIONS
-54shovu028bvj6stkovjcvovjgo0r48618khdd5huhdjfn6raskg  <none>   <none>  Online  Up-to-date  <none>
+NAME                                                  ALIAS    OWNER   SYSTEM  UPDATED     APPLICATIONS  SYSTEM INFO
+54shovu028bvj6stkovjcvovjgo0r48618khdd5huhdjfn6raskg  <none>   <none>  Online  Up-to-date  <none>        Healthy
 ```
 
 You can see one or more specific devices in the inventory using any of these formats:
@@ -179,6 +213,9 @@ status:
     architecture: amd64
     bootID: 037750f7-f293-4c5b-b06e-481eef4e883f
     operatingSystem: linux
+  systemInfoStatus:                          # <-- health status of system info collection
+    summary:
+      status: Healthy
   summary:
     info: ""
     status: Online                           # <-- online status of the device
@@ -354,6 +391,37 @@ spec:
 [...]
 ```
 
+### Using control-plane-generated OS deltas
+
+When a device or fleet receives a changed OS image target, Flight Control can generate a delta from the current image to the target during update preparation.
+
+Before using control-plane generation, configure a valid, writable OCI [delta storage target](managing-repositories.md#configuring-a-delta-storage-target) for the organization or deployment. Ensure both the control plane and the device agent can access the registry. See [Delta storage target access requirements](managing-repositories.md#configuring-a-delta-storage-target).
+
+For a fleet, configure generation and rollout wait behavior under `spec.rolloutPolicy.deltaGeneration`. If `generateDelta` is omitted, it defaults to `true`. A fleet's `maxWaitForDelta` and `deltaGenerationTimeout` values inherit the deployment settings when omitted. Standalone device updates automatically request generation for eligible image pairs when a storage target is configured, using the [deployment defaults](../installing/installing-service-on-linux-configuration.md#delta-generation-configuration). Their generation controls are configured at deployment scope. See [Configuring delta generation](managing-fleets.md#configuring-delta-generation) for fleet options.
+
+Flight Control supplies available generated deltas to the agent automatically. The agent can also discover a matching [CI-published OS delta](#using-ci-published-os-deltas). For diagnostics, see [Verifying delta registry access](troubleshooting.md#verifying-delta-registry-access) and [Inspecting delta image references](troubleshooting.md#inspecting-delta-image-references).
+
+The device's `status.os.deltaSize` reports the known size of the control-plane-generated OS delta payload in IEC units. Use the device's YAML or JSON output to inspect this payload size and the [OS delta status](../references/device-api-statuses.md#os-delta-status).
+
+### Using CI-published OS deltas
+
+You can publish an OS delta from CI to reduce the image data a device downloads during an OS update. Create the delta from the device's current OS image to the target OS image, then publish it as an OCI 1.1 referrer of the target image.
+
+For the agent to discover the delta, publish it with these values:
+
+- Publish it in the same repository as the target OS image.
+- Set the referrer's `subject` to the target image manifest.
+- Set `artifactType` to `application/vnd.io.github.containers.oci-delta.v1`.
+- Set the `io.github.containers.delta.source` annotation to the digest of the source OS image. This must match the device's current OS image digest.
+
+For example, for a target at `quay.io/example/os:v2`, publish the delta referrer in `quay.io/example/os` and set its subject to the target manifest digest.
+
+The agent discovers matching referrers directly in the target image repository using the registry's referrers API or the Referrers Tag Schema compatibility path. Flight Control sets the read-only `spec.os.deltaImage` field for available generated deltas; the agent tries that reference first, then uses referrer discovery when the reference is absent.
+
+The device uses its existing OS image pull credentials to pull the target image and delta. See [Using Image Pull Secrets](#using-image-pull-secrets) for private registries.
+
+The agent uses a full image pull when a matching delta is unavailable or a delta pull or apply fails. See [OS delta status](../references/device-api-statuses.md#os-delta-status) for outcome definitions and how to inspect the result of an OS delta update.
+
 ### Using Image Pull Secrets
 
 If your device relies on containers from a private repository, [authentication credentials](https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/9/html-single/using_image_mode_for_rhel_to_build_deploy_and_manage_operating_systems/index#configuring-container-pull-secrets_managing-users-groups-ssh-key-and-secrets-in-image-mode-for-rhel) (pull secrets) must be placed in the appropriate system paths.
@@ -519,6 +587,10 @@ spec:
 
 For HTTPS repositories, use basic authentication, bearer tokens, or client certificates:
 
+Git repositories use their configured TLS settings independently. For HTTPS connections, custom certificate authorities, client certificates, and `skipServerVerification` apply only to the repository that defines them. Repositories without custom TLS settings use the system trust store and verify server certificates.
+
+If you configure `ca.crt` for a Git repository, provide a PEM bundle encoded with base64 that contains at least one valid certificate. Empty or invalid bundles cause repository operations to fail before connecting.
+
 **Basic authentication (username/password):**
 
 ```yaml
@@ -679,6 +751,31 @@ spec:
 
 You can deploy, update, or undeploy applications on a device by updating the list of applications in the device's specification. The next time the agent checks in, it learns of the change in the specification, downloads any new or updated application packages and images from an OCI-compatible registry, and deploys them to the appropriate application runtime or removes them from that runtime.
 
+### Using application image deltas
+
+Application image deltas can be published by CI or generated by Flight Control. The agent checks the parent application image and nested OCI image targets independently. It reports each application's image references and known digests in `status.applications[].imageDigests[]`. Flight Control uses these entries to identify source images for generation. See [application delta status](../references/device-api-statuses.md#application-delta-status) for the field details.
+
+Before using control-plane generation, configure a valid, writable OCI [delta storage target](managing-repositories.md#configuring-a-delta-storage-target) for the organization or deployment. Ensure both the control plane and the device agent can access the registry. See [Delta storage target access requirements](managing-repositories.md#configuring-a-delta-storage-target). See [Deployment delta generation configuration](../installing/installing-service-on-linux-configuration.md#delta-generation-configuration) for shared defaults and [Configuring delta generation](managing-fleets.md#configuring-delta-generation) for fleet overrides.
+
+Flight Control evaluates reported main and nested image references as delta generation candidates. The following table describes delta application paths on the device. Include `oci-delta` in the device image and verify that `status.systemInfo.deltaEligible` is `true`. Generation also requires a known source image digest.
+
+| Application | Delta application targets | Supported runtime |
+| ----------- | -------------------------- | ----------------- |
+| Container | Main container image and container images used by volumes. | Podman. |
+| Compose or Quadlet | Application package when delivered as an OCI container image, workload container images, and container images used by volumes. | Podman. |
+| Helm | Workload container images referenced by tags. Digest-pinned images currently use regular CRI pulls. | CRI-O or containerd. Other CRI runtimes use full image pulls. |
+| VM | OCI container images used by the VM application. | Podman. |
+
+The main application package, when delivered as an OCI artifact, and the Helm chart itself use regular package pulls. Workload images and image-backed volumes are evaluated individually for delta generation and application. Digest-pinned Helm workload images currently use regular CRI image pulls. See [CRI configuration](#cri-configuration) for local image reuse requirements.
+
+For a CI-published application image delta, follow the OCI 1.1 referrer convention in [CI-published OS deltas](#using-ci-published-os-deltas). Publish the referrer in the target image's repository. Set its `subject` to the target manifest, `artifactType` to `application/vnd.io.github.containers.oci-delta.v1`, and the `io.github.containers.delta.source` annotation to the source application's image digest from `status.applications[].imageDigests[].digest`. The agent discovers matching referrers directly in that repository.
+
+Flight Control supplies generated application deltas to the agent automatically. For each image target, the agent uses an available generated delta or discovers a matching CI-published referrer. Otherwise, it pulls the full image for the current update.
+
+Generated deltas are downloaded from the configured storage target. CI-published deltas are discovered in the target image's repository. For diagnostics, see [Verifying delta registry access](troubleshooting.md#verifying-delta-registry-access) and [Inspecting delta image references](troubleshooting.md#inspecting-delta-image-references).
+
+The agent applies a usable delta separately for each image target. If pulling or applying a delta fails, it records the full-pull fallback for that image and attempts a full image pull for the same target. The aggregated application outcome is `Partial` when another target successfully applies a delta, or `Fallback` when all targets requiring preparation use full pulls. Application outcomes and their representative fallback reason appear in [application delta status](../references/device-api-statuses.md#application-delta-status).
+
 ### Container Image Versioning and Floating Tags
 
 Flight Control uses a declarative API model that expects container images to be immutable for each rendered device version. Floating tags like `latest` are **not recommended** as they can change unexpectedly and cause version skew across your fleet. Changes to floating tags are not automatically reconciled by the service or agent, updates must be explicitly declared.
@@ -730,7 +827,7 @@ The following table shows the application runtimes and formats supported by Flig
 > `vm` applications require the `/dev/kvm` device node to be present on the device. This requires CPU virtualization extensions (Intel VT-x or AMD-V) and the `kvm` kernel module to be loaded.
 
 > [!NOTE]
-> Image downloads adhere to the `pull-timeout` [configuration](../installing/installing-agent.md#agent-configuration).
+> Image downloads adhere to the `pull-timeout` [configuration](../installing/installing-agent.md#configuring-the-agent).
 
 > [!TIP]
 > Short image names (e.g., `nginx`) are not supported. Use fully qualified references like `docker.io/nginx` to avoid ambiguity.
@@ -743,6 +840,8 @@ To deploy an application to a device, create a new entry in the "applications" s
 | Image     | A reference to an application package in an OCI registry.                                                                       |
 | AppType   | The application format type. Currently supported types: `compose`, `quadlet`, `container`, `helm`, `vm`.                       |
 | EnvVars   | (Optional) A list of key/value-pairs that will be passed to the deployment tool as environment variables or command line flags. |
+
+For requirements to run a supported application as a non-root user, see [Running applications as non-root](running-applications-as-non-root.md).
 
 For each application in the "applications" section of the device's specification, there exist a corresponding device status information that contains the following information:
 
@@ -823,6 +922,7 @@ To deploy a VM application, add an entry to the `applications` section of the de
 | `name` | Required. Application name. Must match `metadata.name` inside the `vm.yaml` file. |
 | `appType` | Must be `vm` for VM applications. |
 | `inline` | Required. Exactly one file named `vm.yaml`. The file must be a KubeVirt `VirtualMachine` manifest with `apiVersion: kubevirt.io/v1`, `kind: VirtualMachine`, and `metadata.name` matching the application name. |
+| `runAs` | Optional. The system user under which the VM application runs on the device. Defaults to the user running the agent, generally `root`. Before using a non-root user, see [Running applications as non-root](running-applications-as-non-root.md). |
 | `publishPorts` | Optional. List of host-to-guest port mappings. Each entry must use the format `"hostPort:guestPort"` or `"hostPort:guestPort/protocol"` (for example, `"8080:80"` or `"8080:80/tcp"`). |
 
 Published host ports are unique per device and protocol across VM, container, and inline Quadlet `.container` applications. The API rejects a configuration when two applications request the same host port for the same protocol; an omitted protocol is treated as TCP.
@@ -1120,6 +1220,10 @@ image-endpoint: unix:///var/run/crio/crio.sock
 runtime-endpoint: unix:///run/containerd/containerd.sock
 image-endpoint: unix:///run/containerd/containerd.sock
 ```
+
+When an OCI delta is available for a Helm workload image, the agent reconstructs it and imports it into the local CRI runtime. Containerd hosts use `ctr` and the `k8s.io` namespace. Digest-pinned workload images use a regular pull because reconstruction can change the manifest digest. If delta import is unavailable or fails, the agent falls back to `crictl pull`.
+
+Kubernetes can use the imported image without contacting the registry when the workload's `imagePullPolicy` allows local reuse. With `Always`, Kubernetes asks the runtime to resolve the image remotely, which can fetch layers whose digests differ from the reconstructed image.
 
 #### Helm Application Specification
 
@@ -1436,16 +1540,11 @@ spec:
 
 Quadlet applications use [Podman Quadlet](https://docs.podman.io/en/latest/markdown/podman-systemd.unit.5.html) to manage containers as native systemd services. This allows full integration with systemd's dependency management, restart policies, resource limits, and logging.
 
-We recommend running regular workloads under a rootless podman instance under the provided
-`flightctl` user's systemd instance on the agent machine. This user is automatically created when
-installing the `flightctl-agent` package. You do this by specifying the `runAs: flightctl` option in
-the application yaml config. If `runAs` is not specified, the application will run under the root
-podman and systemd instance.
-
-You may also provision your own user to run rootless applications under, but it is necessary to run
-`loginctl enable-linger <username>` to ensure the systemd instance for that user runs in the
-background without the user being logged in. Also, the user needs to have a home directory set and
-writable by that user.
+For Quadlet applications, `runAs` determines which Podman and systemd instances manage the
+generated Quadlet units. If `runAs` is omitted or set to `root`, the root Podman and systemd
+instances are used. If `runAs` selects a non-root user, that user's rootless Podman and user-level
+systemd instances are used. Before setting `runAs` to a non-root user, complete the [rootless
+application device configuration](running-applications-as-non-root.md).
 
 Reasons for running an application under the root podman include:
 
@@ -1454,11 +1553,6 @@ Reasons for running an application under the root podman include:
 - [Other limitations to be aware of](https://github.com/containers/podman/blob/main/rootless.md#shortcomings-of-rootless-podman)
 
 But many applications should not need access to the root podman instance.
-
-> [!NOTE]
-> If you want to set cpu limits on your rootless quadlet application, you might need to add
-> configuration to systemd to allow delegation of cpu cgroups to non-root users. See [this
-> troubleshooting guide for more details](https://github.com/containers/podman/blob/main/troubleshooting.md#26-running-containers-with-resource-limits-fails-with-a-permissions-error).
 
 #### Supported Quadlet File Types
 
@@ -1695,7 +1789,8 @@ applications, quadlet definitions are the recommended approach.
 * **Image** - Required - Reference to OCI runnable image
 * **RunAs** - Optional - This determines which container runtime the application will run under. By
   default it runs under the root podman/systemd instance. If set to a non-root user, it runs under a
-  rootless podman instance for that user.
+  rootless podman instance for that user. Before using a non-root user, see the
+  [`runAs` application prerequisites](running-applications-as-non-root.md).
 * **Environment Variables** - Optional - Variables to be injected into the running container
 * **Port Mappings** - Optional - Must be in the format `hostPort:containerPort[/protocol]`, with each port limited in the range of `1-65535`. Published host ports are unique per device and protocol across VM, container, and inline Quadlet `.container` applications; an omitted protocol is treated as TCP.
 * **CPU Limits** - Optional - Positive decimal number (e.g., `"1.5"`, `"2"`, `"0.5"`)
@@ -1861,7 +1956,7 @@ Volume images must follow the OCI artifact specification:
 > it will be placed into the existing directory using the file name in the name field for the layer.
 
 > [!NOTE]
-> Artifact downloads adhere to the `pull-timeout` [configuration](../installing/installing-agent.md#agent-configuration).
+> Artifact downloads adhere to the `pull-timeout` [configuration](../installing/installing-agent.md#configuring-the-agent).
 
 #### Device Requirements
 
@@ -2001,6 +2096,9 @@ spec:
 
 > [!NOTE]
 > When a critical disk alert is active, device upgrades that require downloading OCI images will automatically fail to prevent upgrade failures due to insufficient disk space. The upgrade will fail with an error message prompting you to clear storage before attempting the upgrade again.
+
+> [!NOTE]
+> When a critical resource alert fires or clears, the agent reports the change to the Flight Control service immediately without waiting for the next periodic status sync. This behavior is automatic for all critical alert rules and requires no additional configuration.
 
 ## Accessing Devices Remotely
 

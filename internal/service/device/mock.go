@@ -44,6 +44,21 @@ func (m *MockService) EXPECT() *MockServiceMockRecorder {
 	return m.recorder
 }
 
+// ClearDeltaPreparingIfCurrent mocks base method.
+func (m *MockService) ClearDeltaPreparingIfCurrent(ctx context.Context, orgID uuid.UUID, name string, generation int64) (bool, domain.Status) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ClearDeltaPreparingIfCurrent", ctx, orgID, name, generation)
+	ret0, _ := ret[0].(bool)
+	ret1, _ := ret[1].(domain.Status)
+	return ret0, ret1
+}
+
+// ClearDeltaPreparingIfCurrent indicates an expected call of ClearDeltaPreparingIfCurrent.
+func (mr *MockServiceMockRecorder) ClearDeltaPreparingIfCurrent(ctx, orgID, name, generation any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ClearDeltaPreparingIfCurrent", reflect.TypeOf((*MockService)(nil).ClearDeltaPreparingIfCurrent), ctx, orgID, name, generation)
+}
+
 // CountDevices mocks base method.
 func (m *MockService) CountDevices(ctx context.Context, orgId uuid.UUID, params domain.ListDevicesParams, annotationSelector *selector.AnnotationSelector) (int64, domain.Status) {
 	m.ctrl.T.Helper()
@@ -325,6 +340,21 @@ func (mr *MockServiceMockRecorder) MarkDevicesRolloutSelection(ctx, orgId, param
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "MarkDevicesRolloutSelection", reflect.TypeOf((*MockService)(nil).MarkDevicesRolloutSelection), ctx, orgId, params, annotationSelector, limit)
 }
 
+// OverrideDeviceEnrollmentHook mocks base method.
+func (m *MockService) OverrideDeviceEnrollmentHook(ctx context.Context, orgId uuid.UUID, name string) (*domain.Device, domain.Status) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "OverrideDeviceEnrollmentHook", ctx, orgId, name)
+	ret0, _ := ret[0].(*domain.Device)
+	ret1, _ := ret[1].(domain.Status)
+	return ret0, ret1
+}
+
+// OverrideDeviceEnrollmentHook indicates an expected call of OverrideDeviceEnrollmentHook.
+func (mr *MockServiceMockRecorder) OverrideDeviceEnrollmentHook(ctx, orgId, name any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "OverrideDeviceEnrollmentHook", reflect.TypeOf((*MockService)(nil).OverrideDeviceEnrollmentHook), ctx, orgId, name)
+}
+
 // OverwriteDeviceRepositoryRefs mocks base method.
 func (m *MockService) OverwriteDeviceRepositoryRefs(ctx context.Context, orgId uuid.UUID, name string, repositoryNames ...string) domain.Status {
 	m.ctrl.T.Helper()
@@ -417,6 +447,21 @@ func (m *MockService) ReplaceDeviceStatus(ctx context.Context, orgId uuid.UUID, 
 func (mr *MockServiceMockRecorder) ReplaceDeviceStatus(ctx, orgId, name, device, refreshLastSeen any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ReplaceDeviceStatus", reflect.TypeOf((*MockService)(nil).ReplaceDeviceStatus), ctx, orgId, name, device, refreshLastSeen)
+}
+
+// ReplaceServiceOwnedStatus mocks base method.
+func (m *MockService) ReplaceServiceOwnedStatus(ctx context.Context, orgId uuid.UUID, name string, device domain.Device) (*domain.Device, domain.Status) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ReplaceServiceOwnedStatus", ctx, orgId, name, device)
+	ret0, _ := ret[0].(*domain.Device)
+	ret1, _ := ret[1].(domain.Status)
+	return ret0, ret1
+}
+
+// ReplaceServiceOwnedStatus indicates an expected call of ReplaceServiceOwnedStatus.
+func (mr *MockServiceMockRecorder) ReplaceServiceOwnedStatus(ctx, orgId, name, device any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ReplaceServiceOwnedStatus", reflect.TypeOf((*MockService)(nil).ReplaceServiceOwnedStatus), ctx, orgId, name, device)
 }
 
 // RestartDeviceApplication mocks base method.
@@ -566,17 +611,17 @@ func (mr *MockServiceMockRecorder) UpdateDeviceAnnotations(ctx, orgId, name, ann
 }
 
 // UpdateRenderedDevice mocks base method.
-func (m *MockService) UpdateRenderedDevice(ctx context.Context, orgId uuid.UUID, name, renderedConfig, renderedApplications, specHash, osImage string, configFingerprints []domain.DependencySyncConfigRefStatus, forceUpdate bool) domain.Status {
+func (m *MockService) UpdateRenderedDevice(ctx context.Context, orgId uuid.UUID, name, renderedConfig, renderedApplications, specHash, osImage string, configFingerprints []domain.DependencySyncConfigRefStatus, forceUpdate bool, osHints *RenderedOSHints) domain.Status {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "UpdateRenderedDevice", ctx, orgId, name, renderedConfig, renderedApplications, specHash, osImage, configFingerprints, forceUpdate)
+	ret := m.ctrl.Call(m, "UpdateRenderedDevice", ctx, orgId, name, renderedConfig, renderedApplications, specHash, osImage, configFingerprints, forceUpdate, osHints)
 	ret0, _ := ret[0].(domain.Status)
 	return ret0
 }
 
 // UpdateRenderedDevice indicates an expected call of UpdateRenderedDevice.
-func (mr *MockServiceMockRecorder) UpdateRenderedDevice(ctx, orgId, name, renderedConfig, renderedApplications, specHash, osImage, configFingerprints, forceUpdate any) *gomock.Call {
+func (mr *MockServiceMockRecorder) UpdateRenderedDevice(ctx, orgId, name, renderedConfig, renderedApplications, specHash, osImage, configFingerprints, forceUpdate, osHints any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UpdateRenderedDevice", reflect.TypeOf((*MockService)(nil).UpdateRenderedDevice), ctx, orgId, name, renderedConfig, renderedApplications, specHash, osImage, configFingerprints, forceUpdate)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UpdateRenderedDevice", reflect.TypeOf((*MockService)(nil).UpdateRenderedDevice), ctx, orgId, name, renderedConfig, renderedApplications, specHash, osImage, configFingerprints, forceUpdate, osHints)
 }
 
 // UpdateServerSideDeviceStatus mocks base method.

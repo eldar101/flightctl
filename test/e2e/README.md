@@ -107,6 +107,7 @@ When running e2e against a Quadlet deployment (e.g. after `make deploy-quadlets`
 | Variable | Description |
 |----------|-------------|
 | `REGISTRY_ENDPOINT` | Set by e2e infra (e.g. from aux) for deploy/scripts. Usually not set manually. |
+| `E2E_TELEMETRY_COLLECTOR_IMAGE` | Optional OTLP test collector image override. E2E defaults to the local auxiliary registry copy when `REGISTRY_ENDPOINT` is available. |
 
 ## Filtering the e2e run
 
@@ -132,6 +133,13 @@ Aux services are shared testcontainers used by e2e: **registry** (TLS on port 50
 The **auth-provider** suite (`test/e2e/authprovider`) uses Keycloak to test the OAuth authorization-code flow: it starts Keycloak in BeforeSuite, applies a dynamic OIDC AuthProvider, then runs `flightctl login --web --no-browser` and automates the Keycloak login page with chromedp. You can run that suite with `GO_E2E_DIRS=test/e2e/authprovider`; the suite starts Keycloak on its own, or run `make start-keycloak` first if you prefer.
 
 Registry is at `${IP}:5000` / `localhost:5000` (TLS). The test host is configured to treat it as an insecure registry; agents use the CA from `test/scripts/create_e2e_certs.sh`. See [Agent Images](../scripts/agent-images/README.md) for how agent images are built and pushed.
+
+The hooks E2E suite uses the `v13` agent image fixture. Build and push the
+agent images before running `test/e2e/hooks`; the suite updates a disposable VM
+to `v13`, decommissions it, and then validates the fresh enrollment flow. The
+notify-webhook case requires the VM harness to reach the E2E host IP and is
+therefore run in the VM/Quadlet profile; OCP runs cover the gate and image-hook
+cases when the profile provides a reachable host endpoint.
 
 Git server: SSH on port 2222, user `user`, key `bin/.ssh/id_rsa`. Example `~/.ssh/config` (with flightctl in `~/flightctl`):
 

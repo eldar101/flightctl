@@ -2,6 +2,8 @@ package provider
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"maps"
@@ -15,12 +17,12 @@ import (
 
 	"github.com/flightctl/flightctl/api/core/v1beta1"
 	"github.com/flightctl/flightctl/internal/agent/client"
-	"github.com/flightctl/flightctl/internal/agent/device/applications/helm"
 	"github.com/flightctl/flightctl/internal/agent/device/applications/lifecycle"
 	"github.com/flightctl/flightctl/internal/agent/device/dependency"
 	"github.com/flightctl/flightctl/internal/agent/device/errors"
 	"github.com/flightctl/flightctl/internal/agent/device/fileio"
 	"github.com/flightctl/flightctl/internal/api/common"
+	"github.com/flightctl/flightctl/internal/chartutil"
 	"github.com/flightctl/flightctl/internal/quadlet"
 	"github.com/flightctl/flightctl/internal/util/validation"
 	"github.com/flightctl/flightctl/pkg/log"
@@ -83,6 +85,8 @@ type ApplicationSpec struct {
 
 	// Image is the resolved OCI image reference for the application.
 	Image string
+	// ImageDigest is the known content digest of Image in local storage, when available.
+	ImageDigest string
 
 	// App-type-specific specs (only one will be set based on AppType)
 	ContainerApp *v1beta1.ContainerApplication
@@ -229,6 +233,10 @@ func collectProviderTargets(
 		if err != nil {
 			return nil, fmt.Errorf("%w: %w", errors.ErrGettingProviderSpec, err)
 		}
+		parentHint, nestedHints := applicationDeltaHints(p.Spec())
+		for user, userTargets := range baseTargets {
+			baseTargets[user] = decorateApplicationTargets(userTargets, parentHint, nestedHints, p.Name())
+		}
 		targets = targets.MergeWith(baseTargets)
 
 		nestedTargets, requeue, err := collectNestedForProvider(ctx, log, p, configProvider, ociCache, appDataCache)
@@ -238,6 +246,8 @@ func collectProviderTargets(
 		if requeue {
 			needsRequeue = true
 		}
+		_, nestedHints = applicationDeltaHints(p.Spec())
+		nestedTargets = decorateApplicationTargets(nestedTargets, nil, nestedHints, p.Name())
 		targets = targets.Add(p.Spec().User, nestedTargets...)
 	}
 
@@ -247,6 +257,131 @@ func collectProviderTargets(
 		Targets: targets,
 		Requeue: needsRequeue,
 	}, depsErr
+}
+
+func decorateApplicationTargets(
+	targets []dependency.OCIPullTarget,
+	parentHint *string,
+	nestedHints []v1beta1.ImageDeltaHint,
+	application string,
+) []dependency.OCIPullTarget {
+	for i := range targets {
+		target := &targets[i]
+		if target.Type == dependency.OCITypeHelmChart {
+			// The chart artifact is resolved to render workload manifests. Delta
+			// apply outcomes describe the workload images, not the chart package.
+			target.Delta = nil
+			continue
+		}
+		var hint string
+		if i == 0 && parentHint != nil {
+			hint = *parentHint
+		} else {
+			hint = nestedDeltaHintForTarget(*target, nestedHints)
+		}
+		sourceDigest := target.Digest
+		if sourceDigest == "" {
+			sourceDigest = digestFromReference(target.Reference)
+		}
+		target.Delta = &dependency.OCIDeltaTarget{
+			Hint:         hint,
+			SourceDigest: sourceDigest,
+			Application:  application,
+		}
+	}
+	return targets
+}
+
+func nestedDeltaHintForTarget(target dependency.OCIPullTarget, nestedHints []v1beta1.ImageDeltaHint) string {
+	for _, nestedHint := range nestedHints {
+		if nestedHint.TargetImage != "" && nestedHint.TargetImage == target.Reference {
+			return nestedHint.DeltaImage
+		}
+	}
+
+	digest := target.Digest
+	if digest == "" {
+		digest = digestFromReference(target.Reference)
+	}
+	if digest == "" {
+		return ""
+	}
+	for _, nestedHint := range nestedHints {
+		if nestedHint.TargetDigest == digest {
+			return nestedHint.DeltaImage
+		}
+	}
+	return ""
+}
+
+func applicationDeltaHints(spec *ApplicationSpec) (*string, []v1beta1.ImageDeltaHint) {
+	switch {
+	case spec.ContainerApp != nil:
+		imageSpec, err := spec.ContainerApp.AsImageApplicationProviderSpec()
+		if err != nil {
+			return nil, nil
+		}
+		return imageProviderDeltaHints(imageSpec)
+	case spec.ComposeApp != nil:
+		switch spec.ComposeApp.Type() {
+		case v1beta1.ImageApplicationProviderType:
+			imageSpec, err := spec.ComposeApp.AsImageApplicationProviderSpec()
+			if err != nil {
+				return nil, nil
+			}
+			return imageProviderDeltaHints(imageSpec)
+		case v1beta1.InlineApplicationProviderType:
+			inlineSpec, err := spec.ComposeApp.AsInlineApplicationProviderSpec()
+			if err != nil {
+				return nil, nil
+			}
+			return inlineProviderDeltaHints(inlineSpec)
+		}
+	case spec.HelmApp != nil:
+		imageSpec, err := spec.HelmApp.AsImageApplicationProviderSpec()
+		if err != nil {
+			return nil, nil
+		}
+		return imageProviderDeltaHints(imageSpec)
+	case spec.QuadletApp != nil:
+		switch spec.QuadletApp.Type() {
+		case v1beta1.ImageApplicationProviderType:
+			imageSpec, err := spec.QuadletApp.AsImageApplicationProviderSpec()
+			if err != nil {
+				return nil, nil
+			}
+			return imageProviderDeltaHints(imageSpec)
+		case v1beta1.InlineApplicationProviderType:
+			inlineSpec, err := spec.QuadletApp.AsInlineApplicationProviderSpec()
+			if err != nil {
+				return nil, nil
+			}
+			return inlineProviderDeltaHints(inlineSpec)
+		}
+	}
+	return nil, nil
+}
+
+func imageProviderDeltaHints(imageSpec v1beta1.ImageApplicationProviderSpec) (*string, []v1beta1.ImageDeltaHint) {
+	var nested []v1beta1.ImageDeltaHint
+	if imageSpec.DeltaImages != nil {
+		nested = *imageSpec.DeltaImages
+	}
+	return imageSpec.DeltaImage, nested
+}
+
+func inlineProviderDeltaHints(inlineSpec v1beta1.InlineApplicationProviderSpec) (*string, []v1beta1.ImageDeltaHint) {
+	if inlineSpec.DeltaImages == nil {
+		return nil, nil
+	}
+	return nil, *inlineSpec.DeltaImages
+}
+
+func digestFromReference(reference string) string {
+	if index := strings.Index(reference, "@sha256:"); index >= 0 {
+		return reference[index+1:]
+	}
+	return ""
 }
 
 func collectNestedForProvider(
@@ -265,12 +400,27 @@ func collectNestedForProvider(
 		return nil, true, nil
 	}
 
+	inputsHash, err := nestedTargetsInputsHash(p)
+	if err != nil {
+		return nil, false, err
+	}
+
 	if cachedEntry, found := ociCache.Get(p.ID()); found {
-		if cachedEntry.IsValid(ref, digest) {
+		if cachedEntry.IsValid(ref, digest, inputsHash) {
 			log.Debugf("Using cached nested targets for app %s", p.Name())
 			return cachedEntry.Children, false, nil
 		}
-		log.Debugf("Cache invalidated for app %s: reference or digest changed", p.Name())
+		log.Debugf("Cache invalidated for app %s: reference, digest, or provider inputs changed", p.Name())
+	}
+
+	cacheEntry := CacheEntry{
+		Name:  p.ID(),
+		Owner: p.Spec().User,
+		Parent: dependency.OCIPullTarget{
+			Reference: ref,
+			Digest:    digest,
+		},
+		InputsHash: inputsHash,
 	}
 
 	appData, err := p.extractNestedTargets(ctx, configProvider)
@@ -283,19 +433,14 @@ func collectNestedForProvider(
 	}
 
 	if appData == nil {
+		ociCache.Set(cacheEntry)
 		return nil, false, nil
 	}
 
+	cacheEntry.Children = appData.Targets
+	ociCache.Set(cacheEntry)
 	if len(appData.Targets) > 0 {
 		appDataCache[p.ID()] = appData
-		ociCache.Set(CacheEntry{
-			Name: p.ID(),
-			Parent: dependency.OCIPullTarget{
-				Reference: ref,
-				Digest:    digest,
-			},
-			Children: appData.Targets,
-		})
 		log.Debugf("Cached %d nested targets for app %s", len(appData.Targets), p.Name())
 	} else {
 		if err := appData.Cleanup(); err != nil {
@@ -304,6 +449,40 @@ func collectNestedForProvider(
 	}
 
 	return appData.Targets, false, nil
+}
+
+// nestedTargetsInputsHash returns a stable hash for provider inputs that can
+// change the result of nested target extraction. Helm has no parent image
+// digest, so its chart values and other dry-run inputs must be tracked
+// separately from CacheEntry.Parent.Digest.
+func nestedTargetsInputsHash(p appProvider) (string, error) {
+	spec := p.Spec()
+	if spec == nil || spec.AppType != v1beta1.AppTypeHelm || spec.HelmApp == nil {
+		return "", nil
+	}
+
+	inputs := struct {
+		Image       string                  `json:"image"`
+		Path        string                  `json:"path"`
+		Name        string                  `json:"name"`
+		Namespace   *string                 `json:"namespace,omitempty"`
+		Values      *map[string]interface{} `json:"values,omitempty"`
+		ValuesFiles *[]string               `json:"valuesFiles,omitempty"`
+	}{
+		Image:       spec.Image,
+		Path:        spec.Path,
+		Name:        spec.Name,
+		Namespace:   spec.HelmApp.Namespace,
+		Values:      spec.HelmApp.Values,
+		ValuesFiles: spec.HelmApp.ValuesFiles,
+	}
+
+	data, err := json.Marshal(inputs)
+	if err != nil {
+		return "", fmt.Errorf("marshal nested target cache inputs: %w", err)
+	}
+	hash := sha256.Sum256(data)
+	return hex.EncodeToString(hash[:]), nil
 }
 
 // discoverEmbeddedProviders discovers embedded compose and quadlet applications
@@ -396,7 +575,7 @@ func ResolveImageAppName(appSpec *v1beta1.ApplicationProviderSpec) (string, erro
 		if err != nil {
 			return "", err
 		}
-		return helm.SanitizeReleaseName(imageSpec.Image)
+		return chartutil.SanitizeReleaseName(imageSpec.Image)
 	default:
 		return "", fmt.Errorf("%w: %s", errors.ErrUnsupportedAppType, appType)
 	}
@@ -1171,12 +1350,28 @@ func hasQuadletFiles(readWriter fileio.ReadWriter, dirPath string) (bool, error)
 	return false, nil
 }
 
-// writeENVFile writes the environment variables to a .env file in the appPath
-func writeENVFile(appPath string, writer fileio.Writer, envVars map[string]string) error {
+// systemdEnvReplacer escapes backslashes, double-quotes, and dollar signs for
+// systemd EnvironmentFile and Quadlet .env files. Systemd interprets $
+// as variable expansion, so dollar signs must be escaped.
+var systemdEnvReplacer = strings.NewReplacer(`\`, `\\`, `"`, `\"`, `$`, `\$`)
+
+// composeEnvReplacer escapes backslashes and double-quotes but leaves dollar
+// signs unescaped. python-dotenv (used by podman-compose) does NOT decode \$
+// in double-quoted values, so escaping $ would leave literal backslashes in
+// the value.
+var composeEnvReplacer = strings.NewReplacer(`\`, `\\`, `"`, `\"`)
+
+// writeENVFile writes the environment variables to a .env file in the appPath.
+// Values are double-quoted so that special characters (colons, hashes, spaces,
+// etc.) are treated as literal strings. The caller supplies a replacer that
+// matches the target runtime:
+//   - systemdEnvReplacer for systemd/Quadlet (escapes \, ", $)
+//   - composeEnvReplacer for Compose/python-dotenv (escapes \, " only)
+func writeENVFile(appPath string, writer fileio.Writer, envVars map[string]string, replacer *strings.Replacer) error {
 	if len(envVars) > 0 {
 		var env strings.Builder
 		for k, v := range envVars {
-			env.WriteString(fmt.Sprintf("%s=%s\n", k, v))
+			env.WriteString(fmt.Sprintf("%s=\"%s\"\n", k, replacer.Replace(v)))
 		}
 		envPath := fmt.Sprintf("%s/.env", appPath)
 		if err := writer.WriteFile(envPath, []byte(env.String()), fileio.DefaultFilePermissions); err != nil {

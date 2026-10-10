@@ -64,6 +64,8 @@ Welcome to the Flight Control user documentation.
   * [Provisioning on VMware vSphere](using/provisioning-devices.md#provisioning-on-vmware-vsphere)
 * **[Managing Devices](using/managing-devices.md)** - How to manage individual devices.
   * [Enrolling Devices](using/managing-devices.md#enrolling-devices)
+  * [Using enrollment hooks](using/enrollment-hooks.md)
+  * [Overriding a failed enrollment hook](using/managing-devices.md#overriding-a-failed-enrollment-hook)
   * [Viewing the Device Inventory and Device Details](using/managing-devices.md#viewing-the-device-inventory-and-device-details)
   * [OS mode](using/managing-devices.md#os-mode)
   * [Organizing Devices](using/managing-devices.md#organizing-devices)
@@ -74,6 +76,7 @@ Welcome to the Flight Control user documentation.
   * [Monitoring Device Resources](using/managing-devices.md#monitoring-device-resources)
   * [Accessing Devices Remotely](using/managing-devices.md#accessing-devices-remotely)
   * [Scheduling Updates and Downloads](using/managing-devices.md#scheduling-updates-and-downloads)
+  * [Running applications as non-root](using/running-applications-as-non-root.md)
   * [Troubleshooting](using/troubleshooting.md)
 * **[Managing Device Fleets](using/managing-fleets.md)** - How to manage fleets of devices.
   * [Understanding Fleets](using/managing-fleets.md#understanding-fleets)

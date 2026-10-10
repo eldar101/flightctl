@@ -11,6 +11,7 @@ import (
 	"github.com/flightctl/flightctl/internal/agent/device/dependency"
 	"github.com/flightctl/flightctl/internal/agent/device/errors"
 	"github.com/flightctl/flightctl/internal/agent/device/fileio"
+	"github.com/flightctl/flightctl/internal/appspec"
 	"github.com/flightctl/flightctl/pkg/log"
 	"github.com/samber/lo"
 )
@@ -108,6 +109,7 @@ func newComposeProvider(
 			User:              user,
 			ID:                lifecycle.GenerateAppID(appName, user),
 			AppType:           v1beta1.AppTypeCompose,
+			Image:             imageRef,
 			Path:              appPath,
 			EnvVars:           envVars,
 			ComposeApp:        &composeApp,
@@ -225,7 +227,7 @@ func (p *composeProvider) Install(ctx context.Context) error {
 		}
 	}
 
-	if err := writeENVFile(p.spec.Path, p.readWriter, p.spec.EnvVars); err != nil {
+	if err := writeENVFile(p.spec.Path, p.readWriter, p.spec.EnvVars, composeEnvReplacer); err != nil {
 		return fmt.Errorf("writing env file: %w", err)
 	}
 
@@ -273,7 +275,7 @@ func (p *composeProvider) collectOCITargets(ctx context.Context, configProvider 
 			ClientOptsFn: containerPullOptions(configProvider, p.spec.User),
 		})
 	} else {
-		composeSpec, err := client.ParseComposeFromSpec(p.inlineContent)
+		composeSpec, err := appspec.ParseComposeFromSpec(p.inlineContent)
 		if err != nil {
 			return nil, fmt.Errorf("parsing compose spec: %w", err)
 		}

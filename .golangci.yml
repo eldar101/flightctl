@@ -70,6 +70,18 @@ linters:
             - pkg: "math/rand$"
               desc: "Use math/rand/v2 instead"
 
+        server-no-agent:
+          list-mode: lax
+          files:
+            - "**/internal/helm/**"
+            - "**/internal/tasks/**"
+            - "**/internal/delta_worker/**"
+          deny:
+            - pkg: "github.com/flightctl/flightctl/internal/agent$"
+              desc: "Server-side code must not import agent internals"
+            - pkg: "github.com/flightctl/flightctl/internal/agent/"
+              desc: "Server-side code must not import agent internals"
+
         service-no-api:
           list-mode: lax
           files:
@@ -274,6 +286,7 @@ linters:
             - "!**/internal/api_server/server.go"
             - "!**/internal/api_server/agentserver/server.go"
             - "!**/internal/imagebuilder_worker/worker.go"
+            - "!**/internal/worker_server/server.go"
             - "!**/test/**"
           deny:
             - pkg: "github.com/flightctl/flightctl/internal/store/enrollmentrequest$"
@@ -423,6 +436,7 @@ linters:
             - "!**/internal/migration/**"
             - "!**/internal/instrumentation/metrics/**"
             - "!**/internal/api_server/server.go"
+            - "!**/internal/periodic_checker/server.go"
             - "!**/internal/worker_server/server.go"
             - "!**/test/**"
           deny:

@@ -12,11 +12,6 @@ import (
 	"github.com/oapi-codegen/runtime"
 )
 
-const (
-	BearerAuthScopes bearerAuthContextKey = "bearerAuth.Scopes"
-	OrgIdScopes      orgIdContextKey      = "orgId.Scopes"
-)
-
 // Defines values for AapProviderSpecProviderType.
 const (
 	Aap AapProviderSpecProviderType = "aap"
@@ -115,6 +110,8 @@ const (
 	ConditionTypeCertificateSigningRequestTPMVerified ConditionType = "TPMVerified"
 	ConditionTypeDeviceDecommissioning                ConditionType = "DeviceDecommissioning"
 	ConditionTypeDeviceDeltaPreparing                 ConditionType = "DeviceDeltaPreparing"
+	ConditionTypeDeviceEnrollmentHooks                ConditionType = "EnrollmentHooks"
+	ConditionTypeDeviceLabelsSynced                   ConditionType = "LabelsSynced"
 	ConditionTypeDeviceMultipleOwners                 ConditionType = "MultipleOwners"
 	ConditionTypeDeviceSpecValid                      ConditionType = "SpecValid"
 	ConditionTypeDeviceUpdating                       ConditionType = "Updating"
@@ -123,6 +120,7 @@ const (
 	ConditionTypeFleetDeltaPreparing                  ConditionType = "FleetDeltaPreparing"
 	ConditionTypeFleetRolloutInProgress               ConditionType = "RolloutInProgress"
 	ConditionTypeFleetValid                           ConditionType = "Valid"
+	ConditionTypeLabelSyncMappingReady                ConditionType = "Ready"
 	ConditionTypeRepositoryAccessible                 ConditionType = "Accessible"
 	ConditionTypeResourceSyncAccessible               ConditionType = "Accessible"
 	ConditionTypeResourceSyncResourceParsed           ConditionType = "ResourceParsed"
@@ -165,6 +163,15 @@ const (
 const (
 	DeviceDecommissionTargetTypeFactoryReset DeviceDecommissionTargetType = "FactoryReset"
 	DeviceDecommissionTargetTypeUnenroll     DeviceDecommissionTargetType = "Unenroll"
+)
+
+// Defines values for DeviceDeltaApplyOutcomeType.
+const (
+	DeviceDeltaApplyOutcomeApplied     DeviceDeltaApplyOutcomeType = "Applied"
+	DeviceDeltaApplyOutcomeFallback    DeviceDeltaApplyOutcomeType = "Fallback"
+	DeviceDeltaApplyOutcomeNotRequired DeviceDeltaApplyOutcomeType = "NotRequired"
+	DeviceDeltaApplyOutcomeNotUsed     DeviceDeltaApplyOutcomeType = "NotUsed"
+	DeviceDeltaApplyOutcomePartial     DeviceDeltaApplyOutcomeType = "Partial"
 )
 
 // Defines values for DeviceIntegrityCheckStatusType.
@@ -303,6 +310,10 @@ const (
 	EventReasonDeviceVulnerabilityCVEWarning   EventReason = "DeviceVulnerabilityCVEWarning"
 	EventReasonEncryptionMigrationCompleted    EventReason = "EncryptionMigrationCompleted"
 	EventReasonEncryptionMigrationStarted      EventReason = "EncryptionMigrationStarted"
+	EventReasonEnrollmentHookFailed            EventReason = "EnrollmentHookFailed"
+	EventReasonEnrollmentHookManualOverride    EventReason = "EnrollmentHookManualOverride"
+	EventReasonEnrollmentHookNotifyFailed      EventReason = "EnrollmentHookNotifyFailed"
+	EventReasonEnrollmentHookSucceeded         EventReason = "EnrollmentHookSucceeded"
 	EventReasonEnrollmentRequestApprovalFailed EventReason = "EnrollmentRequestApprovalFailed"
 	EventReasonEnrollmentRequestApproved       EventReason = "EnrollmentRequestApproved"
 	EventReasonFleetInvalid                    EventReason = "FleetInvalid"
@@ -433,6 +444,16 @@ const (
 	K8s K8sProviderSpecProviderType = "k8s"
 )
 
+// Defines values for LabelSyncMappingKind.
+const (
+	LabelSyncMappingKindLabelSyncMapping LabelSyncMappingKind = "LabelSyncMapping"
+)
+
+// Defines values for LabelSyncMappingSpecResourceType.
+const (
+	LabelSyncMappingSpecResourceTypeDevice LabelSyncMappingSpecResourceType = "Device"
+)
+
 // Defines values for MatchExpressionOperator.
 const (
 	DoesNotExist MatchExpressionOperator = "DoesNotExist"
@@ -546,11 +567,12 @@ const (
 
 // Defines values for ResourceUpdatedDetailsUpdatedFields.
 const (
-	Labels       ResourceUpdatedDetailsUpdatedFields = "labels"
-	Owner        ResourceUpdatedDetailsUpdatedFields = "owner"
-	Spec         ResourceUpdatedDetailsUpdatedFields = "spec"
-	SpecSelector ResourceUpdatedDetailsUpdatedFields = "spec.selector"
-	SpecTemplate ResourceUpdatedDetailsUpdatedFields = "spec.template"
+	Labels                          ResourceUpdatedDetailsUpdatedFields = "labels"
+	Owner                           ResourceUpdatedDetailsUpdatedFields = "owner"
+	Spec                            ResourceUpdatedDetailsUpdatedFields = "spec"
+	SpecSelector                    ResourceUpdatedDetailsUpdatedFields = "spec.selector"
+	SpecTemplate                    ResourceUpdatedDetailsUpdatedFields = "spec.template"
+	StatusConditionsEnrollmentHooks ResourceUpdatedDetailsUpdatedFields = "status.conditions.EnrollmentHooks"
 )
 
 // Defines values for Rfc7662IntrospectionSpecType.
@@ -561,6 +583,21 @@ const (
 // Defines values for RolloutStrategy.
 const (
 	RolloutStrategyBatchSequence RolloutStrategy = "BatchSequence"
+)
+
+// Defines values for SystemInfoSourceStatusType.
+const (
+	SystemInfoSourceStatusError   SystemInfoSourceStatusType = "Error"
+	SystemInfoSourceStatusHealthy SystemInfoSourceStatusType = "Healthy"
+	SystemInfoSourceStatusUnknown SystemInfoSourceStatusType = "Unknown"
+)
+
+// Defines values for SystemInfoSummaryStatusType.
+const (
+	SystemInfoSummaryStatusDegraded SystemInfoSummaryStatusType = "Degraded"
+	SystemInfoSummaryStatusError    SystemInfoSummaryStatusType = "Error"
+	SystemInfoSummaryStatusHealthy  SystemInfoSummaryStatusType = "Healthy"
+	SystemInfoSummaryStatusUnknown  SystemInfoSummaryStatusType = "Unknown"
 )
 
 // Defines values for SystemdActiveStateType.
@@ -702,6 +739,15 @@ type ApplicationDesiredState string
 type ApplicationEnvVars struct {
 	// EnvVars Environment variable key-value pairs, injected during runtime. The key and value each must be between 1 and 253 characters.
 	EnvVars *map[string]string `json:"envVars,omitempty"`
+}
+
+// ApplicationImageDigest An image reference and its known registry image digest.
+type ApplicationImageDigest struct {
+	// Digest Registry digest associated with this image. If the runtime identifies a platform-specific image, this may differ from the digest in the image reference. Omitted when unavailable.
+	Digest string `json:"digest,omitempty"`
+
+	// Image Image reference as it appears in the rendered application spec.
+	Image string `json:"image"`
 }
 
 // ApplicationLifecycleChangedDetails defines model for ApplicationLifecycleChangedDetails.
@@ -1118,13 +1164,13 @@ type Condition struct {
 	// LastTransitionTime The last time the condition transitioned from one status to another.
 	LastTransitionTime time.Time `json:"lastTransitionTime"`
 
-	// Message Human readable message indicating details about last transition.
+	// Message A human-readable message describing the condition, including details or progress. Consumers should not parse this field.
 	Message string `json:"message"`
 
 	// ObservedGeneration The .metadata.generation that the condition was set based upon.
 	ObservedGeneration *int64 `json:"observedGeneration,omitempty"`
 
-	// Reason A (brief) reason for the condition's last transition.
+	// Reason A brief, machine-readable reason for the condition's last transition. Use a stable CamelCase identifier and put human-readable details in message.
 	Reason string `json:"reason"`
 
 	// Status Status of the condition, one of True, False, Unknown.
@@ -1139,13 +1185,13 @@ type ConditionBase struct {
 	// LastTransitionTime The last time the condition transitioned from one status to another.
 	LastTransitionTime time.Time `json:"lastTransitionTime"`
 
-	// Message Human readable message indicating details about last transition.
+	// Message A human-readable message describing the condition, including details or progress. Consumers should not parse this field.
 	Message string `json:"message"`
 
 	// ObservedGeneration The .metadata.generation that the condition was set based upon.
 	ObservedGeneration *int64 `json:"observedGeneration,omitempty"`
 
-	// Reason A (brief) reason for the condition's last transition.
+	// Reason A brief, machine-readable reason for the condition's last transition. Use a stable CamelCase identifier and put human-readable details in message.
 	Reason string `json:"reason"`
 
 	// Status Status of the condition, one of True, False, Unknown.
@@ -1235,6 +1281,9 @@ type DeltaGenerationProgressDetails struct {
 	// DetailType The type of detail for discriminator purposes.
 	DetailType DeltaGenerationProgressDetailsDetailType `json:"detailType"`
 
+	// Generation Device only. The desired spec generation this prepare is for.
+	Generation *int64 `json:"generation,omitempty"`
+
 	// GenerationStatus Generation row status for this pair.
 	GenerationStatus DeltaGenerationProgressDetailsGenerationStatus `json:"generationStatus"`
 
@@ -1246,9 +1295,6 @@ type DeltaGenerationProgressDetails struct {
 
 	// SourceDigest Current image digest.
 	SourceDigest string `json:"sourceDigest"`
-
-	// SpecHash Device only. The rendered spec hash this prepare is for.
-	SpecHash *string `json:"specHash,omitempty"`
 
 	// TargetDigest Target image digest.
 	TargetDigest string `json:"targetDigest"`
@@ -1346,10 +1392,16 @@ type DeviceApplicationStatus struct {
 	// AppType The type of the application.
 	AppType AppType `json:"appType"`
 
+	// DeltaSize Expected total size of control-plane generated delta images for this application update in IEC units (e.g. "245.3 MiB", "1 GiB"). Computed as the sum of generated delta image sizes across the application. Absent when no delta image was generated or any generated delta image size is unknown. Full image sizes are not included.
+	DeltaSize *string `json:"deltaSize,omitempty"`
+
 	// Embedded Whether the application is embedded in the bootc image.
 	Embedded bool `json:"embedded"`
 
-	// LastDelta Result of the most recent delta apply attempt for this update target.
+	// ImageDigests Image references this application uses and the registry digest associated with each image. image is the ref from the current rendered spec (tag or digest). For a multi-platform index, digest is the platform-specific manifest selected by the runtime when available; if the runtime exposes only an opaque ID, an immutable image reference's digest may be reported. digest is omitted when no registry digest is known.
+	ImageDigests *[]ApplicationImageDigest `json:"imageDigests,omitempty"`
+
+	// LastDelta Agent-reported result for delta apply attempts for this update target. For an application with multiple image targets, the outcome is aggregated across image targets. The lastDelta field is omitted until the agent reports an outcome; server-side delta preparation is reported separately.
 	LastDelta *DeviceDeltaApplyStatus `json:"lastDelta,omitempty"`
 
 	// Name Human readable name of the application.
@@ -1382,7 +1434,8 @@ type DeviceApplicationsSummaryStatus struct {
 
 // DeviceCapabilities Capabilities reported by the device agent.
 type DeviceCapabilities struct {
-	// OsMode OS management mode. "image" indicates the OS is managed via bootc or rpm-ostree image updates. "package" indicates no image-based OS management is available.
+	// OsMode Deprecated since v1.4 and will be removed in a future release. Use status.systemInfo.osMode instead. The service reads status.systemInfo.osMode and only falls back to this field for devices reported by older agents that do not populate systemInfo.
+	// Deprecated: Deprecated since v1.4 and will be removed in a future release. Use status.systemInfo.osMode instead.
 	OsMode *OsModeType `json:"osMode,omitempty"`
 }
 
@@ -1410,13 +1463,55 @@ type DeviceDecommission struct {
 // DeviceDecommissionTargetType Specifies the desired decommissioning method of the device.
 type DeviceDecommissionTargetType string
 
-// DeviceDeltaApplyStatus Result of the most recent delta apply attempt for this update target.
+// DeviceDeltaApplyOutcomeType Result reported by the agent for an update target. NotRequired means the target image is already present on the device with the correct digest, so no delta or pull was needed. NotUsed means the agent skipped delta application without a delta-apply failure; it may still use a full image pull. Applied means all delta work for the target succeeded. Fallback means a delta attempt failed and the agent attempted a full image pull. Partial means an application applied at least one delta while another image target used a full image pull or skipped delta application.
+type DeviceDeltaApplyOutcomeType string
+
+// DeviceDeltaApplyStatus Agent-reported result for delta apply attempts for this update target. For an application with multiple image targets, the outcome is aggregated across image targets. The lastDelta field is omitted until the agent reports an outcome; server-side delta preparation is reported separately.
 type DeviceDeltaApplyStatus struct {
-	// FallbackReason Set when the most recent update attempt fell back from a delta to a full image pull. Absent if no delta was attempted or the delta succeeded. Cleared when the next update attempt for this target starts.
+	// FallbackReason Set when one or more delta attempts failed and the agent attempted a full image pull. For an application with multiple image targets, this reports one representative failure reason.
 	FallbackReason *string `json:"fallbackReason,omitempty"`
 
-	// Size Expected delta size in IEC units (KiB, MiB, GiB, or TiB). Absent when the size is not yet known.
-	Size *string `json:"size,omitempty"`
+	// Outcome Result reported by the agent for an update target. NotRequired means the target image is already present on the device with the correct digest, so no delta or pull was needed. NotUsed means the agent skipped delta application without a delta-apply failure; it may still use a full image pull. Applied means all delta work for the target succeeded. Fallback means a delta attempt failed and the agent attempted a full image pull. Partial means an application applied at least one delta while another image target used a full image pull or skipped delta application.
+	Outcome DeviceDeltaApplyOutcomeType `json:"outcome"`
+}
+
+// DeviceEnrollmentHooksStatus Enrollment hooks state for a device.
+type DeviceEnrollmentHooksStatus struct {
+	// Snapshot Immutable non-secret copy of EnrollmentHookPolicy fields captured at approval time.
+	Snapshot *EnrollmentHookSnapshot `json:"snapshot,omitempty"`
+}
+
+// DeviceGpu Information about a GPU device discovered on the device.
+type DeviceGpu struct {
+	// Arch GPU microarchitecture generation name as defined in the hardware map or platform lookup table (e.g., "Ada", "Ampere", "Volta", "Maxwell" for NVIDIA; "RDNA3", "CDNA3" for AMD). This is the vendor marketing name for the GPU microarchitecture, not the host CPU ISA or a compute-capability version string.
+	Arch *string `json:"arch,omitempty"`
+
+	// Features Vendor-specific GPU capability identifiers sourced from the hardware map. Values are lowercase tokens describing supported compute or display features (e.g., "cuda", "rocm", "opencl", "sriov", "mig"). The vocabulary is extensible and determined by the hardware map; no fixed enum is enforced.
+	Features *[]string `json:"features,omitempty"`
+
+	// Index Zero-based enumeration index of the GPU on the system, assigned in PCI bus discovery order.
+	Index int32 `json:"index"`
+
+	// MemoryBytes The amount of GPU memory in bytes.
+	MemoryBytes *int64 `json:"memoryBytes,omitempty"`
+
+	// Model The GPU model name (e.g., "RTX 4090", "GA10B").
+	Model *string `json:"model,omitempty"`
+
+	// PciAddress PCI bus address in BDF notation (e.g., "0000:01:00.0").
+	PciAddress *string `json:"pciAddress,omitempty"`
+
+	// PciDeviceId PCI device ID of the GPU, as read from the PCI configuration register (e.g., "0x2717").
+	PciDeviceId *string `json:"pciDeviceId,omitempty"`
+
+	// PciRevisionId PCI revision ID of the GPU (e.g., "0xa1").
+	PciRevisionId *string `json:"pciRevisionId,omitempty"`
+
+	// PciVendorId PCI vendor ID of the GPU (e.g., "0x10de" for NVIDIA).
+	PciVendorId *string `json:"pciVendorId,omitempty"`
+
+	// Vendor The GPU vendor name (e.g., "NVIDIA", "AMD", "Intel").
+	Vendor *string `json:"vendor,omitempty"`
 }
 
 // DeviceIntegrityCheckStatus DeviceIntegrityCheckStatus represents the status of the integrity check performed on the device.
@@ -1451,6 +1546,12 @@ type DeviceIntegrityStatus struct {
 
 // DeviceIntegrityStatusSummaryType Status of the integrity of the device.
 type DeviceIntegrityStatusSummaryType string
+
+// DeviceKvm KVM virtualization information reported by the device.
+type DeviceKvm struct {
+	// Enabled Whether KVM virtualization is active and available on the device.
+	Enabled *bool `json:"enabled,omitempty"`
+}
 
 // DeviceLastSeen DeviceLastSeen represents the last seen timestamp of a device.
 type DeviceLastSeen struct {
@@ -1529,7 +1630,7 @@ type DeviceOsSpec struct {
 	// CatalogItemRef A reference to a catalog item, along with its configuration.
 	CatalogItemRef *CatalogItemRefSpec `json:"catalogItemRef,omitempty"`
 
-	// DeltaImage Optional hint: a reference to a delta artifact the control plane's generation records indicate may be applicable to reach `image` from this device's current image. Absent does not imply no delta exists — the device independently discovers candidate delta artifacts (e.g. deltas published by a customer's own CI) regardless of this field, and falls back to a full pull only if none is usable.
+	// DeltaImage Optional hint: a reference to a delta artifact the control plane's generation records indicate may be applicable to reach `image` from this device's current image. Absent does not imply no delta exists — the device independently discovers candidate delta artifacts (e.g. deltas published by a customer's own CI) regardless of this field, and falls back to a full pull only if none is usable. Read-only: generated by the control plane and only present in the rendered device spec delivered to the agent.
 	DeltaImage *string `json:"deltaImage,omitempty"`
 
 	// Image Reference to an OCI image or artifact with tag.
@@ -1538,13 +1639,16 @@ type DeviceOsSpec struct {
 
 // DeviceOsStatus Current status of the device OS.
 type DeviceOsStatus struct {
+	// DeltaSize Size of the control-plane generated OS delta image in IEC units (e.g. "245.3 MiB", "1 GiB"). Absent when no delta image was generated or its size is unknown.
+	DeltaSize *string `json:"deltaSize,omitempty"`
+
 	// Image Version of the OS image.
 	Image string `json:"image"`
 
 	// ImageDigest The digest of the OS image (e.g. sha256:a0...).
 	ImageDigest string `json:"imageDigest"`
 
-	// LastDelta Result of the most recent delta apply attempt for this update target.
+	// LastDelta Agent-reported result for delta apply attempts for this update target. For an application with multiple image targets, the outcome is aggregated across image targets. The lastDelta field is omitted until the agent reports an outcome; server-side delta preparation is reported separately.
 	LastDelta *DeviceDeltaApplyStatus `json:"lastDelta,omitempty"`
 }
 
@@ -1653,6 +1757,9 @@ type DeviceStatus struct {
 	// DependencySync DependencySyncStatus represents the synchronization fingerprints for external dependencies of a device, captured at render time.
 	DependencySync *DependencySyncStatus `json:"dependencySync,omitempty"`
 
+	// EnrollmentHooks Enrollment hooks state for a device.
+	EnrollmentHooks *DeviceEnrollmentHooksStatus `json:"enrollmentHooks,omitempty"`
+
 	// Integrity Summary status of the integrity of the device.
 	Integrity DeviceIntegrityStatus `json:"integrity"`
 
@@ -1673,6 +1780,9 @@ type DeviceStatus struct {
 
 	// SystemInfo System information collected from the device.
 	SystemInfo DeviceSystemInfo `json:"systemInfo"`
+
+	// SystemInfoStatus Status of the system information collection sources for a device.
+	SystemInfoStatus *DeviceSystemInfoStatus `json:"systemInfoStatus,omitempty"`
 
 	// Systemd List of systemd unit statuses.
 	Systemd *[]SystemdUnitStatus `json:"systemd,omitempty"`
@@ -1713,12 +1823,45 @@ type DeviceSystemInfo struct {
 	// DeltaEligible Whether this device can consume OCI deltas. True when the oci-delta binary is present. False when it is not. Omitted when an older agent does not report the field.
 	DeltaEligible *bool `json:"deltaEligible,omitempty"`
 
-	// OciDeltaVersion Version reported by `oci-delta --version`. Absent when oci-delta is not installed or the version command fails.
+	// Gpus List of GPU devices discovered on the device.
+	Gpus *[]DeviceGpu `json:"gpus,omitempty"`
+
+	// Kvm KVM virtualization information reported by the device.
+	Kvm *DeviceKvm `json:"kvm,omitempty"`
+
+	// OciDeltaVersion Version reported by `oci-delta --version`, or from Go module build information when that flag is unsupported. Absent when oci-delta is not installed or its version cannot be determined.
 	OciDeltaVersion *string `json:"ociDeltaVersion,omitempty"`
 
 	// OperatingSystem The Operating System reported by the device.
-	OperatingSystem      string            `json:"operatingSystem"`
+	OperatingSystem string `json:"operatingSystem"`
+
+	// OsMode OS management mode. "image" indicates the OS is managed via bootc or rpm-ostree image updates. "package" indicates no image-based OS management is available.
+	OsMode               *OsModeType       `json:"osMode,omitempty"`
 	AdditionalProperties map[string]string `json:"-"`
+}
+
+// DeviceSystemInfoStatus Status of the system information collection sources for a device.
+type DeviceSystemInfoStatus struct {
+	// Statuses Collection statuses for built-in and custom information sources.
+	Statuses DeviceSystemInfoStatuses `json:"statuses"`
+
+	// Summary Aggregate summary of the system information collection health.
+	Summary DeviceSystemInfoSummaryStatus `json:"summary"`
+}
+
+// DeviceSystemInfoStatuses Collection statuses for built-in and custom information sources.
+type DeviceSystemInfoStatuses struct {
+	// CustomInfo Per-source collection status for custom device information.
+	CustomInfo map[string]SystemInfoSourceStatus `json:"customInfo"`
+
+	// SystemInfo Per-source collection status for built-in system information.
+	SystemInfo map[string]SystemInfoSourceStatus `json:"systemInfo"`
+}
+
+// DeviceSystemInfoSummaryStatus Aggregate summary of the system information collection health.
+type DeviceSystemInfoSummaryStatus struct {
+	// Status Aggregate health of the system information collection.
+	Status SystemInfoSummaryStatusType `json:"status"`
 }
 
 // DeviceUpdatePolicySpec Specifies the policy for managing device updates, including when updates should be downloaded and applied.
@@ -1765,7 +1908,7 @@ type DevicesSummary struct {
 	// ApplicationStatus A breakdown of the devices in the fleet by "application" status.
 	ApplicationStatus map[string]int64 `json:"applicationStatus"`
 
-	// Capabilities Breakdowns of devices by status.capabilities fields.
+	// Capabilities Breakdowns of devices by status.systemInfo fields, falling back to the deprecated status.capabilities fields when unavailable.
 	Capabilities *DevicesSummaryCapabilities `json:"capabilities,omitempty"`
 
 	// SummaryStatus A breakdown of the devices in the fleet by "summary" status.
@@ -1778,9 +1921,9 @@ type DevicesSummary struct {
 	UpdateStatus map[string]int64 `json:"updateStatus"`
 }
 
-// DevicesSummaryCapabilities Breakdowns of devices by status.capabilities fields.
+// DevicesSummaryCapabilities Breakdowns of devices by status.systemInfo fields, falling back to the deprecated status.capabilities fields when unavailable.
 type DevicesSummaryCapabilities struct {
-	// OsMode Counts by status.capabilities.osMode (e.g. image, package). The key "unknown" counts devices that have not reported the capability.
+	// OsMode Counts by device OS mode (e.g. image, package), taken from status.systemInfo.osMode with fallback to the deprecated status.capabilities.osMode. The key "unknown" counts devices that have not reported an OS mode.
 	OsMode *map[string]int64 `json:"osMode,omitempty"`
 }
 
@@ -1917,6 +2060,30 @@ type EnrollmentHookRetryPolicy struct {
 
 	// MaxBackoff Maximum backoff duration (e.g. "2m"). Defaults to "2m".
 	MaxBackoff *string `json:"maxBackoff,omitempty"`
+}
+
+// EnrollmentHookSnapshot Immutable non-secret copy of EnrollmentHookPolicy fields captured at approval time.
+type EnrollmentHookSnapshot struct {
+	// ControlPlaneActions Non-secret copies of control-plane actions from the policy at approval time.
+	ControlPlaneActions *[]EnrollmentHookSnapshotAction `json:"controlPlaneActions,omitempty"`
+
+	// FailurePolicy Determines behavior when a hook action fails.
+	FailurePolicy FailurePolicyType `json:"failurePolicy"`
+}
+
+// EnrollmentHookSnapshotAction Non-secret copy of an enrollment hook HTTP action. Excludes auth/bearerToken.
+type EnrollmentHookSnapshotAction struct {
+	// Index Original action index in the policy.
+	Index int `json:"index"`
+
+	// Retry Retry policy for an enrollment hook action.
+	Retry *EnrollmentHookRetryPolicy `json:"retry,omitempty"`
+
+	// Timeout Timeout duration (e.g. "30s").
+	Timeout *string `json:"timeout,omitempty"`
+
+	// Url The HTTPS URL to call.
+	Url string `json:"url"`
 }
 
 // EnrollmentHookStageSpec Configuration for a stage of enrollment hooks.
@@ -2519,6 +2686,18 @@ type HttpRepoSpecType string
 // ImageApplicationProviderSpec Reference to an OCI image or artifact with tag.
 type ImageApplicationProviderSpec = ImageSpec
 
+// ImageDeltaHint A control-plane-generated delta hint for a nested image within an application. Present only in rendered application specs delivered to the agent.
+type ImageDeltaHint struct {
+	// DeltaImage Reference to the delta artifact for this nested image.
+	DeltaImage string `json:"deltaImage"`
+
+	// TargetDigest The content digest of the target image.
+	TargetDigest string `json:"targetDigest"`
+
+	// TargetImage The target image reference this delta applies to.
+	TargetImage string `json:"targetImage"`
+}
+
 // ImageMountVolumeProviderSpec Volume from OCI image mounted at specified path.
 type ImageMountVolumeProviderSpec struct {
 	// Image Describes the source of an OCI-compliant image or artifact. Exactly one of 'reference' or 'catalogItemRef' must be specified.
@@ -2542,6 +2721,12 @@ type ImagePullPolicy string
 
 // ImageSpec Reference to an OCI image or artifact with tag.
 type ImageSpec struct {
+	// DeltaImage Optional hint: a reference to a delta artifact for the main image. Set by the control plane when a successful delta generation record exists for the current-to-target digest transition. Read-only: generated by the control plane and only present in the rendered application spec delivered to the agent.
+	DeltaImage *string `json:"deltaImage,omitempty"`
+
+	// DeltaImages Optional hints for nested images within this application (e.g. service images in a compose app, OCI volume images). Each entry identifies a target image reference and digest and names its delta artifact reference. Read-only: generated by the control plane and only present in the rendered application spec delivered to the agent.
+	DeltaImages *[]ImageDeltaHint `json:"deltaImages,omitempty"`
+
 	// Image Reference to an OCI image or artifact with tag.
 	Image string `json:"image"`
 }
@@ -2566,6 +2751,9 @@ type ImageVolumeSource struct {
 
 // InlineApplicationProviderSpec defines model for InlineApplicationProviderSpec.
 type InlineApplicationProviderSpec struct {
+	// DeltaImages Optional hints for nested OCI images referenced by this inline application. Each entry identifies a target image reference and digest and names its delta artifact. Read-only: generated by the control plane and only present in the rendered application spec delivered to the agent.
+	DeltaImages *[]ImageDeltaHint `json:"deltaImages,omitempty"`
+
 	// Inline A list of application content.
 	Inline []ApplicationContent `json:"inline"`
 }
@@ -2700,6 +2888,78 @@ type LabelSelector struct {
 
 	// MatchLabels A map of {key,value} pairs.
 	MatchLabels *map[string]string `json:"matchLabels,omitempty"`
+}
+
+// LabelSyncMapping LabelSyncMapping defines an organization-scoped device label mapping.
+type LabelSyncMapping struct {
+	// ApiVersion APIVersion defines the versioned schema of this representation of an object. Servers should convert recognized schemas to the latest internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources.
+	ApiVersion ApiVersion `json:"apiVersion"`
+
+	// Kind Kind is a string value representing this resource type.
+	Kind LabelSyncMappingKind `json:"kind"`
+
+	// Metadata ObjectMeta is metadata that all persisted resources must have, which includes all objects users must create.
+	Metadata ObjectMeta `json:"metadata"`
+
+	// Spec Desired state for a label synchronization mapping.
+	Spec LabelSyncMappingSpec `json:"spec"`
+
+	// Status Current propagation state for a label synchronization mapping.
+	Status *LabelSyncMappingStatus `json:"status,omitempty"`
+}
+
+// LabelSyncMappingKind Kind is a string value representing this resource type.
+type LabelSyncMappingKind string
+
+// LabelSyncMappingList LabelSyncMappingList is a list of LabelSyncMapping resources.
+type LabelSyncMappingList struct {
+	// ApiVersion APIVersion defines the versioned schema of this representation of an object. Servers should convert recognized schemas to the latest internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources.
+	ApiVersion ApiVersion `json:"apiVersion"`
+
+	// Items List of LabelSyncMapping resources.
+	Items []LabelSyncMapping `json:"items"`
+
+	// Kind Kind is a string value representing the REST resource this object represents.
+	Kind string `json:"kind"`
+
+	// Metadata ListMeta describes metadata that synthetic resources must have, including lists and various status objects. A resource may have only one of {ObjectMeta, ListMeta}.
+	Metadata ListMeta `json:"metadata"`
+}
+
+// LabelSyncMappingSpec Desired state for a label synchronization mapping.
+type LabelSyncMappingSpec struct {
+	// Expression CEL expression evaluated for the selected resource type.
+	Expression string `json:"expression"`
+
+	// Key Complete destination label key for scalar mode. Omitted or null selects map mode; no prefix is added.
+	Key *string `json:"key,omitempty"`
+
+	// ResourceType Immutable resource type evaluated by the mapping.
+	ResourceType LabelSyncMappingSpecResourceType `json:"resourceType"`
+}
+
+// LabelSyncMappingSpecResourceType Immutable resource type evaluated by the mapping.
+type LabelSyncMappingSpecResourceType string
+
+// LabelSyncMappingStatus Current propagation state for a label synchronization mapping.
+type LabelSyncMappingStatus struct {
+	// Conditions The Ready condition reports Pending, Degraded, or Success state.
+	Conditions *[]Condition `json:"conditions,omitempty"`
+}
+
+// LabelSyncProvenanceItem Current owning LabelSyncMapping names for one exact label key.
+type LabelSyncProvenanceItem struct {
+	// Key Exact label key.
+	Key string `json:"key"`
+
+	// Owners Names of current owning LabelSyncMapping resources. An empty array means the key has no current mapping owner.
+	Owners []string `json:"owners"`
+}
+
+// LabelSyncProvenanceList Current LabelSyncMapping ownership grouped by exact label key.
+type LabelSyncProvenanceList struct {
+	// Items For organization queries, one item per supplied key in request order, including duplicates. For Device queries, one item per currently owned key, sorted by key.
+	Items []LabelSyncProvenanceItem `json:"items"`
 }
 
 // ListMeta ListMeta describes metadata that synthetic resources must have, including lists and various status objects. A resource may have only one of {ObjectMeta, ListMeta}.
@@ -3071,11 +3331,11 @@ type PrepareDeltasDetails struct {
 	// DetailType The type of detail for discriminator purposes.
 	DetailType PrepareDeltasDetailsDetailType `json:"detailType"`
 
+	// Generation Device only. The desired spec generation this prepare is for. Required when involvedObject.kind is Device; omitted for Fleet.
+	Generation *int64 `json:"generation,omitempty"`
+
 	// ResourceVersion The resource version of the involved Fleet or Device when this prepare event was created. Used to ignore stale prepare events. May be omitted for retained events created before this field was introduced.
 	ResourceVersion *string `json:"resourceVersion,omitempty"`
-
-	// SpecHash Device only. The rendered spec hash this prepare is for. Required when involvedObject.kind is Device; omitted for Fleet.
-	SpecHash *string `json:"specHash,omitempty"`
 
 	// TemplateVersion Fleet only. The TemplateVersion this prepare is for. Required when involvedObject.kind is Fleet; omitted for Device.
 	TemplateVersion *string `json:"templateVersion,omitempty"`
@@ -3397,6 +3657,24 @@ type Status struct {
 	Status string `json:"status"`
 }
 
+// SystemInfoSourceStatus Collection status for a single system information source.
+type SystemInfoSourceStatus struct {
+	// LastTransitionTime The last time the collection status of this source changed.
+	LastTransitionTime time.Time `json:"lastTransitionTime"`
+
+	// Message Human readable message providing details about the source status.
+	Message *string `json:"message,omitempty"`
+
+	// Status Collection health of a single system information source.
+	Status SystemInfoSourceStatusType `json:"status"`
+}
+
+// SystemInfoSourceStatusType Collection health of a single system information source.
+type SystemInfoSourceStatusType string
+
+// SystemInfoSummaryStatusType Aggregate health of the system information collection.
+type SystemInfoSummaryStatusType string
+
 // SystemdActiveStateType The high-level unit activation state.
 type SystemdActiveStateType string
 
@@ -3617,7 +3895,10 @@ type VmApplication struct {
 
 	// RestartGeneration Counter incremented by the restart device API each time the application is restarted. Read-only: cannot be set directly by apply; only present in the rendered application spec delivered to the agent.
 	RestartGeneration *int `json:"restartGeneration,omitempty"`
-	union             json.RawMessage
+
+	// RunAs The username of the system user this application should be run under. This is not the same as the user within any containers of the application (if applicable). Defaults to the user that the agent runs as (generally root) if not specified.
+	RunAs Username `json:"runAs,omitempty"`
+	union json.RawMessage
 }
 
 // VolumeMount Mount configuration for a volume.
@@ -3806,6 +4087,21 @@ type ListLabelsParams struct {
 // ListLabelsParamsKind defines parameters for ListLabels.
 type ListLabelsParamsKind string
 
+// ListLabelSyncMappingsParams defines parameters for ListLabelSyncMappings.
+type ListLabelSyncMappingsParams struct {
+	// Continue An optional parameter to query more results from the server. The value of the parameter must match the value of the 'continue' field in the previous list response.
+	Continue *string `form:"continue,omitempty" json:"continue,omitempty"`
+
+	// Limit The maximum number of results returned in the list response.
+	Limit *int32 `form:"limit,omitempty" json:"limit,omitempty"`
+}
+
+// GetLabelSyncProvenanceParams defines parameters for GetLabelSyncProvenance.
+type GetLabelSyncProvenanceParams struct {
+	// LabelKeys Exact label keys to resolve. Supply between 1 and 50 repeated labelKeys parameters. Repeated key values are preserved as repeated response items in request order.
+	LabelKeys []string `form:"labelKeys" json:"labelKeys"`
+}
+
 // ListOrganizationsParams defines parameters for ListOrganizations.
 type ListOrganizationsParams struct {
 	// FieldSelector A selector to restrict the list of returned objects by their fields, supporting operators like '=', '==', and '!=' (e.g., "key1=value1,key2!=value2").
@@ -3944,6 +4240,15 @@ type PatchFleetStatusApplicationJSONPatchPlusJSONRequestBody = PatchRequest
 // ReplaceFleetStatusJSONRequestBody defines body for ReplaceFleetStatus for application/json ContentType.
 type ReplaceFleetStatusJSONRequestBody = Fleet
 
+// CreateLabelSyncMappingJSONRequestBody defines body for CreateLabelSyncMapping for application/json ContentType.
+type CreateLabelSyncMappingJSONRequestBody = LabelSyncMapping
+
+// PatchLabelSyncMappingApplicationJSONPatchPlusJSONRequestBody defines body for PatchLabelSyncMapping for application/json-patch+json ContentType.
+type PatchLabelSyncMappingApplicationJSONPatchPlusJSONRequestBody = PatchRequest
+
+// ReplaceLabelSyncMappingJSONRequestBody defines body for ReplaceLabelSyncMapping for application/json ContentType.
+type ReplaceLabelSyncMappingJSONRequestBody = LabelSyncMapping
+
 // CreateRepositoryJSONRequestBody defines body for CreateRepository for application/json ContentType.
 type CreateRepositoryJSONRequestBody = Repository
 
@@ -4041,6 +4346,22 @@ func (a *DeviceSystemInfo) UnmarshalJSON(b []byte) error {
 		delete(object, "deltaEligible")
 	}
 
+	if raw, found := object["gpus"]; found {
+		err = json.Unmarshal(raw, &a.Gpus)
+		if err != nil {
+			return fmt.Errorf("error reading 'gpus': %w", err)
+		}
+		delete(object, "gpus")
+	}
+
+	if raw, found := object["kvm"]; found {
+		err = json.Unmarshal(raw, &a.Kvm)
+		if err != nil {
+			return fmt.Errorf("error reading 'kvm': %w", err)
+		}
+		delete(object, "kvm")
+	}
+
 	if raw, found := object["ociDeltaVersion"]; found {
 		err = json.Unmarshal(raw, &a.OciDeltaVersion)
 		if err != nil {
@@ -4055,6 +4376,14 @@ func (a *DeviceSystemInfo) UnmarshalJSON(b []byte) error {
 			return fmt.Errorf("error reading 'operatingSystem': %w", err)
 		}
 		delete(object, "operatingSystem")
+	}
+
+	if raw, found := object["osMode"]; found {
+		err = json.Unmarshal(raw, &a.OsMode)
+		if err != nil {
+			return fmt.Errorf("error reading 'osMode': %w", err)
+		}
+		delete(object, "osMode")
 	}
 
 	if len(object) != 0 {
@@ -4112,6 +4441,20 @@ func (a DeviceSystemInfo) MarshalJSON() ([]byte, error) {
 		}
 	}
 
+	if a.Gpus != nil {
+		object["gpus"], err = json.Marshal(a.Gpus)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'gpus': %w", err)
+		}
+	}
+
+	if a.Kvm != nil {
+		object["kvm"], err = json.Marshal(a.Kvm)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'kvm': %w", err)
+		}
+	}
+
 	if a.OciDeltaVersion != nil {
 		object["ociDeltaVersion"], err = json.Marshal(a.OciDeltaVersion)
 		if err != nil {
@@ -4122,6 +4465,13 @@ func (a DeviceSystemInfo) MarshalJSON() ([]byte, error) {
 	object["operatingSystem"], err = json.Marshal(a.OperatingSystem)
 	if err != nil {
 		return nil, fmt.Errorf("error marshaling 'operatingSystem': %w", err)
+	}
+
+	if a.OsMode != nil {
+		object["osMode"], err = json.Marshal(a.OsMode)
+		if err != nil {
+			return nil, fmt.Errorf("error marshaling 'osMode': %w", err)
+		}
 	}
 
 	for fieldName, field := range a.AdditionalProperties {
@@ -7303,6 +7653,12 @@ func (t VmApplication) MarshalJSON() ([]byte, error) {
 			return nil, fmt.Errorf("error marshaling 'restartGeneration': %w", err)
 		}
 	}
+
+	object["runAs"], err = json.Marshal(t.RunAs)
+	if err != nil {
+		return nil, fmt.Errorf("error marshaling 'runAs': %w", err)
+	}
+
 	b, err = json.Marshal(object)
 	return b, err
 }
@@ -7357,6 +7713,13 @@ func (t *VmApplication) UnmarshalJSON(b []byte) error {
 		err = json.Unmarshal(raw, &t.RestartGeneration)
 		if err != nil {
 			return fmt.Errorf("error reading 'restartGeneration': %w", err)
+		}
+	}
+
+	if raw, found := object["runAs"]; found {
+		err = json.Unmarshal(raw, &t.RunAs)
+		if err != nil {
+			return fmt.Errorf("error reading 'runAs': %w", err)
 		}
 	}
 

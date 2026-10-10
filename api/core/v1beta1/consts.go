@@ -25,6 +25,7 @@ const (
 	DeviceAnnotationConsole         = "device-controller/console"
 	DeviceAnnotationRemoteSession   = "device-controller/remote-session"
 	DeviceAnnotationRenderedVersion = "device-controller/renderedVersion"
+	DeviceAnnotationManagedLabels   = "device-controller/managedLabels"
 	// Per-application device-level lifecycle overrides (desiredState/restartGeneration), as a JSON-encoded map keyed by application name
 	DeviceAnnotationApplicationLifecycle = "device-controller/applicationLifecycle"
 	// Device-local cache of the owning fleet's FleetAnnotationApplicationLifecycle value, ignored for standalone devices
@@ -57,7 +58,9 @@ const (
 	FleetKind       = "Fleet"
 	FleetListKind   = "FleetList"
 
-	FleetAnnotationTemplateVersion = "fleet-controller/templateVersion"
+	FleetAnnotationTemplateVersion             = "fleet-controller/templateVersion"
+	FleetAnnotationDeltaPrepareResourceVersion = "delta-worker/sourceResourceVersion"
+	FleetAnnotationDeltaPrepareGeneration      = "delta-worker/sourceGeneration"
 	// The last template version that has been processed by device selection reconciler.  It is used for new rollout detection
 	FleetAnnotationDeployingTemplateVersion = "fleet-controller/deployingTemplateVersion"
 	// The index to the current batch.  Contains an integer
@@ -93,6 +96,10 @@ const (
 	EnrollmentHookPolicyAPIVersion = "v1beta1"
 	EnrollmentHookPolicyKind       = "EnrollmentHookPolicy"
 	EnrollmentHookPolicyListKind   = "EnrollmentHookPolicyList"
+
+	LabelSyncMappingAPIVersion = "v1beta1"
+	LabelSyncMappingKindValue  = "LabelSyncMapping"
+	LabelSyncMappingListKind   = "LabelSyncMappingList"
 
 	AuthProviderAPIVersion = "v1beta1"
 	AuthProviderKind       = "AuthProvider"
@@ -201,6 +208,14 @@ const (
 
 	// ResourceSync New Hash Detected Reason
 	ResourceSyncNewHashDetectedReason = "NewHashDetected"
+
+	// EnrollmentHooks Condition Reasons
+	EnrollmentHooksReasonNotifyPending  = "NotifyPending"
+	EnrollmentHooksReasonPending        = "Pending"
+	EnrollmentHooksReasonFailed         = "Failed"
+	EnrollmentHooksReasonSucceeded      = "Succeeded"
+	EnrollmentHooksReasonContinued      = "Continued"
+	EnrollmentHooksReasonManualOverride = "ManualOverride"
 )
 
 const (

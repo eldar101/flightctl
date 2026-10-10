@@ -19,6 +19,7 @@ bootable
 bootc
 bootloader
 ca.crt
+CEL
 CentOS
 cgroup
 cgroups
@@ -127,6 +128,7 @@ rollbacks
 rollout
 redboot
 RunAs
+runAs
 post-mortem
 150s
 pre-rollback
@@ -154,6 +156,7 @@ TBD
 TemplateVersion
 TemplateVersions
 templating
+temporality
 timestamp
 timestamps
 TLS
@@ -355,7 +358,8 @@ dashboarding
 scraping
 Prometheus
 Grafana
-Datadog
+Dynatrace
+SaaS
 CRDs
 wildcard
 Istio
@@ -760,6 +764,11 @@ redboot-task-runner
 CVE
 CVEs
 CVSS
+Clair
+TPA
+Quay
+concurrency
+5xx
 SBOM
 SBOMs
 Trustify
@@ -778,3 +787,9 @@ SharedInformer
 sha256
 runbook
 sha256
+- docs/user/references/device-api-statuses.md
+deltaEligible
+deltaSize
+IEC
+MiB
+GiB

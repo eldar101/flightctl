@@ -20,6 +20,7 @@ const (
 	API_RESOURCE_DEVICES_APPLICATIONS_LIFECYCLE = "devices/applications/lifecycle"
 	API_RESOURCE_DEVICES_CONSOLE = "devices/console"
 	API_RESOURCE_DEVICES_DECOMMISSION = "devices/decommission"
+	API_RESOURCE_DEVICES_ENROLLMENTHOOKS_OVERRIDE = "devices/enrollmenthooks/override"
 	API_RESOURCE_DEVICES_LASTSEEN = "devices/lastseen"
 	API_RESOURCE_DEVICES_RENDERED = "devices/rendered"
 	API_RESOURCE_DEVICES_RESUME = "devices/resume"
@@ -35,6 +36,7 @@ const (
 	API_RESOURCE_FLEETS_STATUS = "fleets/status"
 	API_RESOURCE_FLEETS_TEMPLATEVERSIONS = "fleets/templateversions"
 	API_RESOURCE_LABELS = "labels"
+	API_RESOURCE_LABELSYNCMAPPINGS = "labelsyncmappings"
 	API_RESOURCE_ORGANIZATIONS = "organizations"
 	API_RESOURCE_REPOSITORIES = "repositories"
 	API_RESOURCE_REPOSITORIES_CHECK_OCI_IMAGE = "repositories/check-oci-image"
@@ -433,6 +435,22 @@ var APIMetadataMap = map[string]*apimetadata.EndpointMetadata{
 			{Version: "v1beta1", DeprecatedAt: nil},
 		},
 	},
+	"POST:/devices/{name}/enrollmenthooks/override": {
+		OperationID: "overrideDeviceEnrollmentHook",
+		Resource:    "devices/enrollmenthooks/override",
+		Action:      "update",
+		Versions: []apimetadata.EndpointMetadataVersion{
+			{Version: "v1beta1", DeprecatedAt: nil},
+		},
+	},
+	"GET:/devices/{name}/labelsyncprovenance": {
+		OperationID: "getDeviceLabelSyncProvenance",
+		Resource:    "devices",
+		Action:      "get",
+		Versions: []apimetadata.EndpointMetadataVersion{
+			{Version: "v1beta1", DeprecatedAt: nil},
+		},
+	},
 	"GET:/devices/{name}/lastseen": {
 		OperationID: "getDeviceLastSeen",
 		Resource:    "devices/lastseen",
@@ -732,6 +750,62 @@ var APIMetadataMap = map[string]*apimetadata.EndpointMetadata{
 	"GET:/labels": {
 		OperationID: "listLabels",
 		Resource:    "labels",
+		Action:      "list",
+		Versions: []apimetadata.EndpointMetadataVersion{
+			{Version: "v1beta1", DeprecatedAt: nil},
+		},
+	},
+	"GET:/labelsyncmappings": {
+		OperationID: "listLabelSyncMappings",
+		Resource:    "labelsyncmappings",
+		Action:      "list",
+		Versions: []apimetadata.EndpointMetadataVersion{
+			{Version: "v1beta1", DeprecatedAt: nil},
+		},
+	},
+	"POST:/labelsyncmappings": {
+		OperationID: "createLabelSyncMapping",
+		Resource:    "labelsyncmappings",
+		Action:      "create",
+		Versions: []apimetadata.EndpointMetadataVersion{
+			{Version: "v1beta1", DeprecatedAt: nil},
+		},
+	},
+	"DELETE:/labelsyncmappings/{name}": {
+		OperationID: "deleteLabelSyncMapping",
+		Resource:    "labelsyncmappings",
+		Action:      "delete",
+		Versions: []apimetadata.EndpointMetadataVersion{
+			{Version: "v1beta1", DeprecatedAt: nil},
+		},
+	},
+	"GET:/labelsyncmappings/{name}": {
+		OperationID: "getLabelSyncMapping",
+		Resource:    "labelsyncmappings",
+		Action:      "get",
+		Versions: []apimetadata.EndpointMetadataVersion{
+			{Version: "v1beta1", DeprecatedAt: nil},
+		},
+	},
+	"PATCH:/labelsyncmappings/{name}": {
+		OperationID: "patchLabelSyncMapping",
+		Resource:    "labelsyncmappings",
+		Action:      "patch",
+		Versions: []apimetadata.EndpointMetadataVersion{
+			{Version: "v1beta1", DeprecatedAt: nil},
+		},
+	},
+	"PUT:/labelsyncmappings/{name}": {
+		OperationID: "replaceLabelSyncMapping",
+		Resource:    "labelsyncmappings",
+		Action:      "update",
+		Versions: []apimetadata.EndpointMetadataVersion{
+			{Version: "v1beta1", DeprecatedAt: nil},
+		},
+	},
+	"GET:/labelsyncprovenance": {
+		OperationID: "getLabelSyncProvenance",
+		Resource:    "labelsyncmappings",
 		Action:      "list",
 		Versions: []apimetadata.EndpointMetadataVersion{
 			{Version: "v1beta1", DeprecatedAt: nil},

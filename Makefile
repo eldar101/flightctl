@@ -73,6 +73,7 @@ help:
 	@echo "    generate:        regenerate all generated files"
 	@echo "    tidy:            tidy go mod"
 	@echo "    lint:            run golangci-lint"
+	@echo "    lint-comment-artifacts: fail on plan/design/AC tags in Go comments"
 	@echo "    rpmlint:         run rpmlint on RPM spec file"
 	@echo "    lint-openapi:    run spectral to lint and rulecheck the OpenAPI spec"
 	@echo "    lint-docs:       run markdownlint on documentation"
@@ -102,6 +103,7 @@ help:
 	@echo "    start-trustify:  start E2E Trustify (vulnerability scanner) containers"
 	@echo "    start-aux: start all E2E aux containers (registry, git-server, prometheus)"
 	@echo "    rebuild-containers: force rebuild all containers"
+	@echo "    fips-validate:     validate FIPS compliance of built container images"
 	@echo "    bundle-containers: bundle all flightctl containers into tar archive"
 	@echo "    cluster:         create a kind cluster and load the flightctl-server image"
 	@echo "    clean-cluster:   kill the kind cluster only"
@@ -149,6 +151,7 @@ build: bin build-cli build-pam-issuer
 		./cmd/flightctl-backup \
 		./cmd/flightctl-restore \
 		./cmd/flightctl-telemetry-gateway \
+		./cmd/flightctl-catalog-collector \
 		./cmd/flightctl-standalone
 
 bin/flightctl-agent: bin $(GO_FILES)
@@ -201,6 +204,9 @@ build-periodic: bin
 
 build-alert-exporter: bin
 	$(GOENV) GOOS=$(GOOS) GOARCH=$(GOARCH) go build -buildvcs=false $(GO_BUILD_FLAGS) -o $(GOBIN) ./cmd/flightctl-alert-exporter
+
+build-catalog-collector: bin
+	$(GOENV) GOOS=$(GOOS) GOARCH=$(GOARCH) go build -buildvcs=false $(GO_BUILD_FLAGS) -o $(GOBIN) ./cmd/flightctl-catalog-collector
 
 build-alertmanager-proxy: bin
 	$(GOENV) GOOS=$(GOOS) GOARCH=$(GOARCH) go build -buildvcs=false $(GO_BUILD_FLAGS) -o $(GOBIN) ./cmd/flightctl-alertmanager-proxy
@@ -296,6 +302,13 @@ flightctl-alert-exporter-container: packaging/images/$(OS)/Containerfile.alert-e
 		--build-arg SOURCE_GIT_COMMIT=${SOURCE_GIT_COMMIT} \
 		-f packaging/images/$(OS)/Containerfile.alert-exporter -t flightctl-alert-exporter-$(OS):latest -t quay.io/flightctl/flightctl-alert-exporter-$(OS):$(SOURCE_GIT_TAG) .
 
+flightctl-catalog-collector-container: packaging/images/$(OS)/Containerfile.catalog-collector go.mod go.sum $(GO_FILES)
+	podman build \
+		--build-arg SOURCE_GIT_TAG=${SOURCE_GIT_TAG} \
+		--build-arg SOURCE_GIT_TREE_STATE=${SOURCE_GIT_TREE_STATE} \
+		--build-arg SOURCE_GIT_COMMIT=${SOURCE_GIT_COMMIT} \
+		-f packaging/images/$(OS)/Containerfile.catalog-collector -t flightctl-catalog-collector-$(OS):latest -t quay.io/flightctl/flightctl-catalog-collector-$(OS):$(SOURCE_GIT_TAG) .
+
 flightctl-alertmanager-proxy-container: packaging/images/$(OS)/Containerfile.alertmanager-proxy go.mod go.sum $(GO_FILES)
 	podman build \
 		--build-arg SOURCE_GIT_TAG=${SOURCE_GIT_TAG} \
@@ -345,7 +358,7 @@ flightctl-remote-access-container: packaging/images/$(OS)/Containerfile.remote-a
 		--build-arg SOURCE_GIT_COMMIT=${SOURCE_GIT_COMMIT} \
 		-f packaging/images/$(OS)/Containerfile.remote-access -t flightctl-remote-access-$(OS):latest -t quay.io/flightctl/flightctl-remote-access-$(OS):$(SOURCE_GIT_TAG) .
 
-.PHONY: flightctl-api-container flightctl-pam-issuer-container flightctl-db-setup-container flightctl-worker-container flightctl-delta-worker-container flightctl-periodic-container flightctl-alert-exporter-container flightctl-alertmanager-proxy-container flightctl-multiarch-cli-container flightctl-userinfo-proxy-container flightctl-telemetry-gateway-container flightctl-imagebuilder-api-container flightctl-imagebuilder-worker-container flightctl-remote-access-container
+.PHONY: flightctl-api-container flightctl-pam-issuer-container flightctl-db-setup-container flightctl-worker-container flightctl-delta-worker-container flightctl-periodic-container flightctl-alert-exporter-container flightctl-alertmanager-proxy-container flightctl-catalog-collector-container flightctl-multiarch-cli-container flightctl-userinfo-proxy-container flightctl-telemetry-gateway-container flightctl-imagebuilder-api-container flightctl-imagebuilder-worker-container flightctl-remote-access-container
 
 # --- Registry Operations ---
 # The login target expects REGISTRY_USER via environment variable and
@@ -369,6 +382,7 @@ push-containers: login
 	podman push flightctl-delta-worker-$(OS):latest
 	podman push flightctl-periodic:latest
 	podman push flightctl-alert-exporter:latest
+	podman push flightctl-catalog-collector-$(OS):latest
 	podman push flightctl-alertmanager-proxy:latest
 	podman push flightctl-cli-artifacts:latest
 	podman push flightctl-userinfo-proxy:latest
@@ -388,12 +402,58 @@ rebuild-containers: clean-containers build-containers
 clean-containers:
 	- podman images --filter "reference=flightctl-*-$(OS):latest" --format "{{.Repository}}:{{.Tag}}" | xargs -r podman rmi || true
 
-build-containers: flightctl-api-container flightctl-pam-issuer-container flightctl-db-setup-container flightctl-worker-container flightctl-delta-worker-container flightctl-periodic-container flightctl-alert-exporter-container flightctl-alertmanager-proxy-container flightctl-multiarch-cli-container flightctl-userinfo-proxy-container flightctl-telemetry-gateway-container flightctl-imagebuilder-api-container flightctl-imagebuilder-worker-container flightctl-remote-access-container
+build-containers: flightctl-api-container flightctl-pam-issuer-container flightctl-db-setup-container flightctl-worker-container flightctl-delta-worker-container flightctl-periodic-container flightctl-alert-exporter-container flightctl-alertmanager-proxy-container flightctl-catalog-collector-container flightctl-multiarch-cli-container flightctl-userinfo-proxy-container flightctl-telemetry-gateway-container flightctl-imagebuilder-api-container flightctl-imagebuilder-worker-container flightctl-remote-access-container
 
 bundle-containers:
 	test/scripts/agent-images/scripts/bundle.sh \
 		--image-pattern 'quay.io/flightctl/.*-$(OS):$(SOURCE_GIT_TAG)' \
 		--output-path 'flightctl-images-bundle.tar'
+
+# FIPS compliance validation — validates container images for FIPS-compliant crypto.
+# Requires: fips-validator (go install github.com/flightctl/fips-validator@latest)
+# Usage:
+#   make build-containers && make fips-validate           # local validation
+#   make fips-validate FIPS_IMAGE_PATTERN='custom-.*:tag' # custom pattern
+FIPS_IMAGE_PATTERN ?= flightctl-.*-$(OS):latest
+
+.PHONY: fips-validate
+fips-validate:
+	@validator_path="$$(command -v fips-validator 2>/dev/null || true)"; \
+	if [ -z "$$validator_path" ]; then \
+		for d in "$$(go env GOBIN 2>/dev/null)" "$$(go env GOPATH 2>/dev/null)/bin" "$$HOME/go/bin"; do \
+			if [ -n "$$d" ] && [ -x "$$d/fips-validator" ]; then validator_path="$$d/fips-validator"; break; fi; \
+		done; \
+	fi; \
+	if [ -z "$$validator_path" ]; then \
+		echo "ERROR: fips-validator not found. Install with: go install github.com/flightctl/fips-validator@latest"; \
+		exit 1; \
+	fi; \
+	echo "Using fips-validator: $$validator_path"; \
+	echo "Validating FIPS compliance for images matching: $(FIPS_IMAGE_PATTERN)"; \
+	failed=0; \
+	images=$$(podman images --format '{{.Repository}}:{{.Tag}}' | grep '$(FIPS_IMAGE_PATTERN)'); \
+	if [ -z "$$images" ]; then \
+		echo "ERROR: No images found matching pattern: $(FIPS_IMAGE_PATTERN)"; \
+		echo "Available images:"; \
+		podman images --format '{{.Repository}}:{{.Tag}}' | grep -i flightctl || echo "  (none)"; \
+		exit 1; \
+	fi; \
+	count=0; \
+	for img in $$images; do \
+		count=$$((count + 1)); \
+		echo "--- Validating FIPS: $$img ---"; \
+		if podman unshare -- "$$validator_path" image "$$img"; then \
+			echo "PASS: $$img"; \
+		else \
+			echo "FAIL: $$img"; \
+			failed=1; \
+		fi; \
+	done; \
+	if [ "$$failed" -ne 0 ]; then \
+		echo "ERROR: One or more images failed FIPS validation"; \
+		exit 1; \
+	fi; \
+	echo "All $$count images passed FIPS validation"
 
 .PHONY: build-containers bundle-containers build-cli build-multiarch-clis
 
@@ -410,6 +470,7 @@ bin/.rpm: $(shell find $(ROOT_DIR)/ -name "*.go" -not -path "$(ROOT_DIR)/packagi
           | bin
 	@sudo GOMODCACHE="$(shell go env GOMODCACHE)" \
 	     GOCACHE="$(shell go env GOCACHE)" \
+	     MOCK_CLEANUP="$(MOCK_CLEANUP)" \
 	     "$(ROOT_DIR)/hack/build_rpms.sh" \
 	     --root "$(if $(RPM_MOCK_ROOT),$(RPM_MOCK_ROOT),$(RPM_MOCK_ROOT_DEFAULT))"
 	@sudo chown -R $(shell id -u):$(shell id -g) bin/rpm/
@@ -417,7 +478,7 @@ bin/.rpm: $(shell find $(ROOT_DIR)/ -name "*.go" -not -path "$(ROOT_DIR)/packagi
 
 rpm: bin/.rpm
 
-.PHONY: rpm build build-api build-pam-issuer build-periodic build-worker build-delta-worker install-oci-delta build-alert-exporter build-alertmanager-proxy build-userinfo-proxy build-standalone build-imagebuilder-api build-imagebuilder-worker build-remote-access generate-mirror-embed build-mirror-images
+.PHONY: rpm build build-api build-pam-issuer build-periodic build-worker build-delta-worker install-oci-delta build-alert-exporter build-catalog-collector build-alertmanager-proxy build-userinfo-proxy build-standalone build-imagebuilder-api build-imagebuilder-worker build-remote-access generate-mirror-embed build-mirror-images
 
 # cross-building for deb pkg
 bin/amd64:
@@ -466,7 +527,7 @@ clean-quadlets:
 	sudo deploy/scripts/clean_quadlets.sh
 
 
-.PHONY: tools flightctl-api-container flightctl-pam-issuer-container flightctl-db-setup-container flightctl-worker-container flightctl-delta-worker-container flightctl-periodic-container flightctl-alert-exporter-container flightctl-userinfo-proxy-container flightctl-telemetry-gateway-container flightctl-remote-access-container
+.PHONY: tools flightctl-api-container flightctl-pam-issuer-container flightctl-db-setup-container flightctl-worker-container flightctl-delta-worker-container flightctl-periodic-container flightctl-alert-exporter-container flightctl-catalog-collector-container flightctl-userinfo-proxy-container flightctl-telemetry-gateway-container flightctl-remote-access-container
 
 # Use custom golangci-lint container with libvirt support
 LINT_IMAGE := flightctl-lint:latest
@@ -493,6 +554,10 @@ tools:
 .PHONY: lint
 lint: .output/stamps/lint-image
 	$(LINT_CONTAINER) golangci-lint run -v
+
+.PHONY: lint-comment-artifacts
+lint-comment-artifacts:
+	cd tools/check-comment-artifacts && go test ./... && go run . -root ../..
 
 .PHONY: lint-fix
 lint-fix: .output/stamps/lint-image
@@ -531,6 +596,17 @@ lint-openapi: .output/stamps/lint-openapi
 .PHONY: lint-helm
 lint-helm:
 	helm lint deploy/helm/flightctl --values deploy/helm/flightctl/lint-values.yaml
+	helm lint deploy/helm/flightctl-catalog-collector --values deploy/helm/flightctl-catalog-collector/lint-values.yaml
+	helm lint deploy/helm/flightctl-catalog-collector --values deploy/helm/flightctl-catalog-collector/examples/values-vanilla.yaml
+	helm lint deploy/helm/flightctl-catalog-collector --values deploy/helm/flightctl-catalog-collector/examples/values-rhoai-to-flightctl.yaml
+
+# Render tests for the catalog collector chart: which value combinations must
+# fail, which must succeed, and what the rendered objects must contain.
+# "helm lint" can only assert that a given value set renders, so it cannot
+# cover the "must fail" half of the chart's contract.
+.PHONY: test-helm-catalog-collector
+test-helm-catalog-collector:
+	deploy/helm/flightctl-catalog-collector/tests/render_test.sh
 
 .output/stamps/lint-docs: $(wildcard docs/user/*.md)
 	@mkdir -p .output/stamps
@@ -572,5 +648,6 @@ fix-spelling:
 # include the deployment targets
 include deploy/deploy.mk
 include deploy/agent-vm.mk
-include test/test.mk
-include test/scripts/agent-images/agent-images.mk
+# Test targets are not present in production image build contexts.
+-include test/test.mk
+-include test/scripts/agent-images/agent-images.mk

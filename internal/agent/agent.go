@@ -12,9 +12,11 @@ import (
 	agent_config "github.com/flightctl/flightctl/internal/agent/config"
 	"github.com/flightctl/flightctl/internal/agent/device"
 	"github.com/flightctl/flightctl/internal/agent/device/applications"
+	applicationprovider "github.com/flightctl/flightctl/internal/agent/device/applications/provider"
 	"github.com/flightctl/flightctl/internal/agent/device/certmanager"
 	"github.com/flightctl/flightctl/internal/agent/device/config"
 	"github.com/flightctl/flightctl/internal/agent/device/console"
+	"github.com/flightctl/flightctl/internal/agent/device/deltastatus"
 	"github.com/flightctl/flightctl/internal/agent/device/dependency"
 	"github.com/flightctl/flightctl/internal/agent/device/fileio"
 	"github.com/flightctl/flightctl/internal/agent/device/hook"
@@ -112,6 +114,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("initialize root read/writer: %w", err)
 	}
+	deltaStatusStore := deltastatus.New(rootReadWriter, a.config.DataDir, a.log)
 
 	tpmClient, err := a.tryLoadTPM(rootReadWriter)
 	if err != nil {
@@ -216,13 +219,8 @@ func (a *Agent) Run(ctx context.Context) error {
 		a.config.SystemInfo,
 		a.config.SystemInfoCustom,
 		a.config.SystemInfoTimeout,
+		a.config.SystemInfoCollectionInterval(),
 	)
-	if err := systemInfoManager.Initialize(ctx); err != nil {
-		return err
-	}
-
-	// create shutdown manager
-	shutdownManager := shutdown.NewManager(a.log, rootSystemdClient, rootReadWriter, gracefulShutdownTimeout, cancel)
 
 	if tpmClient != nil {
 		systemInfoManager.RegisterCollector(ctx, systeminfocommon.TPMVendorInfoKey, tpmClient.VendorInfoCollector)
@@ -232,6 +230,12 @@ func (a *Agent) Run(ctx context.Context) error {
 			}
 		}()
 	}
+	if err := systemInfoManager.Initialize(ctx); err != nil {
+		return err
+	}
+
+	// create shutdown manager
+	shutdownManager := shutdown.NewManager(a.log, rootSystemdClient, rootReadWriter, gracefulShutdownTimeout, cancel)
 
 	reloadManager := reload.NewManager(a.configFile, a.log)
 
@@ -273,9 +277,18 @@ func (a *Agent) Run(ctx context.Context) error {
 		a.log,
 	)
 
-	// create resource manager
+	// create status manager with critical-change channel
+	criticalCh := make(chan struct{}, 1)
+	statusManager := status.NewManager(
+		deviceName,
+		a.log,
+		status.WithCriticalCh(criticalCh),
+	)
+
+	// create resource manager with injected notifier
 	resourceManager := resource.NewManager(
 		a.log,
+		statusManager.CriticalChangeNotifier(),
 	)
 
 	// create hook manager
@@ -321,6 +334,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		client.NewOCIDelta(a.log, exec, time.Duration(a.config.PullTimeout)),
 		rootSkopeoClient,
 		time.Duration(a.config.PullTimeout),
+		os.WithDeltaStatusStore(deltaStatusStore),
 	)
 
 	// create prefetch manager
@@ -333,12 +347,11 @@ func (a *Agent) Run(ctx context.Context) error {
 		a.config.PullTimeout,
 		resourceManager,
 		pollBackoff,
-	)
-
-	// create status manager
-	statusManager := status.NewManager(
-		deviceName,
-		a.log,
+		dependency.WithOCIDelta(client.NewOCIDelta(a.log, exec, time.Duration(a.config.PullTimeout))),
+		dependency.WithOCIDeltaFactory(client.NewOCIDeltaFactory(a.log, time.Duration(a.config.PullTimeout))),
+		dependency.WithReadWriterFactory(rwFactory),
+		dependency.WithDeltaStatusStore(deltaStatusStore),
+		dependency.WithApplicationNameResolver(applicationprovider.ResolveImageAppName),
 	)
 
 	// create lifecycle manager
@@ -365,11 +378,16 @@ func (a *Agent) Run(ctx context.Context) error {
 
 	// register status exporters
 	statusManager.RegisterStatusExporter(applicationsManager)
+	// The prefetch exporter enriches application status with delta fallback reasons.
+	statusManager.RegisterStatusExporter(prefetchManager)
 	statusManager.RegisterStatusExporter(rootSystemdManager)
 	statusManager.RegisterStatusExporter(resourceManager)
-	statusManager.RegisterStatusExporter(osManager)
+	statusManager.RegisterCriticalExporter(resourceManager)
 	statusManager.RegisterStatusExporter(specManager)
 	statusManager.RegisterStatusExporter(systemInfoManager)
+	// The OS exporter adds delta capability fields to SystemInfo, so run it after
+	// the system-info exporter replaces SystemInfo with its cached snapshot.
+	statusManager.RegisterStatusExporter(osManager)
 	if len(a.config.Warnings) > 0 {
 		statusManager.RegisterStatusExporter(newConfigWarningExporter(a.config.Warnings))
 	}
@@ -489,9 +507,13 @@ func (a *Agent) Run(ctx context.Context) error {
 		pullConfigResolver,
 		pruningManager,
 		caps,
+		criticalCh,
 		backoff,
 		a.log,
 	)
+
+	// Populate collectors registered during startup before asynchronous work begins.
+	systemInfoManager.CollectPending(ctx)
 
 	// register reloader with reload manager
 	reloadManager.Register(agent.ReloadConfig)
@@ -510,6 +532,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	startAsync(reloadManager.Run)
 	startAsync(resourceManager.Run)
 	startAsync(prefetchManager.Run)
+	startAsync(systemInfoManager.Run)
 	appConsoleWatcher := specManager.Watch()
 	startAsync(consoleManager.Run)
 	startAsync(func(ctx context.Context) { applicationsManager.RunConsole(ctx, appConsoleWatcher) })

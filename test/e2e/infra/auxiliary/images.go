@@ -51,16 +51,10 @@ const (
 	bundleCopyRetryWait = 5 * time.Second
 )
 
-// externalTestImages are quay.io/flightctl-tests fixture images that e2e specs
-// reference directly (not built locally, so they never appear in an app/agent
-// bundle - see UploadImages). Without mirroring, every fresh VM pulls each of these
-// straight from the real quay.io the first time a spec needs it, which is slow and
-// adds a hard external dependency to the test run. Mirroring them into the local
-// registry once here lets the device-side registry remap
-// (quay.io/flightctl-tests -> local registry, see inject_agent_files_into_qcow.sh)
-// serve them locally instead. Keep this list in sync with the literal
-// "quay.io/flightctl-tests/..." refs used under test/. Deliberately excludes
-// quay.io/flightctl-tests/does-not-exist:never, which tests rely on staying absent.
+// externalTestImages are external images used by e2e infrastructure or specs
+// that are not built locally, so they do not appear in an app/agent bundle (see
+// UploadImages). Mirroring them into the local registry avoids runtime pulls
+// from external registries, which is required for disconnected profiles.
 var externalTestImages = []string{
 	"quay.io/flightctl-tests/alpine:v1",
 	"quay.io/flightctl-tests/nginx:v1",
@@ -72,6 +66,7 @@ var externalTestImages = []string{
 	"quay.io/flightctl-tests/quadlet-test/quadlet-app-artifact:with-image-ref",
 	"quay.io/flightctl-tests/model-artifact:latest",
 	"quay.io/flightctl-tests/busybox-dummy-artifact:latest",
+	"registry.access.redhat.com/ubi9/python-312:latest",
 }
 
 // MirrorExternalTestImages copies each image in externalTestImages from the real
@@ -183,41 +178,75 @@ func (s *Services) findImageBundles(projectRoot string) []string {
 	return bundles
 }
 
-// uploadBundle copies every image in the bundle straight from the archive to the
-// registry via "skopeo copy docker-archive:...", in parallel across images. This is
-// only called when the registry container was just created (see StartServices), so
-// the registry is always empty here - there's no digest check to skip redundant
-// pushes because every image needs pushing.
-//
-// This intentionally skips "podman load": loading a bundle of bootc images means
-// extracting a full OS root filesystem (many small files) into local containers
-// storage just to immediately read it back out for push. skopeo streams the already
-// packaged layer blobs directly from the tar to the registry without ever touching
-// local storage.
 func (s *Services) uploadBundle(ctx context.Context, bundlePath string) error {
-	refs, err := extractImageRefs(bundlePath)
+	oci, err := tarContains(bundlePath, "oci/oci-layout")
 	if err != nil {
 		return err
 	}
+	if oci {
+		return s.uploadOCIBundle(ctx, bundlePath)
+	}
+	return s.uploadDockerArchiveBundle(ctx, bundlePath)
+}
+
+func (s *Services) uploadOCIBundle(ctx context.Context, bundlePath string) error {
+	dir, err := os.MkdirTemp("", "e2e-oci-bundle-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+	if err := extractTar(bundlePath, dir); err != nil {
+		return err
+	}
+	refs, err := parseE2ERefs(filepath.Join(dir, "e2e-refs.tsv"))
+	if err != nil {
+		return err
+	}
+	layout := filepath.Join(dir, "oci")
+	return s.copyRefsParallel(ctx, refs, func(ctx context.Context, rec e2eRef) error {
+		src := fmt.Sprintf("oci:%s:%s", layout, rec.tag)
+		return s.copyPreserveDigest(ctx, src, rec.ref)
+	})
+}
+
+func (s *Services) uploadDockerArchiveBundle(ctx context.Context, bundlePath string) error {
+	names, err := extractImageRefs(bundlePath)
+	if err != nil {
+		return err
+	}
+	refs := make([]e2eRef, 0, len(names))
+	for _, ref := range names {
+		refs = append(refs, e2eRef{ref: ref})
+	}
+	return s.copyRefsParallel(ctx, refs, func(ctx context.Context, rec e2eRef) error {
+		src := fmt.Sprintf("docker-archive:%s:%s", bundlePath, rec.ref)
+		return s.skopeoCopy(ctx, rec.ref, src, destDockerRef(s.Registry.URL, rec.ref), false)
+	})
+}
+
+type e2eRef struct {
+	tag string
+	ref string
+}
+
+func (s *Services) copyRefsParallel(ctx context.Context, refs []e2eRef, copyFn func(context.Context, e2eRef) error) error {
 	if len(refs) == 0 {
 		return nil
 	}
-
 	sem := make(chan struct{}, uploadConcurrency)
 	errCh := make(chan error, len(refs))
 	var wg sync.WaitGroup
 	for _, ref := range refs {
 		wg.Add(1)
-		go func(ref string) {
+		go func(ref e2eRef) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			errCh <- s.copyImageFromBundle(ctx, bundlePath, ref)
+			errCh <- copyFn(ctx, ref)
 		}(ref)
 	}
 	wg.Wait()
 	close(errCh)
-
 	for err := range errCh {
 		if err != nil {
 			return err
@@ -226,22 +255,43 @@ func (s *Services) uploadBundle(ctx context.Context, bundlePath string) error {
 	return nil
 }
 
-// copyImageFromBundle copies a single image reference out of a multi-image
-// docker-archive bundle directly to the registry. It retries transient local
-// registry failures and keeps each skopeo invocation bounded by perCopyTimeout
-// so a hung copy can't block the uploadConcurrency semaphore indefinitely.
-func (s *Services) copyImageFromBundle(ctx context.Context, bundlePath, ref string) error {
+func (s *Services) copyPreserveDigest(ctx context.Context, src, originalRef string) error {
+	dst := destDockerRef(s.Registry.URL, originalRef)
+	if err := s.skopeoCopy(ctx, originalRef, src, dst, true); err != nil {
+		return err
+	}
+	want, err := skopeoDigest(ctx, src, false)
+	if err != nil {
+		return fmt.Errorf("inspect source %s: %w", src, err)
+	}
+	got, err := skopeoDigestWithRetry(ctx, dst, true)
+	if err != nil {
+		return fmt.Errorf("inspect dest %s: %w", dst, err)
+	}
+	if want != got {
+		return fmt.Errorf("manifest digest changed for %s: source %s dest %s", originalRef, want, got)
+	}
+	return nil
+}
+
+func destDockerRef(registryURL, ref string) string {
 	path := ref
 	if idx := strings.Index(ref, "/"); idx != -1 {
 		path = ref[idx+1:]
 	}
-	src := fmt.Sprintf("docker-archive:%s:%s", bundlePath, ref)
-	dst := fmt.Sprintf("docker://%s/%s", s.Registry.URL, path)
+	return fmt.Sprintf("docker://%s/%s", registryURL, path)
+}
 
+func (s *Services) skopeoCopy(ctx context.Context, ref, src, dst string, preserveDigests bool) error {
 	var lastErr error
 	for attempt := 1; attempt <= bundleCopyRetries; attempt++ {
 		copyCtx, cancel := context.WithTimeout(ctx, perCopyTimeout)
-		copyCmd := exec.CommandContext(copyCtx, "skopeo", "copy", "--dest-tls-verify=false", src, dst)
+		args := []string{"copy", "--dest-tls-verify=false"}
+		if preserveDigests {
+			args = append(args, "--preserve-digests")
+		}
+		args = append(args, src, dst)
+		copyCmd := exec.CommandContext(copyCtx, "skopeo", args...)
 		output, err := copyCmd.CombinedOutput()
 		timedOut := copyCtx.Err() != nil
 		cancel()
@@ -264,6 +314,48 @@ func (s *Services) copyImageFromBundle(ctx context.Context, bundlePath, ref stri
 		}
 	}
 	return lastErr
+}
+
+func skopeoDigest(ctx context.Context, image string, insecureTLS bool) (string, error) {
+	inspectCtx, cancel := context.WithTimeout(ctx, perCopyTimeout)
+	defer cancel()
+	args := []string{"inspect", "--format", "{{.Digest}}"}
+	if insecureTLS {
+		args = append(args, "--tls-verify=false")
+	}
+	args = append(args, image)
+	cmd := exec.CommandContext(inspectCtx, "skopeo", args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		if inspectCtx.Err() != nil {
+			return "", fmt.Errorf("skopeo inspect for %s did not complete within %s: %w", image, perCopyTimeout, inspectCtx.Err())
+		}
+		return "", fmt.Errorf("%w: %s", err, string(out))
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// skopeoDigestWithRetry retries destination manifest reads because the local
+// registry can briefly return HTTP 500 after accepting an image copy.
+func skopeoDigestWithRetry(ctx context.Context, image string, insecureTLS bool) (string, error) {
+	var lastErr error
+	for attempt := 1; attempt <= bundleCopyRetries; attempt++ {
+		digest, err := skopeoDigest(ctx, image, insecureTLS)
+		if err == nil {
+			return digest, nil
+		}
+		lastErr = err
+
+		if attempt < bundleCopyRetries {
+			logrus.Warnf("Retrying bundle image manifest inspection for %s (attempt %d/%d): %v", image, attempt, bundleCopyRetries, lastErr)
+			select {
+			case <-ctx.Done():
+				return "", fmt.Errorf("context: %w", ctx.Err())
+			case <-time.After(bundleCopyRetryWait):
+			}
+		}
+	}
+	return "", lastErr
 }
 
 func extractImageRefs(bundlePath string) ([]string, error) {
@@ -314,4 +406,97 @@ func parseManifestJSON(r io.Reader) ([]string, error) {
 		refs = append(refs, entry.RepoTags...)
 	}
 	return refs, nil
+}
+
+func tarContains(bundlePath, name string) (bool, error) {
+	f, err := os.Open(bundlePath)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	tr := tar.NewReader(f)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if hdr.Name == name {
+			return true, nil
+		}
+	}
+}
+
+func parseE2ERefs(path string) ([]e2eRef, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var out []e2eRef
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		tag, ref, ok := strings.Cut(line, "\t")
+		if !ok || tag == "" || ref == "" {
+			return nil, fmt.Errorf("invalid e2e-refs line %q", line)
+		}
+		out = append(out, e2eRef{tag: tag, ref: ref})
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("e2e-refs.tsv has no entries")
+	}
+	return out, nil
+}
+
+func extractTar(bundlePath, dest string) error {
+	f, err := os.Open(bundlePath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	tr := tar.NewReader(f)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if err := writeTarHeader(dest, hdr, tr); err != nil {
+			return err
+		}
+	}
+}
+
+func writeTarHeader(dest string, hdr *tar.Header, r io.Reader) error {
+	name := filepath.Clean(hdr.Name)
+	if strings.HasPrefix(name, "..") {
+		return fmt.Errorf("invalid tar path %q", hdr.Name)
+	}
+	target := filepath.Join(dest, name)
+	switch hdr.Typeflag {
+	case tar.TypeDir:
+		return os.MkdirAll(target, 0o755)
+	case tar.TypeReg:
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return err
+		}
+		out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, hdr.FileInfo().Mode())
+		if err != nil {
+			return err
+		}
+		_, copyErr := io.Copy(out, r)
+		closeErr := out.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		return closeErr
+	default:
+		return nil
+	}
 }

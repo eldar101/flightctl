@@ -49,11 +49,25 @@ func TestEmitEvent_QueueRouting(t *testing.T) {
 			wantDelta: 1,
 		},
 		{
+			name:      "When PrepareDeltas without delta publisher it should enqueue on neither producer",
+			reason:    domain.EventReasonPrepareDeltas,
+			withDelta: false,
+			wantTask:  0,
+			wantDelta: 0,
+		},
+		{
 			name:      "When DeltaGenerationCompleted it should enqueue on the TaskQueue producer only",
 			reason:    domain.EventReasonDeltaGenerationCompleted,
 			withDelta: true,
 			wantTask:  1,
 			wantDelta: 0,
+		},
+		{
+			name:      "When DeltaGenerationComplete it should enqueue on the delta producer only",
+			reason:    domain.EventReasonDeltaGenerationComplete,
+			withDelta: true,
+			wantTask:  0,
+			wantDelta: 1,
 		},
 		{
 			name:      "When FleetRolloutStarted it should enqueue on the TaskQueue producer",
@@ -63,8 +77,8 @@ func TestEmitEvent_QueueRouting(t *testing.T) {
 			wantDelta: 0,
 		},
 		{
-			name:      "When reason is not allowlisted it should enqueue on neither producer",
-			reason:    domain.EventReasonFleetValid,
+			name:      "When DeltaGenerationProgress it should enqueue on neither producer",
+			reason:    domain.EventReasonDeltaGenerationProgress,
 			withDelta: true,
 			wantTask:  0,
 			wantDelta: 0,

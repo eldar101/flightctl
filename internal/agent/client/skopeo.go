@@ -22,10 +22,11 @@ const (
 
 // OCIManifest represents the minimal OCI manifest structure needed for type detection
 type OCIManifest struct {
-	MediaType    string          `json:"mediaType"`
-	ArtifactType string          `json:"artifactType,omitempty"`
-	Config       *OCIDescriptor  `json:"config,omitempty"`
-	Manifests    json.RawMessage `json:"manifests,omitempty"`
+	MediaType    string            `json:"mediaType"`
+	ArtifactType string            `json:"artifactType,omitempty"`
+	Annotations  map[string]string `json:"annotations,omitempty"`
+	Config       *OCIDescriptor    `json:"config,omitempty"`
+	Manifests    json.RawMessage   `json:"manifests,omitempty"`
 }
 
 // OCIDescriptor represents a content descriptor in an OCI manifest
@@ -126,6 +127,10 @@ func (s *Skopeo) InspectManifest(ctx context.Context, image string, opts ...Clie
 }
 
 func (s *Skopeo) Copy(ctx context.Context, src, dest string, opts ...ClientOption) error {
+	return s.copy(ctx, src, dest, opts...)
+}
+
+func (s *Skopeo) copy(ctx context.Context, src, dest string, opts ...ClientOption) error {
 	options := &clientOptions{}
 	for _, opt := range opts {
 		opt(options)
@@ -149,7 +154,7 @@ func (s *Skopeo) Copy(ctx context.Context, src, dest string, opts ...ClientOptio
 			return fmt.Errorf("pull secret path %s does not exist", options.pullSecretPath)
 		}
 		args = append(args, "--src-authfile", options.pullSecretPath)
-	} else {
+	} else if !options.defaultAuth {
 		args = append(args, "--src-no-creds")
 	}
 	_, stderr, exitCode := s.exec.ExecuteWithContext(ctx, skopeoCmd, args...)
@@ -245,6 +250,9 @@ func (s *Skopeo) inspectRaw(ctx context.Context, image string, options *clientOp
 func (s *Skopeo) appendAuthArgs(args []string, options *clientOptions) ([]string, error) {
 	pullSecretPath := options.pullSecretPath
 	if pullSecretPath == "" {
+		if options.defaultAuth {
+			return args, nil
+		}
 		// Skopeo does not behave well when looking up default credentials as a non-root user without a proper systemd session
 		// running, so disable default credentials when none were explicitly provided. This
 		// means any credentials required have to be specified in the options.

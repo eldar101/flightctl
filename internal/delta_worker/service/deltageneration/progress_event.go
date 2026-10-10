@@ -5,7 +5,7 @@ import (
 	"fmt"
 
 	"github.com/flightctl/flightctl/internal/delta_worker/model"
-	deltastore "github.com/flightctl/flightctl/internal/delta_worker/store"
+	deltastore "github.com/flightctl/flightctl/internal/delta_worker/store/deltageneration"
 	"github.com/flightctl/flightctl/internal/domain"
 )
 
@@ -30,7 +30,7 @@ func DeltaGenerationProgressEvent(ctx context.Context, prepare model.DeltaPrepar
 		details.TemplateVersion = prepare.TemplateVersion
 	}
 	if prepare.Kind == domain.DeviceKind {
-		details.SpecHash = prepare.SpecHash
+		details.Generation = prepare.Generation
 	}
 	var eventDetails domain.EventDetails
 	if err := eventDetails.FromDeltaGenerationProgressDetails(details); err != nil {

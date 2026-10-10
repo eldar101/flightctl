@@ -3,6 +3,8 @@
 We generate multiple agent images for testing purposes, each with a different
 services running, but all connected to our flightctl service for management.
 
+The bootc base image includes `oci-delta` at `/usr/bin/oci-delta`.
+
 This work is performed by the `create_agent_images.sh` script in this
 directory.
 
@@ -95,7 +97,7 @@ agent-images/
 │   └── cs10-bootc-redhat/ # RHEL 10 bootc
 │       └── Containerfile
 ├── variants/              # Variant-specific files
-│   ├── v2/, v3/, ..., v12/  # Layered on bootc base
+│   ├── v2/, v3/, ..., v13/  # Layered on bootc base; v13 contains enrollment-hook fixtures
 │   └── package/             # Package-mode (bootc base; no image-OS switch)
 ├── apps/                  # Application images (Containerfile.<app-name>.<version>)
 ├── common/                # Shared files used by variants/apps

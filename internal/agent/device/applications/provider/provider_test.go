@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"testing"
 
 	"github.com/flightctl/flightctl/api/core/v1beta1"
 	"github.com/flightctl/flightctl/internal/agent/client"
 	"github.com/flightctl/flightctl/internal/agent/device/dependency"
 	"github.com/flightctl/flightctl/internal/agent/device/errors"
+	"github.com/flightctl/flightctl/internal/agent/device/fileio"
 	"github.com/flightctl/flightctl/internal/api/common"
 	"github.com/flightctl/flightctl/pkg/log"
 	"github.com/samber/lo"
@@ -250,6 +252,66 @@ func TestExtractQuadletTargets(t *testing.T) {
 	}
 }
 
+func TestDecorateApplicationTargets(t *testing.T) {
+	parentHint := "quay.io/acme/deltas/app@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+	childHint := "quay.io/acme/deltas/child@sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+
+	targets := []dependency.OCIPullTarget{
+		{Reference: "quay.io/acme/app@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+		{Reference: "quay.io/acme/child:latest"},
+		{Reference: "quay.io/acme/other:latest"},
+	}
+
+	got := decorateApplicationTargets(
+		targets,
+		&parentHint,
+		[]v1beta1.ImageDeltaHint{{
+			TargetImage:  "quay.io/acme/child:latest",
+			TargetDigest: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+			DeltaImage:   childHint,
+		}},
+		"app",
+	)
+
+	require.Equal(t, parentHint, got[0].Delta.Hint)
+	require.Equal(t, childHint, got[1].Delta.Hint)
+	require.Equal(t, "app", got[0].Delta.Application)
+	require.Equal(t, "app", got[1].Delta.Application)
+	require.NotNil(t, got[2].Delta)
+	require.Empty(t, got[2].Delta.Hint)
+}
+
+func TestDecorateApplicationTargetsDoesNotTrackHelmChartAsWorkloadDelta(t *testing.T) {
+	parentHint := "quay.io/acme/deltas/chart@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+	chart := dependency.OCIPullTarget{
+		Type:      dependency.OCITypeHelmChart,
+		Reference: "quay.io/acme/charts/app:2.0.0",
+	}
+
+	got := decorateApplicationTargets([]dependency.OCIPullTarget{chart}, &parentHint, nil, "helm-app")
+
+	require.Nil(t, got[0].Delta)
+
+	const digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const workloadHint = "quay.io/acme/deltas/workload@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	workload := dependency.OCIPullTarget{
+		Reference: "quay.io/acme/workload:2.0.0",
+		Digest:    digest,
+	}
+	const otherDigest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	otherWorkload := dependency.OCIPullTarget{Reference: "quay.io/acme/other@" + otherDigest}
+	got = decorateApplicationTargets(
+		[]dependency.OCIPullTarget{chart, workload, otherWorkload},
+		&parentHint,
+		[]v1beta1.ImageDeltaHint{{TargetImage: workload.Reference, TargetDigest: digest, DeltaImage: workloadHint}},
+		"helm-app",
+	)
+
+	require.Nil(t, got[0].Delta)
+	require.Equal(t, &dependency.OCIDeltaTarget{Hint: workloadHint, SourceDigest: digest, Application: "helm-app"}, got[1].Delta)
+	require.Equal(t, &dependency.OCIDeltaTarget{SourceDigest: otherDigest, Application: "helm-app"}, got[2].Delta)
+}
+
 func TestCollectProviderTargetsDeferredDependencies(t *testing.T) {
 	tests := []struct {
 		name                string
@@ -444,6 +506,74 @@ type mockProvider struct {
 	id   string
 	name string
 	spec *ApplicationSpec
+}
+
+type nestedTargetsTestProvider struct {
+	spec          *ApplicationSpec
+	parentRef     string
+	nestedTargets []dependency.OCIPullTarget
+	extracted     int
+}
+
+func (p *nestedTargetsTestProvider) ID() string                                 { return p.spec.ID }
+func (p *nestedTargetsTestProvider) Name() string                               { return p.spec.Name }
+func (p *nestedTargetsTestProvider) Spec() *ApplicationSpec                     { return p.spec }
+func (p *nestedTargetsTestProvider) Verify(_ context.Context) error             { return nil }
+func (p *nestedTargetsTestProvider) Install(_ context.Context) error            { return nil }
+func (p *nestedTargetsTestProvider) Remove(_ context.Context) error             { return nil }
+func (p *nestedTargetsTestProvider) EnsureDependencies(_ context.Context) error { return nil }
+func (p *nestedTargetsTestProvider) collectOCITargets(_ context.Context, _ dependency.PullConfigResolver) (dependency.OCIPullTargetsByUser, error) {
+	return nil, nil
+}
+func (p *nestedTargetsTestProvider) extractNestedTargets(_ context.Context, _ dependency.PullConfigResolver) (*AppData, error) {
+	p.extracted++
+	return &AppData{Targets: p.nestedTargets}, nil
+}
+func (p *nestedTargetsTestProvider) parentIsAvailable(_ context.Context) (string, string, bool, error) {
+	return p.parentRef, "", true, nil
+}
+
+func TestCollectNestedForProvider_WhenHelmValuesChange_ItShouldInvalidateCache(t *testing.T) {
+	require := require.New(t)
+	oldValues := map[string]interface{}{"image": map[string]interface{}{"repository": "nginx"}}
+	newValues := map[string]interface{}{"image": map[string]interface{}{"repository": "nginxinc/nginx-unprivileged"}}
+
+	provider := &nestedTargetsTestProvider{
+		spec: &ApplicationSpec{
+			ID:      "hello-helm",
+			Name:    "hello-helm",
+			AppType: v1beta1.AppTypeHelm,
+			Image:   "oci://registry.example.com/charts/hello:0.1.0",
+			Path:    "/var/lib/flightctl/helm/charts/hello",
+			HelmApp: &v1beta1.HelmApplication{Values: &oldValues},
+		},
+		parentRef:     "oci://registry.example.com/charts/hello:0.1.0",
+		nestedTargets: []dependency.OCIPullTarget{{Reference: "docker.io/nginx:latest"}},
+	}
+	cache := NewOCITargetCache()
+	appDataCache := NewAppDataCache()
+	ctx := context.Background()
+	logger := log.NewPrefixLogger("test")
+
+	targets, requeue, err := collectNestedForProvider(ctx, logger, provider, nil, cache, appDataCache)
+	require.NoError(err)
+	require.False(requeue)
+	require.Equal(provider.nestedTargets, targets)
+	require.Equal(1, provider.extracted)
+
+	targets, requeue, err = collectNestedForProvider(ctx, logger, provider, nil, cache, appDataCache)
+	require.NoError(err)
+	require.False(requeue)
+	require.Equal(provider.nestedTargets, targets)
+	require.Equal(1, provider.extracted, "unchanged Helm values should use the cache")
+
+	provider.spec.HelmApp.Values = &newValues
+	provider.nestedTargets = []dependency.OCIPullTarget{{Reference: "docker.io/nginxinc/nginx-unprivileged:1.27-alpine"}}
+	targets, requeue, err = collectNestedForProvider(ctx, logger, provider, nil, cache, appDataCache)
+	require.NoError(err)
+	require.False(requeue)
+	require.Equal(provider.nestedTargets, targets)
+	require.Equal(2, provider.extracted, "changed Helm values should rerun extraction")
 }
 
 func (m *mockProvider) ID() string                                 { return m.id }
@@ -652,6 +782,199 @@ func TestGetDiff_WhenOnlyHelmLifecycleFieldsDiffer_ItShouldEnsureNotChange(t *te
 			require.Empty(diff.Changed, "lifecycle-only diff must not trigger Update")
 			require.Len(diff.Ensure, 1)
 			require.Equal(appID, diff.Ensure[0].ID())
+		})
+	}
+}
+
+func TestWriteENVFileSystemd(t *testing.T) {
+	tests := []struct {
+		name     string
+		envVars  map[string]string
+		expected map[string]string // key → expected full line in the .env file
+	}{
+		{
+			name:    "When values are plain it should double-quote them",
+			envVars: map[string]string{"FOO": "bar"},
+			expected: map[string]string{
+				"FOO": `FOO="bar"`,
+			},
+		},
+		{
+			name:    "When value contains a colon it should preserve it inside quotes",
+			envVars: map[string]string{"DB_URL": "host:5432"},
+			expected: map[string]string{
+				"DB_URL": `DB_URL="host:5432"`,
+			},
+		},
+		{
+			name:    "When value contains a hash it should preserve it inside quotes",
+			envVars: map[string]string{"COMMENT": "value#with-hash"},
+			expected: map[string]string{
+				"COMMENT": `COMMENT="value#with-hash"`,
+			},
+		},
+		{
+			name:    "When value contains spaces it should preserve them inside quotes",
+			envVars: map[string]string{"GREETING": "hello world"},
+			expected: map[string]string{
+				"GREETING": `GREETING="hello world"`,
+			},
+		},
+		{
+			name:    "When value contains a double-quote it should escape it",
+			envVars: map[string]string{"MSG": `say "hello"`},
+			expected: map[string]string{
+				"MSG": `MSG="say \"hello\""`,
+			},
+		},
+		{
+			name:    "When value contains a backslash it should escape it",
+			envVars: map[string]string{"PATH_VAL": `C:\Users\test`},
+			expected: map[string]string{
+				"PATH_VAL": `PATH_VAL="C:\\Users\\test"`,
+			},
+		},
+		{
+			name:    "When value contains both backslash and double-quote it should escape both",
+			envVars: map[string]string{"COMPLEX": `path\"quoted`},
+			expected: map[string]string{
+				"COMPLEX": `COMPLEX="path\\\"quoted"`,
+			},
+		},
+		{
+			name:    "When value contains a dollar sign it should escape it",
+			envVars: map[string]string{"SECRET": "pa$$word"},
+			expected: map[string]string{
+				"SECRET": `SECRET="pa\$\$word"`,
+			},
+		},
+		{
+			name:    "When value contains dollar backslash and double-quote it should escape all",
+			envVars: map[string]string{"ALL": `cost$10 path\"quoted`},
+			expected: map[string]string{
+				"ALL": `ALL="cost\$10 path\\\"quoted"`,
+			},
+		},
+		{
+			name:    "When value is empty it should produce an empty quoted string",
+			envVars: map[string]string{"EMPTY": ""},
+			expected: map[string]string{
+				"EMPTY": `EMPTY=""`,
+			},
+		},
+		{
+			name:    "When envVars is empty it should not create a file",
+			envVars: map[string]string{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require := require.New(t)
+			tmpDir := t.TempDir()
+			writer := fileio.NewWriter(fileio.WithWriterRootDir(tmpDir))
+			reader := fileio.NewReader(fileio.WithReaderRootDir(tmpDir))
+
+			appPath := "/test-app"
+			err := fileio.NewReadWriter(reader, writer).MkdirAll(appPath, fileio.DefaultDirectoryPermissions)
+			require.NoError(err)
+
+			err = writeENVFile(appPath, writer, tt.envVars, systemdEnvReplacer)
+			require.NoError(err)
+
+			if len(tt.envVars) == 0 {
+				exists, err := fileio.NewReadWriter(reader, writer).PathExists(filepath.Join(appPath, ".env"))
+				require.NoError(err)
+				require.False(exists, ".env file should not be created when envVars is empty")
+				return
+			}
+
+			envFile, err := fileio.NewReadWriter(reader, writer).ReadFile(filepath.Join(appPath, ".env"))
+			require.NoError(err)
+			content := string(envFile)
+
+			for _, expectedLine := range tt.expected {
+				require.Contains(content, expectedLine+"\n")
+			}
+		})
+	}
+}
+
+func TestWriteENVFileCompose(t *testing.T) {
+	tests := []struct {
+		name     string
+		envVars  map[string]string
+		expected map[string]string // key → expected full line in the .env file
+	}{
+		{
+			name:    "When values are plain it should double-quote them",
+			envVars: map[string]string{"FOO": "bar"},
+			expected: map[string]string{
+				"FOO": `FOO="bar"`,
+			},
+		},
+		{
+			name:    "When value contains a dollar sign it should NOT escape it",
+			envVars: map[string]string{"SECRET": "pa$$word"},
+			expected: map[string]string{
+				"SECRET": `SECRET="pa$$word"`,
+			},
+		},
+		{
+			name:    "When value contains a double-quote it should escape it",
+			envVars: map[string]string{"MSG": `say "hello"`},
+			expected: map[string]string{
+				"MSG": `MSG="say \"hello\""`,
+			},
+		},
+		{
+			name:    "When value contains a backslash it should escape it",
+			envVars: map[string]string{"PATH_VAL": `C:\Users\test`},
+			expected: map[string]string{
+				"PATH_VAL": `PATH_VAL="C:\\Users\\test"`,
+			},
+		},
+		{
+			name:    "When value contains dollar and backslash it should escape only the backslash",
+			envVars: map[string]string{"MIXED": `cost$10\path`},
+			expected: map[string]string{
+				"MIXED": `MIXED="cost$10\\path"`,
+			},
+		},
+		{
+			name:    "When envVars is empty it should not create a file",
+			envVars: map[string]string{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require := require.New(t)
+			tmpDir := t.TempDir()
+			writer := fileio.NewWriter(fileio.WithWriterRootDir(tmpDir))
+			reader := fileio.NewReader(fileio.WithReaderRootDir(tmpDir))
+
+			appPath := "/test-app"
+			err := fileio.NewReadWriter(reader, writer).MkdirAll(appPath, fileio.DefaultDirectoryPermissions)
+			require.NoError(err)
+
+			err = writeENVFile(appPath, writer, tt.envVars, composeEnvReplacer)
+			require.NoError(err)
+
+			if len(tt.envVars) == 0 {
+				exists, err := fileio.NewReadWriter(reader, writer).PathExists(filepath.Join(appPath, ".env"))
+				require.NoError(err)
+				require.False(exists, ".env file should not be created when envVars is empty")
+				return
+			}
+
+			envFile, err := fileio.NewReadWriter(reader, writer).ReadFile(filepath.Join(appPath, ".env"))
+			require.NoError(err)
+			content := string(envFile)
+
+			for _, expectedLine := range tt.expected {
+				require.Contains(content, expectedLine+"\n")
+			}
 		})
 	}
 }

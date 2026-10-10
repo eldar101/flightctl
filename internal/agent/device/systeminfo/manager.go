@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -23,7 +24,6 @@ import (
 	"github.com/flightctl/flightctl/pkg/executer"
 	"github.com/flightctl/flightctl/pkg/log"
 	"github.com/flightctl/flightctl/pkg/version"
-	"github.com/samber/lo"
 )
 
 type manager struct {
@@ -35,12 +35,23 @@ type manager struct {
 	readWriter fileio.ReadWriter
 	dataDir    string
 
-	mu                sync.Mutex
-	infoKeys          []string
-	customKeys        []string
-	collectionTimeout time.Duration
-	collectors        map[string]CollectorFn
-	collected         bool
+	mu                 sync.Mutex
+	collectionMu       sync.Mutex
+	infoKeys           []string
+	customKeys         []string
+	collectionTimeout  time.Duration
+	collectionInterval time.Duration
+	collectionChanged  chan struct{}
+	runtimeCollectors  map[string]CollectorFn
+	collection         []*collector
+	now                func() time.Time
+	rng                *rand.Rand
+
+	// gpus and kvm cache the collected GPU inventory and KVM availability. They
+	// are refreshed during the collection cycle rather than on every status
+	// generation, and are read under mu.
+	gpus *[]v1beta1.DeviceGpu
+	kvm  *v1beta1.DeviceKvm
 
 	log *log.PrefixLogger
 }
@@ -53,17 +64,24 @@ func NewManager(
 	infoKeys []string,
 	customKeys []string,
 	collectionTimeout util.Duration,
+	collectionInterval util.Duration,
 ) *manager {
-	return &manager{
-		exec:              exec,
-		readWriter:        readWriter,
-		dataDir:           dataDir,
-		infoKeys:          infoKeys,
-		customKeys:        customKeys,
-		collectionTimeout: time.Duration(collectionTimeout),
-		collectors:        make(map[string]CollectorFn),
-		log:               log,
+	m := &manager{
+		exec:               exec,
+		readWriter:         readWriter,
+		dataDir:            dataDir,
+		infoKeys:           infoKeys,
+		customKeys:         customKeys,
+		collectionTimeout:  time.Duration(collectionTimeout),
+		collectionInterval: time.Duration(collectionInterval),
+		collectionChanged:  make(chan struct{}, 1),
+		runtimeCollectors:  make(map[string]CollectorFn),
+		now:                time.Now,
+		rng:                rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64())), //nolint:gosec // G404 - shuffling does not require crypto-strength randomness
+		log:                log,
 	}
+	m.rebuildCollectors()
+	return m
 }
 
 func (m *manager) Initialize(ctx context.Context) (err error) {
@@ -103,6 +121,8 @@ func (m *manager) Initialize(ctx context.Context) (err error) {
 		}
 	}
 
+	m.collect(ctx)
+
 	return nil
 }
 
@@ -118,71 +138,34 @@ func (m *manager) ReloadConfig(ctx context.Context, cfg *config.Config) error {
 
 	if !reflect.DeepEqual(m.infoKeys, cfg.SystemInfo) {
 		m.log.Infof("Updating system info keys: %v -> %v", m.infoKeys, cfg.SystemInfo)
-
-		oldConfig := collectCfg{}
-
-		// Ignore errors for previous and new. We're just trying to diff the two to see if there
-		// is something new that should be collected
-		opts, _ := collectionOptsFromInfoKeys(m.infoKeys)
-		for _, opt := range opts {
-			opt(&oldConfig)
-		}
-
-		newConfig := collectCfg{}
-		opts, _ = collectionOptsFromInfoKeys(cfg.SystemInfo)
-		for _, opt := range opts {
-			opt(&newConfig)
-		}
-
-		// Snapshot old/new key sets (string keys), so we can detect newly added keys.
-		oldKeys := make(map[string]struct{}, len(m.infoKeys))
-		for _, k := range m.infoKeys {
-			oldKeys[k] = struct{}{}
-		}
-		newKeys := make(map[string]struct{}, len(cfg.SystemInfo))
-		for _, k := range cfg.SystemInfo {
-			newKeys[k] = struct{}{}
-		}
-
 		m.infoKeys = cfg.SystemInfo
-
-		// If the newConfig only removes required collectors but doesn't add any
-		// new collectors, there is no need to trigger a recollection
-		hasNewCollectors := false
-		for cType := range newConfig.enabledTypes {
-			if !oldConfig.hasCollector(cType) {
-				hasNewCollectors = true
-				break
-			}
-		}
-
-		if !hasNewCollectors {
-			for k := range newKeys {
-				if _, existed := oldKeys[k]; existed {
-					continue
-				}
-				if _, ok := m.collectors[k]; ok {
-					// Runtime collector already registered -> can collect immediately.
-					hasNewCollectors = true
-					break
-				}
-			}
-		}
-
-		if hasNewCollectors {
-			m.collected = false
-		}
 	}
-
 	if !reflect.DeepEqual(m.customKeys, cfg.SystemInfoCustom) {
 		m.log.Infof("Updating custom system info keys: %v -> %v", m.customKeys, cfg.SystemInfoCustom)
 		m.customKeys = cfg.SystemInfoCustom
 	}
+	// Reload custom script definitions on every SIGHUP, even when the
+	// configured keys are unchanged.
+	m.rebuildCollectors()
+	collectionChanged := true
 
 	timeout := time.Duration(cfg.SystemInfoTimeout)
 	if m.collectionTimeout != timeout {
 		m.log.Infof("Updating system info collection timeout: %v -> %v", m.collectionTimeout, timeout)
 		m.collectionTimeout = timeout
+	}
+
+	interval := time.Duration(cfg.SystemInfoCollectionInterval())
+	if m.collectionInterval != interval {
+		m.log.Infof("Updating system info collection interval: %v -> %v", m.collectionInterval, interval)
+		m.collectionInterval = interval
+		collectionChanged = true
+	}
+	if collectionChanged {
+		select {
+		case m.collectionChanged <- struct{}{}:
+		default:
+		}
 	}
 
 	return nil
@@ -205,51 +188,298 @@ func (m *manager) Status(ctx context.Context, deviceStatus *v1beta1.DeviceStatus
 	for _, opt := range opts {
 		opt(&collectorOpts)
 	}
-	m.mu.Lock()
+	if collectorOpts.Force {
+		m.collect(ctx)
+	}
+	deviceStatus.SystemInfo, deviceStatus.SystemInfoStatus = m.systemInfoFromCache()
+	m.applyGPU(&deviceStatus.SystemInfo)
+	m.applyKVM(&deviceStatus.SystemInfo)
 
-	if m.collected && !collectorOpts.Force {
+	return nil
+}
+
+// Run starts periodic system info collection and stops when ctx is cancelled.
+func (m *manager) Run(ctx context.Context) {
+	var (
+		interval time.Duration
+		ticker   *time.Ticker
+		ticks    <-chan time.Time
+	)
+	updateTicker := func() {
+		m.mu.Lock()
+		updatedInterval := m.collectionInterval
 		m.mu.Unlock()
-		return nil
+		if updatedInterval != interval {
+			if updatedInterval <= 0 {
+				if ticker != nil {
+					ticker.Stop()
+					ticker = nil
+					ticks = nil
+				}
+				m.log.Debugf("Systeminfo collection disabled (no interval)")
+			} else if ticker == nil {
+				ticker = time.NewTicker(updatedInterval)
+				ticks = ticker.C
+				m.log.Debugf("Starting systeminfo collection loop (interval=%s)", updatedInterval)
+			} else {
+				ticker.Reset(updatedInterval)
+				m.log.Debugf("Systeminfo collection loop changed (interval=%s)", updatedInterval)
+			}
+		}
+		interval = updatedInterval
 	}
+	updateTicker()
+	defer func() {
+		if ticker != nil {
+			ticker.Stop()
+		}
+	}()
 
-	// set collected to true even if there is an error this is to prevent
-	// collecting system info multiple times
-	m.collected = true
-
-	// reduce scope of the mutex
-	timeout := m.collectionTimeout
-	infoKeys := slices.Clone(m.infoKeys)
-	customKeys := slices.Clone(m.customKeys)
-	bootID := m.bootID
-	collectors := make(map[string]CollectorFn, len(m.collectors))
-	for k, v := range m.collectors {
-		collectors[k] = v
+	for {
+		select {
+		case <-ctx.Done():
+			m.log.Debugf("Systeminfo collection loop stopped")
+			return
+		case <-m.collectionChanged:
+			updateTicker()
+			m.collect(ctx)
+		case <-ticks:
+			m.collect(ctx)
+		}
 	}
-	dataDir := m.dataDir
-	m.mu.Unlock()
+}
 
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	systemInfo, err := collectDeviceSystemInfo(
-		ctx,
+func (m *manager) rebuildCollectors() {
+	m.collection = buildCollectors(
 		m.log,
 		m.exec,
 		m.readWriter,
-		infoKeys,
-		customKeys,
-		bootID,
-		collectors,
-		filepath.Join(dataDir, HardwareMapFileName),
+		filepath.Join(m.dataDir, HardwareMapFileName),
+		managerCollectionRequest(m.infoKeys, m.customKeys),
+		m.runtimeCollectors,
+		m.collection,
 	)
+}
 
-	if err != nil {
-		deviceStatus.SystemInfo = m.defaultSystemInfo()
-		return err
+func managerCollectionRequest(infoKeys, customKeys []string) collectionRequest {
+	custom := customCollectionRequest{mode: customCollectionDisabled}
+	if customKeys == nil || slices.Contains(customKeys, "*") {
+		custom.mode = customCollectionDiscover
+	} else if len(customKeys) > 0 {
+		custom = customCollectionRequest{mode: customCollectionConfigured, keys: customKeys}
 	}
-	deviceStatus.SystemInfo = systemInfo
+	return collectionRequest{infoKeys: infoKeys, custom: custom}
+}
 
-	return nil
+func (m *manager) collect(ctx context.Context) {
+	m.collectConfigured(ctx, false)
+	m.refreshGPU(ctx)
+	m.refreshKVM(ctx)
+}
+
+// CollectPending collects sources that have not yet been collected.
+func (m *manager) CollectPending(ctx context.Context) {
+	m.collectConfigured(ctx, true)
+}
+
+func (m *manager) collectConfigured(ctx context.Context, pendingOnly bool) {
+	m.collectionMu.Lock()
+	defer m.collectionMu.Unlock()
+
+	m.mu.Lock()
+	timeout := m.collectionTimeout
+	sources := slices.Clone(m.collection)
+	if pendingOnly {
+		sources = slices.DeleteFunc(sources, func(source *collector) bool {
+			return !source.pending()
+		})
+	}
+	m.mu.Unlock()
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+
+	m.collectSources(ctx, sources)
+}
+
+func (m *manager) collectSources(ctx context.Context, sources []*collector) {
+	// Shuffle sources so that when the global timeout fires, different
+	// sources get a chance to run on each collection cycle instead of
+	// always starving the ones at the end of a fixed list.
+	m.rng.Shuffle(len(sources), func(i, j int) {
+		sources[i], sources[j] = sources[j], sources[i]
+	})
+
+	for _, source := range sources {
+		if ctx.Err() != nil {
+			return
+		}
+		info := &Info{Hardware: HardwareFacts{}}
+		err := source.collect(ctx, info)
+		if err == nil && ctx.Err() != nil {
+			err = ctx.Err()
+		}
+		if err != nil && !errors.IsContext(err) {
+			m.log.Warningf("System info collector failed: %v", err)
+		}
+		m.mu.Lock()
+		source.apply(info, err, m.now())
+		m.mu.Unlock()
+		if ctx.Err() != nil {
+			return
+		}
+	}
+}
+
+func (m *manager) infoFromCache() *Info {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	info := &Info{
+		CollectedAt: time.Now().Format(time.RFC3339),
+		Hardware:    HardwareFacts{},
+		Metadata: map[string]interface{}{
+			"collector_version": version.Get().String(),
+			"collector_type":    "flightctl-agent",
+		},
+	}
+	for _, source := range m.collection {
+		if source.raw == nil {
+			continue
+		}
+		for _, executor := range source.executors {
+			if executor.projectInfo != nil {
+				executor.projectInfo(info, source.raw)
+			}
+		}
+	}
+	return info
+}
+
+func (m *manager) systemInfoFromCache() (v1beta1.DeviceSystemInfo, *v1beta1.DeviceSystemInfoStatus) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	systemInfo := m.defaultSystemInfo()
+	systemInfo.AdditionalProperties = make(map[string]string)
+	customInfo := make(v1beta1.CustomDeviceInfo)
+	statuses := v1beta1.DeviceSystemInfoStatuses{
+		SystemInfo: make(map[string]v1beta1.SystemInfoSourceStatus),
+		CustomInfo: make(map[string]v1beta1.SystemInfoSourceStatus),
+	}
+	failed := 0
+	total := 0
+	unknown := false
+	for _, source := range m.collection {
+		for _, exec := range source.executors {
+			if exec.kind == hiddenSource {
+				continue
+			}
+			total++
+			if !exec.attempted {
+				unknown = true
+				continue
+			}
+			entry := v1beta1.SystemInfoSourceStatus{
+				LastTransitionTime: exec.lastTransitionTime,
+				Status:             v1beta1.SystemInfoSourceStatusHealthy,
+			}
+			if exec.failed {
+				entry.Message = new(exec.message)
+				entry.Status = v1beta1.SystemInfoSourceStatusError
+				failed++
+			}
+			if exec.kind == systemInfoSource {
+				statuses.SystemInfo[exec.key] = entry
+				if exec.hasValue {
+					systemInfo.AdditionalProperties[exec.key] = exec.value
+				}
+			} else {
+				statuses.CustomInfo[exec.key] = entry
+				if exec.hasValue {
+					customInfo[exec.key] = exec.value
+				}
+			}
+		}
+	}
+	if len(customInfo) > 0 {
+		systemInfo.CustomInfo = &customInfo
+	}
+
+	summary := v1beta1.SystemInfoSummaryStatusHealthy
+	if total == 0 || unknown {
+		summary = v1beta1.SystemInfoSummaryStatusUnknown
+	} else if failed == total {
+		summary = v1beta1.SystemInfoSummaryStatusError
+	} else if failed > 0 {
+		summary = v1beta1.SystemInfoSummaryStatusDegraded
+	}
+	return systemInfo, &v1beta1.DeviceSystemInfoStatus{
+		Statuses: statuses,
+		Summary:  v1beta1.DeviceSystemInfoSummaryStatus{Status: summary},
+	}
+}
+
+// refreshGPU collects the GPU inventory and caches it so Status reports a
+// snapshot rather than scanning the filesystem on every status generation. It is
+// called from the collection cycle (see collect).
+//
+// It must be called WITHOUT holding m.mu: it calls infoFromCache (which acquires
+// m.mu) and performs best-effort filesystem reads before taking the lock to
+// store the result. readWriter is nil only in unit tests that construct the
+// manager struct directly; skip the scan in that case.
+func (m *manager) refreshGPU(ctx context.Context) {
+	if m.readWriter == nil || ctx.Err() != nil {
+		return
+	}
+	info := m.infoFromCache()
+	hardwareMapPath := filepath.Join(m.dataDir, HardwareMapFileName)
+	gpus := collectGPUSystemInfo(m.log, m.readWriter, hardwareMapPath, info)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// Preserve the previously cached inventory when a GPU scan fails (nil) so a
+	// transient failure does not clear the reported GPU inventory.
+	if gpus != nil {
+		m.gpus = gpus
+	}
+}
+
+// refreshKVM collects KVM availability and caches it so Status reports a
+// snapshot rather than scanning the filesystem on every status generation. It is
+// called from the collection cycle (see collect).
+//
+// readWriter is nil only in unit tests that construct the manager struct
+// directly; skip the scan in that case.
+func (m *manager) refreshKVM(ctx context.Context) {
+	if m.readWriter == nil || ctx.Err() != nil {
+		return
+	}
+	kvm := collectKVMSystemInfo(m.log, m.readWriter)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.kvm = kvm
+}
+
+// applyGPU records the GPU inventory on the system info. It is always reported,
+// regardless of which info keys are configured. The value is read from the cache
+// populated by refreshGPU during collection.
+func (m *manager) applyGPU(systemInfo *v1beta1.DeviceSystemInfo) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	systemInfo.Gpus = m.gpus
+}
+
+// applyKVM records KVM availability on the system info. It is always reported,
+// regardless of which info keys are configured. The value is read from the cache
+// populated by refreshKVM during collection.
+func (m *manager) applyKVM(systemInfo *v1beta1.DeviceSystemInfo) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	systemInfo.Kvm = m.kvm
 }
 
 // defaultSystemInfo returns the default system info.
@@ -275,14 +505,14 @@ func (m *manager) RegisterCollector(ctx context.Context, key string, fn Collecto
 		return
 	}
 
-	if !common.IsKnownKey(key) {
+	if !common.IsRuntimeKey(key) {
 		if m.log != nil {
 			m.log.Errorf("Unknown system info collector key: %q", key)
 		}
 		return
 	}
 
-	if common.IsBuiltInKey(key) {
+	if _, isBuiltIn := collectorForInfoKey(key); isBuiltIn {
 		if m.log != nil {
 			m.log.Errorf("BuiltIn system info key must not be registered as a runtime collector: %q", key)
 		}
@@ -296,56 +526,17 @@ func (m *manager) RegisterCollector(ctx context.Context, key string, fn Collecto
 		m.log.Debugf("Registering system info collector: %s", key)
 	}
 
-	if _, ok := m.collectors[key]; ok {
+	if _, ok := m.runtimeCollectors[key]; ok {
 		if m.log != nil {
 			m.log.Errorf("Collector %s already registered", key)
 		}
 		return
 	}
 
-	m.collectors[key] = fn
-	m.collected = false
-}
-
-// collectDeviceSystemInfo collects the system information from the device and returns it as a DeviceSystemInfo object.
-func collectDeviceSystemInfo(
-	ctx context.Context,
-	log *log.PrefixLogger,
-	exec executer.Executer,
-	reader fileio.Reader,
-	infoKeys []string,
-	customKeys []string,
-	bootID string,
-	collectors map[string]CollectorFn,
-	hardwareMapPath string,
-) (v1beta1.DeviceSystemInfo, error) {
-	agentVersion := version.Get()
-
-	collectionOpts, err := collectionOptsFromInfoKeys(infoKeys)
-	// Don't block collection for a few unknown keys. Try our best to grab everything we can
-	if err != nil {
-		log.Warnf("Failed to handle system info keys: %v", err)
+	m.runtimeCollectors[key] = fn
+	if slices.Contains(m.infoKeys, key) {
+		m.rebuildCollectors()
 	}
-
-	info, err := Collect(ctx, log, exec, reader, customKeys, hardwareMapPath, collectionOpts...)
-	if err != nil {
-		log.Errorf("Failed to collect system info: %v", err)
-		return v1beta1.DeviceSystemInfo{}, err
-	}
-
-	systemInfoMap := getSystemInfoMap(ctx, log, info, infoKeys, collectors)
-	log.Tracef("system info map: %v", systemInfoMap)
-	s := v1beta1.DeviceSystemInfo{
-		Architecture:         info.Architecture,
-		OperatingSystem:      info.OperatingSystem,
-		BootID:               bootID,
-		AgentVersion:         agentVersion.GitVersion,
-		AdditionalProperties: systemInfoMap,
-	}
-	if len(info.Custom) > 0 {
-		s.CustomInfo = lo.ToPtr(v1beta1.CustomDeviceInfo(info.Custom))
-	}
-	return s, nil
 }
 
 // getBoot returns the boot status from disk.

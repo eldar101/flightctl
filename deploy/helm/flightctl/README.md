@@ -320,6 +320,7 @@ For more detailed configuration options, see the [Values](#values) section below
 | global.auth.aap.clientSecret | string | `""` | OAuth2 client secret (prefer mounting from a secret) |
 | global.auth.aap.enabled | bool | `true` | Whether the AAP provider is enabled |
 | global.auth.aap.externalApiUrl | string | `""` | The URL of the AAP Gateway API endpoint that is reachable by clients |
+| global.auth.aap.identityCacheTTL | string | `"45s"` | TTL for AAP identity cache (Go duration string, e.g. "45s", "2m") |
 | global.auth.aap.organizationNamePrefix | string | `""` | Optional prefix for org names from this provider (e.g. "aap-"). Incoming org names are exposed as prefix + name. |
 | global.auth.aap.scopes | list | `["read","write"]` | List of OAuth2 scopes to request |
 | global.auth.aap.tokenUrl | string | `""` | OAuth2 token endpoint URL |
@@ -371,12 +372,13 @@ For more detailed configuration options, see the [Values](#values) section below
 | imageBuilderApi.image.image | string | `"quay.io/flightctl/flightctl-imagebuilder-api-el9"` | ImageBuilder API container image |
 | imageBuilderApi.image.pullPolicy | string | `""` | Image pull policy for ImageBuilder API container |
 | imageBuilderApi.image.tag | string | `""` | ImageBuilder API image tag |
-| imageBuilderWorker | object | `{"defaultTTL":"168h","enabled":true,"image":{"image":"quay.io/flightctl/flightctl-imagebuilder-worker-el9","pullPolicy":"","tag":""},"logLevel":"info","maxConcurrentBuilds":2,"privileged":true,"replicas":1,"resources":{},"rhsmCaSecretName":"","rhsmSecretName":"","sbom":{"enabled":true,"purlTransform":{"enabled":true},"pushToRegistry":true,"uploadToTrustify":true},"serviceImages":{"bootcImageBuilder":{"image":"","skipTlsVerify":false},"podman":{"image":"","skipTlsVerify":false},"pullSecretName":"","syft":{"image":"","skipTlsVerify":false}},"yumReposSecretName":""}` | ImageBuilder Worker Configuration |
+| imageBuilderWorker | object | `{"defaultTTL":"168h","enabled":true,"image":{"image":"quay.io/flightctl/flightctl-imagebuilder-worker-el9","pullPolicy":"","tag":""},"imageBuilderTimeout":"3m","logLevel":"info","maxConcurrentBuilds":2,"privileged":true,"replicas":1,"resources":{},"rhsmCaSecretName":"","rhsmSecretName":"","sbom":{"enabled":true,"purlTransform":{"enabled":true},"pushToRegistry":true,"uploadToTrustify":true},"serviceImages":{"bootcImageBuilder":{"image":"","skipTlsVerify":false},"podman":{"image":"","skipTlsVerify":false},"pullSecretName":"","syft":{"image":"","skipTlsVerify":false}},"timeoutCheckTaskInterval":"1m","yumReposSecretName":""}` | ImageBuilder Worker Configuration |
 | imageBuilderWorker.defaultTTL | string | `"168h"` | Default TTL for image build resources |
 | imageBuilderWorker.enabled | bool | `true` | Enable imagebuilder worker service |
 | imageBuilderWorker.image.image | string | `"quay.io/flightctl/flightctl-imagebuilder-worker-el9"` | ImageBuilder Worker container image |
 | imageBuilderWorker.image.pullPolicy | string | `""` | Image pull policy for ImageBuilder Worker container |
 | imageBuilderWorker.image.tag | string | `""` | ImageBuilder Worker image tag |
+| imageBuilderWorker.imageBuilderTimeout | string | `"3m"` | Inactivity timeout for image builds and exports |
 | imageBuilderWorker.logLevel | string | `"info"` | Log level for the imagebuilder worker |
 | imageBuilderWorker.maxConcurrentBuilds | int | `2` | Maximum number of concurrent image builds |
 | imageBuilderWorker.privileged | bool | `true` | Enable privileged mode for container-in-container builds |
@@ -397,6 +399,7 @@ For more detailed configuration options, see the [Values](#values) section below
 | imageBuilderWorker.serviceImages.pullSecretName | string | `""` | Secret name containing registry credentials (auth.json) for pulling builder service images. Required when serviceImages are hosted in an authenticated or air-gapped registry. The secret must contain a key named `auth.json` in standard podman/Docker auth format. Mounted read-only at /root/.config/containers/auth.json inside the worker container. |
 | imageBuilderWorker.serviceImages.syft.image | string | `""` | Syft image for SBOM generation. If empty, defaults to `docker.io/anchore/syft:v1.44.0`. |
 | imageBuilderWorker.serviceImages.syft.skipTlsVerify | bool | `false` | Set to true to skip TLS verification when pulling the Syft image. |
+| imageBuilderWorker.timeoutCheckTaskInterval | string | `"1m"` | Interval between image build and export timeout checks |
 | imageBuilderWorker.yumReposSecretName | string | `""` | Secret name containing yum repository configuration files, mounted at /etc/yum.repos.d |
 | kv | object | `{"fsGroup":"","image":{"image":"quay.io/sclorg/valkey-8-c10s","pullPolicy":"","tag":"20260121"},"loglevel":"warning","maxmemory":"1gb","maxmemoryPolicy":"allkeys-lru","passwordSecretName":""}` | Key-Value Store Configuration |
 | kv.fsGroup | string | `""` | File system group ID for Valkey pod security context |
@@ -407,7 +410,7 @@ For more detailed configuration options, see the [Values](#values) section below
 | kv.maxmemory | string | `"1gb"` | Maximum memory usage for Valkey |
 | kv.maxmemoryPolicy | string | `"allkeys-lru"` | Valkey memory eviction policy |
 | kv.passwordSecretName | string | `""` | Secret containing password for Valkey (leave empty for auto-generation) |
-| periodic | object | `{"clusterLevelSecretAccess":false,"consumers":5,"image":{"image":"quay.io/flightctl/flightctl-periodic-el9","pullPolicy":"","tag":""},"metrics":{"address":":15690","enabled":true}}` | Periodic Configuration |
+| periodic | object | `{"clusterLevelSecretAccess":false,"consumers":5,"image":{"image":"quay.io/flightctl/flightctl-periodic-el9","pullPolicy":"","tag":""},"metrics":{"address":":15690","enabled":true},"tasks":{"deltaPrepareDeadline":{"schedule":{"interval":"1m"}},"labelMappingScan":{"pageSize":1000,"schedule":{"interval":"2m"},"timeBudget":"30s"}}}` | Periodic Configuration |
 | periodic.clusterLevelSecretAccess | bool | `false` | Allow flightctl-periodic to list/watch secrets at the cluster level for change detection |
 | periodic.consumers | int | `5` | Number of periodic consumers |
 | periodic.image.image | string | `"quay.io/flightctl/flightctl-periodic-el9"` | Periodic container image |
@@ -416,6 +419,11 @@ For more detailed configuration options, see the [Values](#values) section below
 | periodic.metrics | object | `{"address":":15690","enabled":true}` | Metrics configuration for flightctl-periodic |
 | periodic.metrics.address | string | `":15690"` | Address for the metrics HTTP server |
 | periodic.metrics.enabled | bool | `true` | Enable Prometheus metrics endpoint |
+| periodic.tasks.deltaPrepareDeadline | object | `{"schedule":{"interval":"1m"}}` | Delta prepare deadline sweep schedule |
+| periodic.tasks.deltaPrepareDeadline.schedule.interval | string | `"1m"` | How often flightctl-periodic checks for expired delta prepares |
+| periodic.tasks.labelMappingScan.pageSize | int | `1000` | Maximum number of devices in each label mapping scan page (1–1000) |
+| periodic.tasks.labelMappingScan.schedule.interval | string | `"2m"` | How often to scan devices after a label mapping changes |
+| periodic.tasks.labelMappingScan.timeBudget | string | `"30s"` | Maximum work time per label mapping scan invocation |
 | remoteAccess | object | `{"enabled":true,"env":{},"image":{"image":"quay.io/flightctl/flightctl-remote-access-el9","pullPolicy":"","tag":""},"logLevel":"info","resources":{"limits":{"cpu":"500m","memory":"256Mi"},"requests":{"cpu":"100m","memory":"128Mi"}}}` | Remote Access Configuration |
 | remoteAccess.enabled | bool | `true` | Enable remote access service |
 | remoteAccess.env | object | `{}` | Additional environment variables for the remote access container |
@@ -474,13 +482,15 @@ For more detailed configuration options, see the [Values](#values) section below
 | vulnerabilityReporting.trustify.caFile | string | `""` | Path to a CA bundle for verifying the Trustify server certificate. If unset, system roots are used. |
 | vulnerabilityReporting.trustify.endpoint | string | `""` | Trustify API base URL (do not include /api/v1 or /api/v2 paths). |
 | vulnerabilityReporting.trustify.skipTlsVerify | bool | `false` | Skip TLS certificate verification (insecure, for lab/air-gap only). Defaults to false. |
-| worker | object | `{"clusterLevelSecretAccess":false,"image":{"image":"quay.io/flightctl/flightctl-worker-el9","pullPolicy":"","tag":""},"renderTimeout":"60s","vmRender":{"launcherImage":"","launcherImages":{},"passtWorkarounds":false}}` | Worker Configuration |
+| worker | object | `{"clusterLevelSecretAccess":false,"helmImageRefsCacheTTL":"15m","image":{"image":"quay.io/flightctl/flightctl-worker-el9","pullPolicy":"","tag":""},"imageDigestCacheTTL":"15m","renderTimeout":"60s","vmRender":{"launcherImage":"","launcherImages":{},"passtWorkarounds":false}}` | Worker Configuration |
 | worker.clusterLevelSecretAccess | bool | `false` | Allow flightctl-worker to access secrets at the cluster level for embedding in device configs |
+| worker.helmImageRefsCacheTTL | string | `"15m"` | Maximum age of cached Helm workload image references before the chart is rendered again (default "15m") |
 | worker.image.image | string | `"quay.io/flightctl/flightctl-worker-el9"` | Worker container image |
 | worker.image.pullPolicy | string | `""` | Image pull policy for worker container |
 | worker.image.tag | string | `""` | Worker image tag |
+| worker.imageDigestCacheTTL | string | `"15m"` | Maximum age of cached OCI image digest resolutions used during delta preparation (default "15m") |
 | worker.renderTimeout | string | `"60s"` | Time budget for a single device render operation including VM conversion and DB writes (default "60s") |
-| worker.vmRender | object | `{"launcherImage":"","launcherImages":{},"passtWorkarounds":false}` | VM application render options passed to vm-to-quadlet |
+| worker.vmRender | object | `{"launcherImage":"","launcherImages":{},"passtWorkarounds":false}` | VM application render options passed to vm-to-quadlet by both worker services |
 | worker.vmRender.launcherImage | string | `""` | virt-launcher image used when converting VmApplications to Quadlet units (leave empty to use the worker default) |
 | worker.vmRender.launcherImages | object | `{}` | virt-launcher images keyed by os-release ID and major from status.systemInfo (e.g. "rhel-9", "rhel-10") |
 | worker.vmRender.passtWorkarounds | bool | `false` | Enable passt networking workarounds for older virt-launcher images (default false; enable only for older images) |

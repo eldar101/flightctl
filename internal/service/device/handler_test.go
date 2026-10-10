@@ -477,6 +477,35 @@ func TestPatchDeviceStatus(t *testing.T) {
 		require.Equal(t, "a", result.Status.SystemInfo.AgentVersion)
 	})
 
+	t.Run("When a status patch commits it should publish identity-only reconciliation work", func(t *testing.T) {
+		st, ev, svc := newTestHandler()
+		ctx := context.Background()
+		orgId := uuid.New()
+		initialStatus := domain.NewDeviceStatus()
+		device := domain.Device{
+			Metadata: domain.ObjectMeta{Name: lo.ToPtr("foo")},
+			Spec:     &domain.DeviceSpec{},
+			Status:   &initialStatus,
+		}
+		_, err := st.device.Create(ctx, orgId, &device, nil)
+		require.NoError(t, err)
+
+		infoMap, err := util.StructToMap(domain.DeviceSystemInfo{Architecture: "aarch64"})
+		require.NoError(t, err)
+		var value interface{} = infoMap
+		patch := domain.PatchRequest{{Op: "replace", Path: "/status/systemInfo", Value: &value}}
+		result, status := svc.PatchDeviceStatus(ctx, orgId, "foo", patch)
+
+		require.Equal(t, int32(http.StatusOK), status.Code)
+		require.Equal(t, "aarch64", result.Status.SystemInfo.Architecture)
+		require.Len(t, ev.created, 1)
+		event := ev.created[0]
+		require.Equal(t, domain.EventReasonResourceUpdated, event.Reason)
+		require.Equal(t, domain.DeviceKind, event.InvolvedObject.Kind)
+		require.Equal(t, "foo", event.InvolvedObject.Name)
+		require.Nil(t, event.Details)
+	})
+
 	t.Run("When patching an immutable field it should return bad request", func(t *testing.T) {
 		svc, orgId := setup(t)
 		var value interface{} = "newname"
@@ -921,7 +950,7 @@ func TestUpdateRenderedDevice(t *testing.T) {
 		Status: lo.ToPtr(domain.NewDeviceStatus()),
 	}, nil)
 	require.NoError(t, err)
-	status := svc.UpdateRenderedDevice(ctx, orgId, "foo", "config", "apps", "hash", "", nil, false)
+	status := svc.UpdateRenderedDevice(ctx, orgId, "foo", "config", "apps", "hash", "", nil, false, nil)
 	require.Equal(t, int32(http.StatusOK), status.Code)
 }
 
@@ -937,13 +966,15 @@ func TestServiceConditionsFromDevice(t *testing.T) {
 					{Type: domain.ConditionTypeDeviceUpdating, Status: domain.ConditionStatusTrue},
 					{Type: domain.ConditionTypeDeviceSpecValid, Status: domain.ConditionStatusFalse},
 					{Type: domain.ConditionTypeDeviceMultipleOwners, Status: domain.ConditionStatusTrue},
+					{Type: domain.ConditionTypeDeviceEnrollmentHooks, Status: domain.ConditionStatusFalse, Reason: domain.EnrollmentHooksReasonNotifyPending},
 				},
 			},
 		}
 		got := serviceConditionsFromDevice(device)
-		require.Len(t, got, 2)
+		require.Len(t, got, 3)
 		require.Equal(t, domain.ConditionTypeDeviceSpecValid, got[0].Type)
 		require.Equal(t, domain.ConditionTypeDeviceMultipleOwners, got[1].Type)
+		require.Equal(t, domain.ConditionTypeDeviceEnrollmentHooks, got[2].Type)
 	})
 }
 
@@ -965,6 +996,66 @@ func TestSetDeviceServiceConditions(t *testing.T) {
 		stored := st.device.devices["foo"]
 		require.NotNil(t, domain.FindStatusCondition(stored.Status.Conditions, domain.ConditionTypeDeviceSpecValid))
 		require.Len(t, ev.created, 1)
+	})
+
+	t.Run("When EnrollmentHooks changes from False to True it should emit an ownership reconciliation event", func(t *testing.T) {
+		st, ev, svc := newTestHandler()
+		ctx := context.Background()
+		orgId := uuid.New()
+		_, err := st.device.Create(ctx, orgId, &domain.Device{
+			Metadata: domain.ObjectMeta{Name: lo.ToPtr("foo")},
+			Status: &domain.DeviceStatus{Conditions: []domain.Condition{{
+				Type:   domain.ConditionTypeDeviceEnrollmentHooks,
+				Status: domain.ConditionStatusFalse,
+				Reason: domain.EnrollmentHooksReasonPending,
+			}}},
+		}, nil)
+		require.NoError(t, err)
+
+		status := svc.SetDeviceServiceConditions(ctx, orgId, "foo", []domain.Condition{{
+			Type:   domain.ConditionTypeDeviceEnrollmentHooks,
+			Status: domain.ConditionStatusTrue,
+			Reason: domain.EnrollmentHooksReasonSucceeded,
+		}})
+		require.Equal(t, int32(http.StatusOK), status.Code)
+		require.Len(t, ev.created, 2)
+		event := ev.created[0]
+		require.Equal(t, domain.EventReasonResourceUpdated, event.Reason)
+		require.Equal(t, domain.DeviceKind, event.InvolvedObject.Kind)
+		require.Equal(t, "foo", event.InvolvedObject.Name)
+		require.NotNil(t, event.Details)
+		details, err := event.Details.AsResourceUpdatedDetails()
+		require.NoError(t, err)
+		require.Equal(t, []domain.ResourceUpdatedDetailsUpdatedFields{
+			domain.UpdatedFieldEnrollmentHooksCondition,
+		}, details.UpdatedFields)
+		require.Equal(t, domain.EventReasonEnrollmentHookSucceeded, ev.created[1].Reason)
+	})
+
+	t.Run("When EnrollmentHooks remains False it should not emit an ownership reconciliation event", func(t *testing.T) {
+		st, ev, svc := newTestHandler()
+		ctx := context.Background()
+		orgId := uuid.New()
+		_, err := st.device.Create(ctx, orgId, &domain.Device{
+			Metadata: domain.ObjectMeta{Name: lo.ToPtr("foo")},
+			Status: &domain.DeviceStatus{Conditions: []domain.Condition{{
+				Type:    domain.ConditionTypeDeviceEnrollmentHooks,
+				Status:  domain.ConditionStatusFalse,
+				Reason:  domain.EnrollmentHooksReasonPending,
+				Message: "hooks are pending",
+			}}},
+		}, nil)
+		require.NoError(t, err)
+
+		status := svc.SetDeviceServiceConditions(ctx, orgId, "foo", []domain.Condition{{
+			Type:    domain.ConditionTypeDeviceEnrollmentHooks,
+			Status:  domain.ConditionStatusFalse,
+			Reason:  domain.EnrollmentHooksReasonFailed,
+			Message: "hooks failed",
+		}})
+		require.Equal(t, int32(http.StatusOK), status.Code)
+		require.Len(t, ev.created, 1)
+		require.Equal(t, domain.EventReasonEnrollmentHookFailed, ev.created[0].Reason)
 	})
 
 	t.Run("When a service condition is updated it should preserve agent-owned conditions", func(t *testing.T) {
@@ -1103,6 +1194,9 @@ func TestReplaceDeviceStatus(t *testing.T) {
 		require.NotNil(t, result.Status.LastSeen)
 		require.False(t, result.Status.LastSeen.Before(before))
 		require.WithinDuration(t, time.Now(), *result.Status.LastSeen, 5*time.Second)
+		require.Len(t, st.device.healthcheckCalls, 1)
+		require.Equal(t, orgId, st.device.healthcheckCalls[0].orgId)
+		require.Equal(t, []string{"foo"}, st.device.healthcheckCalls[0].names)
 	})
 
 	t.Run("When refreshLastSeen is false it should preserve the caller-provided LastSeen", func(t *testing.T) {
@@ -1127,6 +1221,7 @@ func TestReplaceDeviceStatus(t *testing.T) {
 		require.Equal(t, int32(http.StatusOK), status.Code)
 		require.NotNil(t, result.Status.LastSeen)
 		require.True(t, result.Status.LastSeen.Equal(callerProvidedLastSeen))
+		require.Empty(t, st.device.healthcheckCalls)
 	})
 }
 
@@ -1141,6 +1236,125 @@ func TestGetRenderedDevice(t *testing.T) {
 	result, status := svc.GetRenderedDevice(ctx, orgId, "foo", domain.GetRenderedDeviceParams{})
 	require.Equal(t, int32(http.StatusOK), status.Code)
 	require.Equal(t, "foo", lo.FromPtr(result.Metadata.Name))
+	require.Equal(t, 1, st.device.getRenderedCalls)
+	require.Zero(t, st.device.getCalls, "rendered-device lookup should not issue a separate Get")
+}
+
+func TestGetRenderedDevice_EnrollmentHooksGateWhenRenderedSpecIsUnavailable(t *testing.T) {
+	st, _, svc := newTestHandler()
+	ctx := context.Background()
+	orgId := uuid.New()
+	device := domain.Device{
+		Metadata: domain.ObjectMeta{Name: lo.ToPtr("gate-test")},
+		Status: &domain.DeviceStatus{Conditions: []domain.Condition{{
+			Type:   domain.ConditionTypeDeviceEnrollmentHooks,
+			Status: domain.ConditionStatusFalse,
+			Reason: domain.EnrollmentHooksReasonPending,
+		}}},
+	}
+	_, err := st.device.Create(ctx, orgId, &device, nil)
+	require.NoError(t, err)
+	st.device.getRenderedErr = flterrors.ErrNoRenderedVersion
+
+	// Gate runs only on a successful GetRendered result so we do not add a
+	// fallback Get on this hot path. No rendered version keeps the existing
+	// store-error status.
+	result, status := svc.GetRenderedDevice(ctx, orgId, "gate-test", domain.GetRenderedDeviceParams{})
+	require.Nil(t, result)
+	require.Equal(t, int32(http.StatusConflict), status.Code)
+	require.Equal(t, flterrors.ErrNoRenderedVersion.Error(), status.Message)
+	require.Equal(t, 1, st.device.getRenderedCalls)
+	require.Zero(t, st.device.getCalls, "rendered-device lookup should not issue a separate Get")
+}
+
+func TestGetRenderedDevice_EnrollmentHooksGate(t *testing.T) {
+	tests := []struct {
+		name        string
+		conditions  []domain.Condition
+		wantCode    int32
+		wantMessage string
+	}{
+		{
+			name: "When device has EnrollmentHooks False/Pending it should return 409 Conflict",
+			conditions: []domain.Condition{
+				{Type: domain.ConditionTypeDeviceEnrollmentHooks, Status: domain.ConditionStatusFalse, Reason: domain.EnrollmentHooksReasonPending},
+			},
+			wantCode:    http.StatusConflict,
+			wantMessage: "device is gated by enrollment hooks (reason: Pending)",
+		},
+		{
+			name: "When device has EnrollmentHooks False/Failed it should return 409 Conflict",
+			conditions: []domain.Condition{
+				{Type: domain.ConditionTypeDeviceEnrollmentHooks, Status: domain.ConditionStatusFalse, Reason: domain.EnrollmentHooksReasonFailed},
+			},
+			wantCode:    http.StatusConflict,
+			wantMessage: "device is gated by enrollment hooks (reason: Failed)",
+		},
+		{
+			name: "When device has EnrollmentHooks False/NotifyPending it should return 409 Conflict",
+			conditions: []domain.Condition{
+				{Type: domain.ConditionTypeDeviceEnrollmentHooks, Status: domain.ConditionStatusFalse, Reason: domain.EnrollmentHooksReasonNotifyPending},
+			},
+			wantCode:    http.StatusConflict,
+			wantMessage: "device is gated by enrollment hooks (reason: NotifyPending)",
+		},
+		{
+			name: "When device has EnrollmentHooks True/Succeeded it should return 200 OK",
+			conditions: []domain.Condition{
+				{Type: domain.ConditionTypeDeviceEnrollmentHooks, Status: domain.ConditionStatusTrue, Reason: domain.EnrollmentHooksReasonSucceeded},
+			},
+			wantCode: http.StatusOK,
+		},
+		{
+			name: "When device has EnrollmentHooks True/Continued it should return 200 OK",
+			conditions: []domain.Condition{
+				{Type: domain.ConditionTypeDeviceEnrollmentHooks, Status: domain.ConditionStatusTrue, Reason: domain.EnrollmentHooksReasonContinued},
+			},
+			wantCode: http.StatusOK,
+		},
+		{
+			name: "When device has EnrollmentHooks True/ManualOverride it should return 200 OK",
+			conditions: []domain.Condition{
+				{Type: domain.ConditionTypeDeviceEnrollmentHooks, Status: domain.ConditionStatusTrue, Reason: domain.EnrollmentHooksReasonManualOverride},
+			},
+			wantCode: http.StatusOK,
+		},
+		{
+			name:        "When device has no EnrollmentHooks condition it should return 200 OK",
+			conditions:  []domain.Condition{},
+			wantCode:    http.StatusOK,
+			wantMessage: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st, _, svc := newTestHandler()
+			ctx := context.Background()
+			orgId := uuid.New()
+			device := domain.Device{
+				Metadata: domain.ObjectMeta{Name: lo.ToPtr("gate-test")},
+				Status: &domain.DeviceStatus{
+					Conditions: tt.conditions,
+				},
+			}
+			_, err := st.device.Create(ctx, orgId, &device, nil)
+			require.NoError(t, err)
+
+			// Non-agent caller: skips healthchecker/rendered.Bus singletons
+			result, status := svc.GetRenderedDevice(ctx, orgId, "gate-test", domain.GetRenderedDeviceParams{})
+			require.Equal(t, tt.wantCode, status.Code)
+			require.Equal(t, 1, st.device.getRenderedCalls)
+			require.Zero(t, st.device.getCalls, "gate should reuse GetRendered without a separate Get")
+			if tt.wantCode == http.StatusConflict {
+				require.Nil(t, result)
+				require.Contains(t, status.Message, tt.wantMessage)
+			} else {
+				require.NotNil(t, result)
+				require.Equal(t, "gate-test", lo.FromPtr(result.Metadata.Name))
+			}
+		})
+	}
 }
 
 func TestReplaceDevicePackageModeOsReject(t *testing.T) {

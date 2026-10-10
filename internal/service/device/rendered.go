@@ -17,6 +17,7 @@ func applyRenderedUpdate(
 	renderedConfig, renderedApplications, specHash, osImage string,
 	configFingerprints []domain.DependencySyncConfigRefStatus,
 	forceUpdate bool,
+	osHints *RenderedOSHints,
 ) (renderedVersion string, err error) {
 	device := m.Device
 	ann := util.EnsureMap(lo.FromPtr(device.Metadata.Annotations))
@@ -56,6 +57,15 @@ func applyRenderedUpdate(
 		Applications: renderedApplications,
 		OsImage:      osImage,
 	}
+	if osHints != nil {
+		m.Rendered.DeltaImage = osHints.DeltaImage
+	}
+	estimates := &devicestore.DeviceDeltaEstimates{}
+	if osHints != nil {
+		estimates.OSDeltaSize = osHints.DeltaSize
+		estimates.ApplicationDeltaSizes = osHints.AppDeltaSizes
+	}
+	m.Rendered.DeltaEstimates = estimates
 	return next, nil
 }
 

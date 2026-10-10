@@ -178,6 +178,8 @@ type Config struct {
 	SystemInfo []string `json:"system-info,omitempty"`
 
 	// SystemInfoCustom defines keys used to collect custom system information.
+	// A nil slice discovers all executable scripts; an empty slice disables custom
+	// collection; a wildcard discovers all scripts; other values select named keys.
 	// Each key should match the name of an executable script in the custom info directory.
 	// The script must output a single string, which will be included in device.status.systemInfo.CustomInfo.
 	//
@@ -187,6 +189,9 @@ type Config struct {
 
 	// SystemInfoTimeout is the timeout for collecting system info.
 	SystemInfoTimeout util.Duration `json:"system-info-timeout,omitempty"`
+
+	// SystemInfoPeriodic configures independent periodic systeminfo collection.
+	SystemInfoPeriodic SystemInfoPeriodicConfig `json:"system-info-periodic,omitempty"`
 
 	// PullTimeout is the max duration a single OCI target will try to pull.
 	PullTimeout util.Duration `json:"pull-timeout,omitempty"`
@@ -241,6 +246,13 @@ type PreEnrollmentConfig struct {
 // EnrollmentConfig groups enrollment-related agent settings.
 type EnrollmentConfig struct {
 	PreEnrollment PreEnrollmentConfig `json:"preEnrollment,omitempty"`
+}
+
+// SystemInfoPeriodicConfig configures periodic systeminfo collection.
+type SystemInfoPeriodicConfig struct {
+	// Interval is the collection interval for periodic systeminfo gathering.
+	// When zero or absent, the agent falls back to StatusUpdateInterval.
+	Interval util.Duration `json:"interval,omitempty"`
 }
 
 // DefaultSystemInfo defines the list of system information keys that are included
@@ -341,6 +353,16 @@ func (cfg *Config) SetManagementCertMetricsCallback(cb mgmtcertcommon.Management
 
 func (cfg *Config) GetManagementCertMetricsCallback() mgmtcertcommon.ManagementCertMetricsCallback {
 	return cfg.managementCertMetricsCallback
+}
+
+// SystemInfoCollectionInterval returns the effective collection interval
+// for periodic systeminfo gathering. If system-info-periodic.interval is
+// configured, it is used; otherwise StatusUpdateInterval is the fallback.
+func (cfg *Config) SystemInfoCollectionInterval() util.Duration {
+	if cfg.SystemInfoPeriodic.Interval > 0 {
+		return cfg.SystemInfoPeriodic.Interval
+	}
+	return cfg.StatusUpdateInterval
 }
 
 // Complete fills in defaults for fields not set by the config file
@@ -546,6 +568,9 @@ func (cfg *Config) validateSyncIntervals() error {
 	if cfg.StatusUpdateInterval < MinSyncInterval {
 		return fmt.Errorf("minimum status update interval is %s have %s", MinSyncInterval, cfg.StatusUpdateInterval)
 	}
+	if cfg.SystemInfoPeriodic.Interval != 0 && cfg.SystemInfoPeriodic.Interval < MinSyncInterval {
+		return fmt.Errorf("minimum system info periodic interval is %s have %s", MinSyncInterval, cfg.SystemInfoPeriodic.Interval)
+	}
 	if cfg.StatusUpdateJitter != nil && *cfg.StatusUpdateJitter < 0 {
 		return fmt.Errorf("status update jitter must be >= 0 have %s", *cfg.StatusUpdateJitter)
 	}
@@ -579,7 +604,10 @@ func (cfg *Config) LoadWithOverrides(configFile string) error {
 	entries, err := cfg.readWriter.ReadDir(confSubdir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return cfg.Complete()
+			if err := cfg.Complete(); err != nil {
+				return err
+			}
+			return cfg.Validate()
 		}
 		return err
 	}
@@ -638,6 +666,7 @@ func mergeConfigs(base, override *Config) {
 	overrideSliceIfNotNil(&base.SystemInfo, override.SystemInfo)
 	overrideSliceIfNotNil(&base.SystemInfoCustom, override.SystemInfoCustom)
 	overrideIfNotEmpty(&base.SystemInfoTimeout, override.SystemInfoTimeout)
+	overrideIfNotEmpty(&base.SystemInfoPeriodic.Interval, override.SystemInfoPeriodic.Interval)
 
 	// tpm
 	overrideIfNotEmpty(&base.TPM.Enabled, override.TPM.Enabled)

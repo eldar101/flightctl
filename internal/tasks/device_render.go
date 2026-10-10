@@ -17,7 +17,9 @@ import (
 	"github.com/flightctl/flightctl/api/core/v1alpha1"
 	"github.com/flightctl/flightctl/api/core/v1beta1"
 	"github.com/flightctl/flightctl/internal/config"
+	delta "github.com/flightctl/flightctl/internal/delta_worker/store/deltageneration"
 	"github.com/flightctl/flightctl/internal/domain"
+	helmruntime "github.com/flightctl/flightctl/internal/helm"
 	"github.com/flightctl/flightctl/internal/kvstore"
 	catalogservice "github.com/flightctl/flightctl/internal/service/catalog"
 	"github.com/flightctl/flightctl/internal/service/common"
@@ -50,19 +52,16 @@ import (
 // This design ensures the task can be retried safely, detects mid-write inconsistencies,
 // and avoids unnecessary reprocessing when the output is already up to date.
 
-func deviceRender(ctx context.Context, orgId uuid.UUID, event domain.Event, deviceSvc deviceservice.Service, repositorySvc repositoryservice.Service, catalogSvc catalogservice.Service, k8sClient k8sclient.K8SClient, kvStore kvstore.KVStore, cfg *config.Config, log logrus.FieldLogger) error {
-	logic := NewDeviceRenderLogic(log, deviceSvc, repositorySvc, catalogSvc, k8sClient, kvStore, cfg, orgId, event)
+func deviceRender(ctx context.Context, orgId uuid.UUID, event domain.Event, logic *DeviceRenderLogic, log logrus.FieldLogger) error {
 	if event.InvolvedObject.Kind != domain.DeviceKind {
 		log.Errorf("DeviceRender called with unexpected kind %s and op %s", event.InvolvedObject.Kind, event.Reason)
 		return nil
 	}
 
 	// Detach from the parent's EventProcessingTimeout so that the render
-	// operation (config + application rendering + DB/Redis writes) runs under
-	// its own configurable deadline. Explicit parent cancellation (e.g.
-	// shutdown) still propagates via the goroutine below, matching the pattern
-	// used by fleetRolloutIterationContext.
-	renderCtx, cancelRender := context.WithTimeout(context.WithoutCancel(ctx), cfg.EffectiveRenderTimeout())
+	// operation runs under its own configurable deadline. Explicit parent
+	// cancellation (e.g. shutdown) still propagates through the goroutine.
+	renderCtx, cancelRender := context.WithTimeout(context.WithoutCancel(ctx), logic.cfg.EffectiveRenderTimeout())
 	defer cancelRender()
 	go func() {
 		select {
@@ -74,7 +73,7 @@ func deviceRender(ctx context.Context, orgId uuid.UUID, event domain.Event, devi
 		}
 	}()
 
-	err := logic.RenderDevice(renderCtx)
+	err := logic.renderDevice(renderCtx, orgId, event, log)
 	if err != nil {
 		log.Errorf("failed rendering device %s/%s: %v", orgId, event.InvolvedObject.Name, err)
 	} else {
@@ -84,63 +83,215 @@ func deviceRender(ctx context.Context, orgId uuid.UUID, event domain.Event, devi
 }
 
 type DeviceRenderLogic struct {
-	log               logrus.FieldLogger
-	deviceSvc         deviceservice.Service
-	repositorySvc     repositoryservice.Service
-	catalogSvc        catalogservice.Service
-	k8sClient         k8sclient.K8SClient
-	kvStore           kvstore.KVStore
-	cfg               *config.Config
-	orgId             uuid.UUID
-	event             domain.Event
-	ownerFleet        *string
-	templateVersion   *string
-	vmConverter       VmConverterFn
-	vmRenderOptions   VmRenderOptions
-	customVmConverter bool
+	log                 logrus.FieldLogger
+	deviceSvc           deviceservice.Service
+	repositorySvc       repositoryservice.Service
+	catalogSvc          catalogservice.Service
+	k8sClient           k8sclient.K8SClient
+	kvStore             kvstore.KVStore
+	cfg                 *config.Config
+	vmConverterOverride VmConverterFn
+	helmRenderer        helmImageRenderer
+	deltaLookup         generationLookup
 }
 
-func NewDeviceRenderLogic(log logrus.FieldLogger, deviceSvc deviceservice.Service, repositorySvc repositoryservice.Service, catalogSvc catalogservice.Service, k8sClient k8sclient.K8SClient, kvStore kvstore.KVStore, cfg *config.Config, orgId uuid.UUID, event domain.Event) DeviceRenderLogic {
-	opts := vmRenderOptionsFromConfig(cfg, "")
-	return DeviceRenderLogic{
-		log:             log,
-		deviceSvc:       deviceSvc,
-		repositorySvc:   repositorySvc,
-		catalogSvc:      catalogSvc,
-		k8sClient:       k8sClient,
-		kvStore:         kvStore,
-		cfg:             cfg,
-		orgId:           orgId,
-		event:           event,
-		vmConverter:     NewVmConverter(vmToQuadletBinary, opts),
-		vmRenderOptions: opts,
+type helmImageRenderer interface {
+	ImageRefs(context.Context, v1beta1.HelmApplication, *domain.Device, []byte, *domain.OciRepoSpec) ([]string, error)
+}
+
+func NewDeviceRenderLogic(log logrus.FieldLogger, deviceSvc deviceservice.Service, repositorySvc repositoryservice.Service, catalogSvc catalogservice.Service, k8sClient k8sclient.K8SClient, kvStore kvstore.KVStore, cfg *config.Config) *DeviceRenderLogic {
+	return &DeviceRenderLogic{
+		log:           log,
+		deviceSvc:     deviceSvc,
+		repositorySvc: repositorySvc,
+		catalogSvc:    catalogSvc,
+		k8sClient:     k8sClient,
+		kvStore:       kvStore,
+		cfg:           cfg,
+		helmRenderer:  helmruntime.NewRenderer(nil, log),
 	}
 }
 
-// WithVmConverter returns a copy of DeviceRenderLogic using the given converter
-// for VM application rendering. Intended for integration tests that extract the
-// kubevirt-vm-to-pod binary into a temporary directory and supply its path via
-// NewVmConverter.
-func (t DeviceRenderLogic) WithVmConverter(fn VmConverterFn) DeviceRenderLogic {
-	t.vmConverter = fn
-	t.customVmConverter = true
-	return t
+// RenderHelmImageRefs renders a target Helm application using the resolved
+// config files that will be delivered to the device and returns its workload
+// image references. The same method is used during delta preparation and when
+// attaching delta hints to a rendered device spec.
+func (t *DeviceRenderLogic) RenderHelmImageRefs(
+	ctx context.Context,
+	orgID uuid.UUID,
+	device *domain.Device,
+	app v1beta1.HelmApplication,
+	renderedConfig []byte,
+) ([]string, error) {
+	if t.helmRenderer == nil {
+		return nil, errors.New("Helm image renderer is not configured")
+	}
+	imageSpec, err := app.AsImageApplicationProviderSpec()
+	if err != nil {
+		return nil, fmt.Errorf("get Helm chart image reference: %w", err)
+	}
+	cacheTTL := t.cfg.EffectiveHelmImageRefsCacheTTL()
+	cacheKey := ""
+	if t.kvStore != nil && cacheTTL > 0 {
+		key, keyErr := helmruntime.ImageRefsCacheKey(orgID, app, device, renderedConfig, cacheTTL)
+		if keyErr != nil {
+			t.log.WithError(keyErr).Warn("failed to build Helm image refs cache key; rendering chart without cache")
+		} else {
+			cacheKey = key
+			cached, cacheErr := t.kvStore.Get(ctx, cacheKey)
+			if cacheErr != nil {
+				t.log.WithError(cacheErr).Warn("failed to read Helm image refs cache; rendering chart")
+			} else if len(cached) > 0 {
+				var imageRefs []string
+				if err := json.Unmarshal(cached, &imageRefs); err != nil || imageRefs == nil {
+					if err == nil {
+						err = errors.New("cached Helm image refs are null")
+					}
+					t.log.WithError(err).Warn("invalid Helm image refs cache entry; rendering chart")
+				} else {
+					t.log.Debug("using cached Helm workload image references")
+					return imageRefs, nil
+				}
+			}
+		}
+	}
+
+	// Repository lookup supplies chart-pull credentials and transport settings,
+	// but does not change rendered workload images. Delay the paginated lookup
+	// until after a cache miss.
+	registrySpec, err := helmruntime.ResolveOCIRepositorySpec(
+		ctx,
+		t.repositorySvc,
+		orgID,
+		imageSpec.Image,
+		deltaWriteSpec(t.cfg),
+	)
+	if err != nil {
+		return nil, err
+	}
+	imageRefs, err := t.helmRenderer.ImageRefs(ctx, app, device, renderedConfig, registrySpec)
+	if err != nil {
+		return nil, err
+	}
+	if imageRefs == nil {
+		imageRefs = []string{}
+	}
+	if cacheKey != "" {
+		cached, marshalErr := json.Marshal(imageRefs)
+		if marshalErr != nil {
+			t.log.WithError(marshalErr).Warn("failed to encode Helm image refs cache entry")
+		} else if cacheErr := t.kvStore.Set(ctx, cacheKey, cached, cacheTTL); cacheErr != nil {
+			t.log.WithError(cacheErr).Warn("failed to write Helm image refs cache entry")
+		}
+	}
+	return imageRefs, nil
 }
 
-func (t *DeviceRenderLogic) bindVmLauncher(device *domain.Device) {
+// WithHelmImageRenderer returns a copy configured with a renderer implementation.
+// This keeps Helm command execution injectable in unit tests.
+func (t *DeviceRenderLogic) WithHelmImageRenderer(renderer helmImageRenderer) *DeviceRenderLogic {
+	clone := *t
+	clone.helmRenderer = renderer
+	return &clone
+}
+
+// NewDeviceRenderLogicWithDeltaStore creates device-render logic with the
+// dependencies required to look up OS delta hints. NewDeviceRenderLogic is
+// also used for spec-only rendering, which does not need a delta store.
+func NewDeviceRenderLogicWithDeltaStore(log logrus.FieldLogger, deviceSvc deviceservice.Service, repositorySvc repositoryservice.Service, catalogSvc catalogservice.Service, k8sClient k8sclient.K8SClient, kvStore kvstore.KVStore, deltaStore delta.Store, cfg *config.Config) (*DeviceRenderLogic, error) {
+	return newDeviceRenderLogicWithDeltaLookup(log, deviceSvc, repositorySvc, catalogSvc, k8sClient, kvStore, deltaStore, cfg)
+}
+
+func newDeviceRenderLogicWithDeltaLookup(log logrus.FieldLogger, deviceSvc deviceservice.Service, repositorySvc repositoryservice.Service, catalogSvc catalogservice.Service, k8sClient k8sclient.K8SClient, kvStore kvstore.KVStore, deltaLookup generationLookup, cfg *config.Config) (*DeviceRenderLogic, error) {
+	if kvStore == nil {
+		return nil, errors.New("KV store is required for device rendering")
+	}
+	if deltaLookup == nil {
+		return nil, errors.New("delta generation lookup is required for device rendering")
+	}
+	logic := NewDeviceRenderLogic(log, deviceSvc, repositorySvc, catalogSvc, k8sClient, kvStore, cfg)
+	logic.deltaLookup = deltaLookup
+	return logic, nil
+}
+
+// WithVmConverter returns a copy of DeviceRenderLogic configured with the given
+// converter for VM application rendering. Intended for integration tests that
+// extract the kubevirt-vm-to-pod binary into a temporary directory and supply
+// its path via NewVmConverter.
+func (t *DeviceRenderLogic) WithVmConverter(fn VmConverterFn) *DeviceRenderLogic {
+	clone := *t
+	clone.vmConverterOverride = fn
+	return &clone
+}
+
+// deviceRenderState carries values that belong to one render invocation.
+// DeviceRenderLogic itself contains only startup-owned dependencies and can
+// safely be shared by concurrent event handlers.
+type deviceRenderState struct {
+	*DeviceRenderLogic
+	log             logrus.FieldLogger
+	orgId           uuid.UUID
+	event           domain.Event
+	ownerFleet      *string
+	templateVersion *string
+	vmConverter     VmConverterFn
+	vmRenderOptions VmRenderOptions
+}
+
+func (t *DeviceRenderLogic) newRenderState(orgId uuid.UUID, event domain.Event) *deviceRenderState {
+	opts := vmRenderOptionsFromConfig(t.cfg, "")
+	converter := t.vmConverterOverride
+	if converter == nil {
+		converter = NewVmConverter(vmToQuadletBinary, opts)
+	}
+	return &deviceRenderState{
+		DeviceRenderLogic: t,
+		log:               t.log,
+		orgId:             orgId,
+		event:             event,
+		vmConverter:       converter,
+		vmRenderOptions:   opts,
+	}
+}
+
+func (t *deviceRenderState) bindVmLauncher(device *domain.Device) {
 	opts := vmRenderOptionsFromConfig(t.cfg, osKeyFromDevice(device))
 	t.vmRenderOptions = opts
-	if t.customVmConverter {
+	if t.DeviceRenderLogic.vmConverterOverride != nil {
 		return
 	}
 	t.vmConverter = NewVmConverter(vmToQuadletBinary, opts)
 }
 
+// RenderDevice processes one device event. orgId and event are call-scoped so
+// the renderer's startup-owned dependencies can be reused across events.
+//
 //nolint:gocyclo
-func (t *DeviceRenderLogic) RenderDevice(ctx context.Context) error {
+func (t *DeviceRenderLogic) RenderDevice(ctx context.Context, orgId uuid.UUID, event domain.Event) error {
+	return t.renderDevice(ctx, orgId, event, t.log)
+}
+
+func (t *DeviceRenderLogic) renderDevice(ctx context.Context, orgId uuid.UUID, event domain.Event, log logrus.FieldLogger) error {
+	state := t.newRenderState(orgId, event)
+	if log != nil {
+		state.log = log
+	}
+	return state.renderDevice(ctx)
+}
+
+//nolint:gocyclo
+func (t *deviceRenderState) renderDevice(ctx context.Context) error {
 	device, status := t.deviceSvc.GetDevice(ctx, t.orgId, t.event.InvolvedObject.Name)
 	if status.Code != http.StatusOK {
 		return fmt.Errorf("failed getting device %s/%s: %s", t.orgId, t.event.InvolvedObject.Name, status.Message)
+	}
+	if t.event.Reason == domain.EventReasonDeltaGenerationCompleted {
+		generation := device.Metadata.Generation
+		completedGeneration := lo.FromPtr(t.event.Metadata.Annotations)[domain.EventAnnotationDeltaGeneration]
+		if generation == nil || *generation <= 0 || completedGeneration != strconv.FormatInt(*generation, 10) {
+			t.log.Infof("Dropping delta completion for device %s: prepared generation %q does not match current generation", t.event.InvolvedObject.Name, completedGeneration)
+			return nil
+		}
 	}
 
 	t.bindVmLauncher(device)
@@ -247,6 +398,9 @@ func (t *DeviceRenderLogic) RenderDevice(ctx context.Context) error {
 	}
 
 	rendered, renderErr := t.renderSpec(ctx, spec)
+	if renderErr == nil {
+		renderErr = t.resolveRenderedAppDeltaHints(ctx, device, &rendered)
+	}
 	if errors.Is(renderErr, errIgnitionConversion) {
 		return t.setErrorStatus(ctx, renderErr)
 	}
@@ -272,7 +426,14 @@ func (t *DeviceRenderLogic) RenderDevice(ctx context.Context) error {
 		syncRefs = append(syncRefs, ref)
 	}
 
-	status = t.deviceSvc.UpdateRenderedDevice(ctx, t.orgId, t.event.InvolvedObject.Name, string(rendered.Config), string(rendered.Applications), specHash, rendered.OsImage, syncRefs, bypassHashCheck)
+	osHints := t.resolveOSDeltaHint(ctx, device, rendered)
+	if len(rendered.appDeltaSizes) > 0 {
+		if osHints == nil {
+			osHints = &deviceservice.RenderedOSHints{}
+		}
+		osHints.AppDeltaSizes = rendered.appDeltaSizes
+	}
+	status = t.deviceSvc.UpdateRenderedDevice(ctx, t.orgId, t.event.InvolvedObject.Name, string(rendered.Config), string(rendered.Applications), specHash, rendered.OsImage, syncRefs, bypassHashCheck, osHints)
 	if err := common.ApiStatusToErr(status); err != nil {
 		return t.setErrorStatus(ctx, err)
 	}
@@ -288,13 +449,25 @@ type RenderedSpec struct {
 
 	referencedRepos    []string
 	configFingerprints []ConfigRefFingerprint
+	// appDeltaSizes maps application name to its IEC-formatted control-plane
+	// delta payload size.
+	appDeltaSizes map[string]*string
 }
 
-func (t *DeviceRenderLogic) RenderSpec(ctx context.Context, spec *domain.DeviceSpec) (RenderedSpec, error) {
-	return t.renderSpec(ctx, spec)
+// RenderSpec resolves a spec for orgId without device-event state.
+func (t *DeviceRenderLogic) RenderSpec(ctx context.Context, orgId uuid.UUID, spec *domain.DeviceSpec) (RenderedSpec, error) {
+	return t.newRenderState(orgId, domain.Event{}).renderSpec(ctx, spec)
 }
 
-func (t *DeviceRenderLogic) renderSpec(ctx context.Context, spec *domain.DeviceSpec) (RenderedSpec, error) {
+// RenderSpecForDevice resolves a spec using the VM render options selected for
+// the device's reported OS, matching the options used by RenderDevice.
+func (t *DeviceRenderLogic) RenderSpecForDevice(ctx context.Context, orgId uuid.UUID, device *domain.Device, spec *domain.DeviceSpec) (RenderedSpec, error) {
+	state := t.newRenderState(orgId, domain.Event{})
+	state.bindVmLauncher(device)
+	return state.renderSpec(ctx, spec)
+}
+
+func (t *deviceRenderState) renderSpec(ctx context.Context, spec *domain.DeviceSpec) (RenderedSpec, error) {
 	var deviceConfig *[]domain.ConfigProviderSpec
 	var applications *[]domain.ApplicationProviderSpec
 	if spec != nil {
@@ -339,7 +512,7 @@ func (t *DeviceRenderLogic) renderSpec(ctx context.Context, spec *domain.DeviceS
 	return result, nil
 }
 
-func (t *DeviceRenderLogic) markPermanentRenderFailure(ctx context.Context, specHash string) {
+func (t *deviceRenderState) markPermanentRenderFailure(ctx context.Context, specHash string) {
 	annotations := map[string]string{
 		domain.DeviceAnnotationRenderedSpecHash: specHash,
 	}
@@ -355,7 +528,7 @@ func (t *DeviceRenderLogic) markPermanentRenderFailure(ctx context.Context, spec
 
 // setErrorStatus records a render failure as SpecValid=False. All call sites already gate
 // on a non-nil error, so renderErr is always expected to be set.
-func (t *DeviceRenderLogic) setErrorStatus(ctx context.Context, renderErr error) error {
+func (t *deviceRenderState) setErrorStatus(ctx context.Context, renderErr error) error {
 	condition := domain.Condition{
 		Type:    domain.ConditionTypeDeviceSpecValid,
 		Status:  domain.ConditionStatusFalse,
@@ -372,7 +545,7 @@ func (t *DeviceRenderLogic) setErrorStatus(ctx context.Context, renderErr error)
 	return renderErr
 }
 
-func (t *DeviceRenderLogic) renderApplications(ctx context.Context, applications *[]domain.ApplicationProviderSpec) ([]byte, error) {
+func (t *deviceRenderState) renderApplications(ctx context.Context, applications *[]domain.ApplicationProviderSpec) ([]byte, error) {
 	if applications == nil {
 		return nil, nil
 	}
@@ -417,7 +590,7 @@ func (t *DeviceRenderLogic) renderApplications(ctx context.Context, applications
 	return renderedApplicationBytes, nil
 }
 
-func (t *DeviceRenderLogic) renderConfig(ctx context.Context, deviceConfig *[]domain.ConfigProviderSpec) (*config_latest_types.Config, []string, []ConfigRefFingerprint, error) {
+func (t *deviceRenderState) renderConfig(ctx context.Context, deviceConfig *[]domain.ConfigProviderSpec) (*config_latest_types.Config, []string, []ConfigRefFingerprint, error) {
 	ignitionConfig := &config_latest_types.Config{
 		Ignition: config_latest_types.Ignition{
 			Version: config_latest_types.MaxVersion.String(),
@@ -483,7 +656,7 @@ type RenderItem interface {
 	MarshalJSON() ([]byte, error)
 }
 
-func (t *DeviceRenderLogic) renderConfigItem(ctx context.Context, configItem *domain.ConfigProviderSpec, ignitionConfig **config_latest_types.Config) (*string, *string, *string, error) {
+func (t *deviceRenderState) renderConfigItem(ctx context.Context, configItem *domain.ConfigProviderSpec, ignitionConfig **config_latest_types.Config) (*string, *string, *string, error) {
 	configType, err := configItem.Type()
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("%w: failed getting config type: %w", ErrUnknownConfigName, err)
@@ -522,8 +695,8 @@ func renderApplication(ctx context.Context, app *domain.ApplicationProviderSpec,
 		if err := resolveVolumeCatalogItemRefs(ctx, container.Volumes, orgId, catalogSvc); err != nil {
 			return nil, nil, fmt.Errorf("failed to resolve volume catalog item refs: %w", err)
 		}
-		if err := app.MergeContainerApplication(container); err != nil {
-			return nil, nil, fmt.Errorf("failed to merge in resolved container app: %w", err)
+		if err := app.FromContainerApplication(container); err != nil {
+			return nil, nil, fmt.Errorf("failed to apply resolved container app: %w", err)
 		}
 		return container.Name, app, nil
 	case domain.AppTypeHelm:
@@ -535,8 +708,8 @@ func renderApplication(ctx context.Context, app *domain.ApplicationProviderSpec,
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to resolve catalog item ref: %w", err)
 		}
-		if err := app.MergeHelmApplication(helm); err != nil {
-			return nil, nil, fmt.Errorf("failed to merge in resolved helm app: %w", err)
+		if err := app.FromHelmApplication(helm); err != nil {
+			return nil, nil, fmt.Errorf("failed to apply resolved helm app: %w", err)
 		}
 		return helm.Name, app, nil
 	case domain.AppTypeCompose:
@@ -551,8 +724,8 @@ func renderApplication(ctx context.Context, app *domain.ApplicationProviderSpec,
 		if err := resolveVolumeCatalogItemRefs(ctx, compose.Volumes, orgId, catalogSvc); err != nil {
 			return nil, nil, fmt.Errorf("failed to resolve volume catalog item refs: %w", err)
 		}
-		if err := app.MergeComposeApplication(compose); err != nil {
-			return nil, nil, fmt.Errorf("failed to merge in resolved compose app: %w", err)
+		if err := app.FromComposeApplication(compose); err != nil {
+			return nil, nil, fmt.Errorf("failed to apply resolved compose app: %w", err)
 		}
 		return compose.Name, app, nil
 	case domain.AppTypeQuadlet:
@@ -567,8 +740,8 @@ func renderApplication(ctx context.Context, app *domain.ApplicationProviderSpec,
 		if err := resolveVolumeCatalogItemRefs(ctx, quadlet.Volumes, orgId, catalogSvc); err != nil {
 			return nil, nil, fmt.Errorf("failed to resolve volume catalog item refs: %w", err)
 		}
-		if err := app.MergeQuadletApplication(quadlet); err != nil {
-			return nil, nil, fmt.Errorf("failed to merge in resolved quadlet app: %w", err)
+		if err := app.FromQuadletApplication(quadlet); err != nil {
+			return nil, nil, fmt.Errorf("failed to apply resolved quadlet app: %w", err)
 		}
 		return quadlet.Name, app, nil
 	case domain.AppTypeVm:
@@ -587,7 +760,7 @@ func renderApplication(ctx context.Context, app *domain.ApplicationProviderSpec,
 	}
 }
 
-func (t *DeviceRenderLogic) renderGitConfig(ctx context.Context, configItem *domain.ConfigProviderSpec, ignitionConfig **config_latest_types.Config) (*string, *string, *string, error) {
+func (t *deviceRenderState) renderGitConfig(ctx context.Context, configItem *domain.ConfigProviderSpec, ignitionConfig **config_latest_types.Config) (*string, *string, *string, error) {
 	gitSpec, err := configItem.AsGitConfigProviderSpec()
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("%w: failed getting config item as GitConfigProviderSpec: %w", ErrUnknownConfigName, err)
@@ -655,7 +828,7 @@ func (t *DeviceRenderLogic) renderGitConfig(ctx context.Context, configItem *dom
 	return &gitSpec.Name, &gitSpec.GitRef.Repository, &commitHash, nil
 }
 
-func (t *DeviceRenderLogic) renderK8sConfig(ctx context.Context, configItem *domain.ConfigProviderSpec, ignitionConfig **config_latest_types.Config) (*string, *string, *string, error) {
+func (t *deviceRenderState) renderK8sConfig(ctx context.Context, configItem *domain.ConfigProviderSpec, ignitionConfig **config_latest_types.Config) (*string, *string, *string, error) {
 	k8sSpec, err := configItem.AsKubernetesSecretProviderSpec()
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("%w: failed getting config item as KubernetesSecretProviderSpec: %w", ErrUnknownConfigName, err)
@@ -756,7 +929,7 @@ func (t *DeviceRenderLogic) renderK8sConfig(ctx context.Context, configItem *dom
 	return &k8sSpec.Name, nil, fingerprint, nil
 }
 
-func (t *DeviceRenderLogic) renderInlineConfig(configItem *domain.ConfigProviderSpec, ignitionConfig **config_latest_types.Config) (*string, *string, *string, error) {
+func (t *deviceRenderState) renderInlineConfig(configItem *domain.ConfigProviderSpec, ignitionConfig **config_latest_types.Config) (*string, *string, *string, error) {
 	inlineSpec, err := configItem.AsInlineConfigProviderSpec()
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("%w: failed getting config item as InlineConfigProviderSpec: %w", ErrUnknownConfigName, err)
@@ -784,7 +957,7 @@ func (t *DeviceRenderLogic) renderInlineConfig(configItem *domain.ConfigProvider
 	return &inlineSpec.Name, nil, nil, nil
 }
 
-func (t *DeviceRenderLogic) renderHttpProviderConfig(ctx context.Context, configItem *domain.ConfigProviderSpec, ignitionConfig **config_latest_types.Config) (*string, *string, *string, error) {
+func (t *deviceRenderState) renderHttpProviderConfig(ctx context.Context, configItem *domain.ConfigProviderSpec, ignitionConfig **config_latest_types.Config) (*string, *string, *string, error) {
 	httpConfigProviderSpec, err := configItem.AsHttpConfigProviderSpec()
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("%w: failed getting config item as HttpConfigProviderSpec: %w", ErrUnknownConfigName, err)
@@ -897,7 +1070,7 @@ func (t *DeviceRenderLogic) renderHttpProviderConfig(ctx context.Context, config
 // getDepChangeDetails returns the fingerprint and resourceKey from a
 // DependencyChangeDetected event. Both values are empty when the event is of a
 // different type or carries no details.
-func (t *DeviceRenderLogic) getDepChangeDetails() (fingerprint, resourceKey string) {
+func (t *deviceRenderState) getDepChangeDetails() (fingerprint, resourceKey string) {
 	if t.event.Reason != domain.EventReasonDependencyChangeDetected || t.event.Details == nil {
 		return "", ""
 	}
@@ -909,7 +1082,7 @@ func (t *DeviceRenderLogic) getDepChangeDetails() (fingerprint, resourceKey stri
 	return details.Fingerprint, details.ResourceKey
 }
 
-func (t *DeviceRenderLogic) getFrozenRepositoryURL(ctx context.Context, repo *domain.Repository) error {
+func (t *deviceRenderState) getFrozenRepositoryURL(ctx context.Context, repo *domain.Repository) error {
 	repoURL, err := repo.Spec.GetRepoURL()
 	if err != nil {
 		return fmt.Errorf("failed fetching git repository URL %s/%s: %w", t.orgId, *repo.Metadata.Name, err)
@@ -945,7 +1118,7 @@ func (t *DeviceRenderLogic) getFrozenRepositoryURL(ctx context.Context, repo *do
 // entries are deleted so this call (or a concurrent one) re-fetches and
 // re-freezes with the new commit. Subsequent callers that find the updated hash
 // already matching newFingerprint skip the clone entirely.
-func (t *DeviceRenderLogic) cloneCachedGitRepoToIgnition(ctx context.Context, repo *domain.Repository, targetRevision string, path string, newFingerprint string) (*config_latest_types.Config, string, error) {
+func (t *deviceRenderState) cloneCachedGitRepoToIgnition(ctx context.Context, repo *domain.Repository, targetRevision string, path string, newFingerprint string) (*config_latest_types.Config, string, error) {
 	err := t.getFrozenRepositoryURL(ctx, repo)
 	if err != nil {
 		return nil, "", err

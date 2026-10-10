@@ -76,6 +76,10 @@ type fakeDeviceStore struct {
 	lastSeen         map[string]*time.Time
 	healthcheckCalls []healthcheckCall
 	healthcheckErr   error
+	getCalls         int
+	getRenderedCalls int
+	getRenderedErr   error
+	mutateErr        error
 }
 
 func (s *fakeDeviceStore) rememberLastSeen(name string, device *domain.Device) {
@@ -117,6 +121,11 @@ func (s *fakeDeviceStore) Create(ctx context.Context, orgId uuid.UUID, device *d
 }
 
 func (s *fakeDeviceStore) Get(ctx context.Context, orgId uuid.UUID, name string) (*domain.Device, error) {
+	s.getCalls++
+	return s.get(name)
+}
+
+func (s *fakeDeviceStore) get(name string) (*domain.Device, error) {
 	d, ok := s.devices[name]
 	if !ok {
 		return nil, flterrors.ErrResourceNotFound
@@ -134,6 +143,9 @@ func (s *fakeDeviceStore) GetWithTimestamp(ctx context.Context, orgId uuid.UUID,
 }
 
 func (s *fakeDeviceStore) Mutate(ctx context.Context, orgId uuid.UUID, name string, previous *domain.Device, apply devicestore.DeviceApplyFunc, opts ...devicestore.MutateOption) (*domain.Device, *domain.Device, bool, error) {
+	if s.mutateErr != nil {
+		return nil, nil, false, s.mutateErr
+	}
 	old, ok := s.devices[name]
 	creating := !ok
 	var before *domain.Device
@@ -277,7 +289,11 @@ func (s *fakeDeviceStore) MarkRolloutSelection(ctx context.Context, orgId uuid.U
 }
 
 func (s *fakeDeviceStore) GetRendered(ctx context.Context, orgId uuid.UUID, name string, knownRenderedVersion *string, consoleGrpcEndpoint string) (*domain.Device, error) {
-	return s.Get(ctx, orgId, name)
+	s.getRenderedCalls++
+	if s.getRenderedErr != nil {
+		return nil, s.getRenderedErr
+	}
+	return s.get(name)
 }
 
 type healthcheckCall struct {

@@ -28,6 +28,8 @@ const (
 	ConditionTypeCertificateSigningRequestFailed      = v1beta1.ConditionTypeCertificateSigningRequestFailed
 	ConditionTypeCertificateSigningRequestTPMVerified = v1beta1.ConditionTypeCertificateSigningRequestTPMVerified
 	ConditionTypeDeviceDecommissioning                = v1beta1.ConditionTypeDeviceDecommissioning
+	ConditionTypeDeviceEnrollmentHooks                = v1beta1.ConditionTypeDeviceEnrollmentHooks
+	ConditionTypeDeviceLabelsSynced                   = v1beta1.ConditionTypeDeviceLabelsSynced
 	ConditionTypeDeviceMultipleOwners                 = v1beta1.ConditionTypeDeviceMultipleOwners
 	ConditionTypeDeviceSpecValid                      = v1beta1.ConditionTypeDeviceSpecValid
 	ConditionTypeDeviceUpdating                       = v1beta1.ConditionTypeDeviceUpdating
@@ -35,6 +37,7 @@ const (
 	ConditionTypeEnrollmentRequestTPMVerified         = v1beta1.ConditionTypeEnrollmentRequestTPMVerified
 	ConditionTypeFleetDeltaPreparing                  = v1beta1.ConditionTypeFleetDeltaPreparing
 	ConditionTypeDeviceDeltaPreparing                 = v1beta1.ConditionTypeDeviceDeltaPreparing
+	ConditionTypeLabelSyncMappingReady                = v1beta1.ConditionTypeLabelSyncMappingReady
 	ConditionTypeFleetRolloutInProgress               = v1beta1.ConditionTypeFleetRolloutInProgress
 	ConditionTypeFleetValid                           = v1beta1.ConditionTypeFleetValid
 	ConditionTypeRepositoryAccessible                 = v1beta1.ConditionTypeRepositoryAccessible

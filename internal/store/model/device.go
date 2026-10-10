@@ -77,18 +77,128 @@ type DeviceTypePtr interface {
 }
 
 type DeviceLabel struct {
-	OrgID      uuid.UUID `gorm:"primaryKey;type:uuid;index:,composite:device_label_org_device" selector:"metadata.orgid,hidden,private"`
-	DeviceName string    `gorm:"primaryKey;index:,composite:device_label_org_device" selector:"metadata.name"`
-	LabelKey   string    `gorm:"primaryKey;index:,composite:device_label_key" selector:"metadata.labels.key"`
-	LabelValue string    `gorm:"index" selector:"metadata.labels.value"`
+	OrgID              uuid.UUID  `gorm:"primaryKey;type:uuid;index:,composite:device_label_org_device" selector:"metadata.orgid,hidden,private"`
+	DeviceName         string     `gorm:"primaryKey;index:,composite:device_label_org_device" selector:"metadata.name"`
+	LabelKey           string     `gorm:"primaryKey;index:,composite:device_label_key" selector:"metadata.labels.key"`
+	LabelValue         string     `gorm:"index" selector:"metadata.labels.value"`
+	LabelSyncMappingID *uuid.UUID `gorm:"type:uuid"`
 
 	// Foreign Key Constraint with CASCADE DELETE
 	Device Device `gorm:"foreignKey:OrgID,DeviceName;references:OrgID,Name;constraint:OnDelete:CASCADE"`
 }
 
 type ServiceConditions struct {
-	Conditions     *[]domain.Condition          `json:"conditions,omitempty"`
-	DependencySync *domain.DependencySyncStatus `json:"dependencySync,omitempty"`
+	Conditions      *[]domain.Condition           `json:"conditions,omitempty"`
+	DependencySync  *domain.DependencySyncStatus  `json:"dependencySync,omitempty"`
+	DeltaGeneration *domain.DeltaGenerationStatus `json:"deltaGeneration,omitempty"`
+	DeltaEstimates  *DeviceDeltaEstimates         `json:"deltaEstimates,omitempty"`
+}
+
+// DeviceDeltaEstimates stores control-plane size estimates separately from
+// agent-reported device status.
+type DeviceDeltaEstimates struct {
+	OS           *DeviceDeltaEstimate           `json:"os,omitempty"`
+	Applications map[string]DeviceDeltaEstimate `json:"applications,omitempty"`
+}
+
+// DeviceDeltaEstimate is the control-plane generated delta-size estimate for
+// one update target.
+type DeviceDeltaEstimate struct {
+	DeltaSize *string `json:"deltaSize,omitempty"`
+}
+
+func extractDeviceDeltaEstimates(status *domain.DeviceStatus) *DeviceDeltaEstimates {
+	if status == nil {
+		return nil
+	}
+
+	estimates := &DeviceDeltaEstimates{}
+	if status.Os.DeltaSize != nil {
+		estimates.OS = &DeviceDeltaEstimate{DeltaSize: clonePtr(status.Os.DeltaSize)}
+		status.Os.DeltaSize = nil
+	}
+	if status.Os.LastDelta != nil {
+		status.Os.LastDelta = agentDeltaApplyResult(status.Os.LastDelta)
+	}
+
+	if len(status.Applications) > 0 {
+		status.Applications = append([]domain.DeviceApplicationStatus(nil), status.Applications...)
+	}
+	applicationEstimates := make(map[string]DeviceDeltaEstimate)
+	for i := range status.Applications {
+		application := &status.Applications[i]
+		deltaSize := application.DeltaSize
+		if deltaSize != nil && application.Name != "" {
+			applicationEstimates[application.Name] = DeviceDeltaEstimate{DeltaSize: clonePtr(deltaSize)}
+		}
+		application.DeltaSize = nil
+		application.LastDelta = agentDeltaApplyResult(application.LastDelta)
+	}
+	if len(applicationEstimates) > 0 {
+		estimates.Applications = applicationEstimates
+	}
+	if estimates.OS == nil && len(estimates.Applications) == 0 {
+		return nil
+	}
+	return estimates
+}
+
+func agentDeltaApplyResult(lastDelta *domain.DeviceDeltaApplyStatus) *domain.DeviceDeltaApplyStatus {
+	if lastDelta == nil {
+		return nil
+	}
+	result := *lastDelta
+	if result.Outcome == "" {
+		if result.FallbackReason == nil || *result.FallbackReason == "" {
+			return nil
+		}
+		result.Outcome = "Fallback"
+	}
+	return &result
+}
+
+func mergeDeviceDeltaEstimates(status *domain.DeviceStatus, estimates *DeviceDeltaEstimates) {
+	if status == nil || estimates == nil {
+		return
+	}
+	if estimates.OS != nil && estimates.OS.DeltaSize != nil {
+		status.Os.DeltaSize = clonePtr(estimates.OS.DeltaSize)
+	}
+	for i := range status.Applications {
+		application := &status.Applications[i]
+		estimate, exists := estimates.Applications[application.Name]
+		if !exists || estimate.DeltaSize == nil {
+			continue
+		}
+		application.DeltaSize = clonePtr(estimate.DeltaSize)
+	}
+}
+
+func (d *Device) mergeServiceConditions(status *domain.DeviceStatus) {
+	legacyDeltaEstimates := extractDeviceDeltaEstimates(status)
+	status.Conditions = lo.Filter(status.Conditions, func(c domain.Condition, _ int) bool {
+		return !c.Type.IsServiceConditionType()
+	})
+	status.DeltaGeneration = nil
+
+	var deltaEstimates *DeviceDeltaEstimates
+	if d.ServiceConditions != nil {
+		if d.ServiceConditions.Data.Conditions != nil {
+			if status.Conditions == nil {
+				status.Conditions = []domain.Condition{}
+			}
+			status.Conditions = append(status.Conditions, *d.ServiceConditions.Data.Conditions...)
+		}
+		if d.ServiceConditions.Data.DependencySync != nil {
+			status.DependencySync = d.ServiceConditions.Data.DependencySync
+		}
+		status.DeltaGeneration = d.ServiceConditions.Data.DeltaGeneration
+		deltaEstimates = d.ServiceConditions.Data.DeltaEstimates
+	}
+	if deltaEstimates == nil {
+		deltaEstimates = legacyDeltaEstimates
+	}
+	mergeDeviceDeltaEstimates(status, deltaEstimates)
 }
 
 func (d Device) String() string {
@@ -110,10 +220,11 @@ func NewDeviceFromApiResource(resource *domain.Device) (*Device, error) {
 	if resource.Status != nil {
 		status = *resource.Status
 	}
+	serviceConditions := ServiceConditions{}
+	serviceConditions.DeltaEstimates = extractDeviceDeltaEstimates(&status)
 	if status.Conditions == nil {
 		status.Conditions = []domain.Condition{}
 	}
-	var serviceConditions ServiceConditions
 	serviceConditions.Conditions = lo.ToPtr(lo.Filter(status.Conditions, func(c domain.Condition, _ int) bool {
 		return c.Type.IsServiceConditionType()
 	}))
@@ -125,6 +236,10 @@ func NewDeviceFromApiResource(resource *domain.Device) (*Device, error) {
 	if status.DependencySync != nil {
 		serviceConditions.DependencySync = status.DependencySync
 		status.DependencySync = nil
+	}
+	if status.DeltaGeneration != nil {
+		serviceConditions.DeltaGeneration = status.DeltaGeneration
+		status.DeltaGeneration = nil
 	}
 
 	var resourceVersion *int64
@@ -268,18 +383,7 @@ func (d *Device) ToApiResource(opts ...APIResourceOption) (*domain.Device, error
 	if d.Status != nil {
 		status = d.Status.Data
 	}
-
-	if d.ServiceConditions != nil {
-		if d.ServiceConditions.Data.Conditions != nil {
-			if status.Conditions == nil {
-				status.Conditions = []domain.Condition{}
-			}
-			status.Conditions = append(status.Conditions, *d.ServiceConditions.Data.Conditions...)
-		}
-		if d.ServiceConditions.Data.DependencySync != nil {
-			status.DependencySync = d.ServiceConditions.Data.DependencySync
-		}
-	}
+	d.mergeServiceConditions(&status)
 
 	var resourceVersion *string
 	if d.ResourceVersion != nil {

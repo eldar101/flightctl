@@ -152,7 +152,7 @@ var _ = Describe("Enrollment VM launcher image selection", func() {
 		templateVersionSvc = templateversionservice.NewServiceHandler(tvStore, kvStoreInst, eventsSvc, log)
 		dependencyrefSvc = dependencyrefservice.NewServiceHandler(depStore, log)
 		repositorySvc = repositoryservice.NewServiceHandler(repoStore, eventsSvc, log)
-		enrollmentSvc = enrollmentrequestservice.NewServiceHandler(erStore, deviceStore, csrStore, caClient, kvStoreInst, eventsSvc, log, []string{}, "", "")
+		enrollmentSvc = enrollmentrequestservice.NewServiceHandler(erStore, deviceStore, csrStore, caClient, kvStoreInst, eventsSvc, log, []string{}, "", "", nil, nil)
 
 		ctx = context.WithValue(ctx, consts.MappedIdentityCtxKey, identity.NewMappedIdentity("admin", "uid-admin", nil, nil, true, nil))
 
@@ -218,8 +218,8 @@ var _ = Describe("Enrollment VM launcher image selection", func() {
 			rolloutLogic := tasks.NewFleetRolloutsLogic(log, fleetSvc, templateVersionSvc, deviceSvc, dependencyrefSvc, orgId, event)
 			Expect(rolloutLogic.RolloutDevice(ctx)).To(Succeed())
 
-			renderLogic := tasks.NewDeviceRenderLogic(log, deviceSvc, repositorySvc, nil, &mockK8sClient{}, kvStoreInst, cfg, orgId, event)
-			Expect(renderLogic.RenderDevice(ctx)).To(Succeed())
+			renderLogic := tasks.NewDeviceRenderLogic(log, deviceSvc, repositorySvc, nil, &mockK8sClient{}, kvStoreInst, cfg)
+			Expect(renderLogic.RenderDevice(ctx, orgId, event)).To(Succeed())
 
 			renderedDevice, getStatus := deviceSvc.GetRenderedDevice(ctx, orgId, deviceName, api.GetRenderedDeviceParams{})
 			Expect(getStatus.Code).To(BeNumerically("==", 200))

@@ -2,11 +2,13 @@ package device
 
 import (
 	"context"
+	"reflect"
 
 	"github.com/flightctl/flightctl/internal/consts"
 	"github.com/flightctl/flightctl/internal/domain"
 	"github.com/flightctl/flightctl/internal/service/common"
 	"github.com/flightctl/flightctl/internal/service/events"
+	"github.com/flightctl/flightctl/internal/util"
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
 )
@@ -32,6 +34,14 @@ func EmitDeviceUpdatedEvent(ctx context.Context, eventsService events.Service, l
 
 	// Only generate status change events when the device is not being created
 	if !created {
+		if oldDevice != nil && newDevice != nil && !reflect.DeepEqual(oldDevice.Status, newDevice.Status) {
+			// Emit an identity-only update so the worker can reconcile from committed state.
+			// Focused events below describe known status transitions; mapped label changes
+			// are only known after all current mappings have been evaluated.
+			event := domain.GetBaseEvent(ctx, domain.DeviceKind, name, domain.EventReasonResourceUpdated, "Device status changed", nil)
+			eventsService.CreateEvent(ctx, orgId, event)
+		}
+
 		statusUpdates := common.ComputeDeviceStatusChanges(ctx, oldDevice, newDevice, orgId)
 
 		// Deduplicate DeviceDisconnected events - if multiple status fields changed to Unknown,
@@ -68,10 +78,48 @@ func EmitDeviceUpdatedEvent(ctx context.Context, eventsService events.Service, l
 
 	annotations := map[string]string{}
 	delayDeviceRender, ok := ctx.Value(consts.DelayDeviceRenderCtxKey).(bool)
-	if ok && delayDeviceRender {
+	holdStandalone := deviceSpecsChanged(oldDevice, newDevice) && !hasFleetOwner(newDevice)
+	if (ok && delayDeviceRender) || holdStandalone {
 		annotations[domain.EventAnnotationDelayDeviceRender] = "true"
 	}
 	eventsService.CreateEvent(ctx, orgId, common.GetResourceCreatedOrUpdatedSuccessEvent(ctx, false, domain.DeviceKind, name, updateDetails, log, annotations))
+	if holdStandalone {
+		emitStandalonePrepareDeltas(ctx, eventsService, log, orgId, name, newDevice)
+	}
+}
+
+func hasFleetOwner(device *domain.Device) bool {
+	if device == nil {
+		return false
+	}
+	kind, _, err := util.GetResourceOwner(device.Metadata.Owner)
+	return err == nil && kind == domain.FleetKind
+}
+
+func emitStandalonePrepareDeltas(ctx context.Context, eventsService events.Service, log logrus.FieldLogger, orgId uuid.UUID, name string, device *domain.Device) {
+	details := domain.PrepareDeltasDetails{
+		DetailType: domain.PrepareDeltasDetailsDetailType("PrepareDeltas"),
+	}
+	if device != nil {
+		details.ResourceVersion = device.Metadata.ResourceVersion
+		details.Generation = device.Metadata.Generation
+	}
+	var eventDetails domain.EventDetails
+	if err := eventDetails.FromPrepareDeltasDetails(details); err != nil {
+		return
+	}
+	event := domain.GetBaseEvent(ctx, domain.DeviceKind, name, domain.EventReasonPrepareDeltas, "Preparing OS image deltas", &eventDetails)
+	if reliable, ok := eventsService.(interface {
+		CreateEventWithRetry(context.Context, uuid.UUID, *domain.Event) error
+	}); ok {
+		if err := reliable.CreateEventWithRetry(ctx, orgId, event); err != nil {
+			log.WithError(err).Error("failed to publish standalone PrepareDeltas event")
+		}
+		return
+	}
+	// Test doubles and older event implementations do not expose the retrying
+	// extension; retain the generic event-service behavior for those callers.
+	eventsService.CreateEvent(ctx, orgId, event)
 }
 
 func ensureSpecUpdatedField(details *domain.ResourceUpdatedDetails, oldDevice, newDevice *domain.Device) *domain.ResourceUpdatedDetails {

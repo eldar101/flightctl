@@ -24,6 +24,24 @@ kv:
   hostname: flightctl-kv
   port: 6379
 service: {}
+worker:
+  {{- if and .worker .worker.imageDigestCacheTTL }}
+  imageDigestCacheTTL: {{.worker.imageDigestCacheTTL}}
+  {{- end }}
+  {{- if and .worker .worker.helmImageRefsCacheTTL }}
+  helmImageRefsCacheTTL: {{.worker.helmImageRefsCacheTTL}}
+  {{- end }}
+  vmRender:
+    {{- if and .worker .worker.vmRender .worker.vmRender.launcherImage }}
+    launcherImage: {{.worker.vmRender.launcherImage}}
+    {{- end }}
+    {{- if and .worker .worker.vmRender .worker.vmRender.launcherImages }}
+    launcherImages:
+    {{- range $major, $image := .worker.vmRender.launcherImages }}
+      {{ printf "%q" $major }}: {{ printf "%q" $image }}
+    {{- end }}
+    {{- end }}
+    passtWorkarounds: {{if and .worker .worker.vmRender}}{{if eq (printf "%v" .worker.vmRender.passtWorkarounds) "true"}}true{{else}}false{{end}}{{else}}false{{end}}
 metrics:
   enabled: true
   address: ":8080"
@@ -35,6 +53,9 @@ metrics:
 deltaGeneration:
   maxConcurrentDeltaGenerations: {{if and .deltaGeneration .deltaGeneration.maxConcurrentDeltaGenerations}}{{.deltaGeneration.maxConcurrentDeltaGenerations}}{{else}}2{{end}}
   timeout: {{if and .deltaGeneration .deltaGeneration.timeout}}{{.deltaGeneration.timeout}}{{else}}30m{{end}}
+  {{- if and .deltaGeneration .deltaGeneration.maxWaitForDelta }}
+  maxWaitForDelta: {{.deltaGeneration.maxWaitForDelta}}
+  {{- end }}
 {{- with .deltaGeneration }}
 {{- with .defaultRepository }}
 {{- if .registry }}

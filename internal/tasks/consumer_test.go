@@ -3,16 +3,25 @@ package tasks
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/flightctl/flightctl/internal/domain"
+	deviceservice "github.com/flightctl/flightctl/internal/service/device"
+	eventservice "github.com/flightctl/flightctl/internal/service/event"
+	fleetservice "github.com/flightctl/flightctl/internal/service/fleet"
+	labelsyncmappingservice "github.com/flightctl/flightctl/internal/service/labelsyncmapping"
+	repositoryservice "github.com/flightctl/flightctl/internal/service/repository"
 	"github.com/flightctl/flightctl/internal/worker_client"
 	"github.com/flightctl/flightctl/pkg/queues"
 	"github.com/google/uuid"
+	"github.com/samber/lo"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
 )
 
 func createTestEventWithDetails(kind domain.ResourceKind, reason domain.EventReason, name string, details *domain.EventDetails) domain.Event {
@@ -180,6 +189,12 @@ func TestShouldReconcileDeviceOwnership(t *testing.T) {
 			expected: true,
 		},
 		{
+			name: "DeviceUpdatedWithEnrollmentHooksGateCleared",
+			event: createTestEventWithDetails(domain.DeviceKind, domain.EventReasonResourceUpdated, "device1",
+				createResourceUpdatedDetails(t, domain.UpdatedFieldEnrollmentHooksCondition)),
+			expected: true,
+		},
+		{
 			name:     "DeviceUpdatedWithOtherFields",
 			event:    createTestEventWithDetails(domain.DeviceKind, domain.EventReasonResourceUpdated, "device1", createResourceUpdatedDetails(t, domain.Spec)),
 			expected: false,
@@ -200,6 +215,46 @@ func TestShouldReconcileDeviceOwnership(t *testing.T) {
 	}
 }
 
+func TestShouldReconcileDeviceLabels(t *testing.T) {
+	tests := []struct {
+		name     string
+		event    domain.Event
+		expected bool
+	}{
+		{
+			name:     "When a device is created it should reconcile labels",
+			event:    createTestEvent(domain.DeviceKind, domain.EventReasonResourceCreated, "device1"),
+			expected: true,
+		},
+		{
+			name:     "When a device status changes it should reconcile from the identity-only event",
+			event:    createTestEvent(domain.DeviceKind, domain.EventReasonResourceUpdated, "device1"),
+			expected: true,
+		},
+		{
+			name:     "When a device update carries details it should not trigger status reconciliation",
+			event:    createTestEventWithDetails(domain.DeviceKind, domain.EventReasonResourceUpdated, "device1", createResourceUpdatedDetails(t, domain.Labels)),
+			expected: false,
+		},
+		{
+			name:     "When another resource is created it should not reconcile device labels",
+			event:    createTestEvent(domain.FleetKind, domain.EventReasonResourceCreated, "fleet1"),
+			expected: false,
+		},
+		{
+			name:     "When a device is deleted it should not reconcile labels",
+			event:    createTestEvent(domain.DeviceKind, domain.EventReasonResourceDeleted, "device1"),
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, shouldReconcileDeviceLabels(context.Background(), tt.event))
+		})
+	}
+}
+
 func TestShouldValidateFleet(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -209,6 +264,11 @@ func TestShouldValidateFleet(t *testing.T) {
 		{
 			name:     "FleetUpdatedWithTemplate",
 			event:    createTestEventWithDetails(domain.FleetKind, domain.EventReasonResourceUpdated, "fleet1", createResourceUpdatedDetails(t, domain.SpecTemplate)),
+			expected: true,
+		},
+		{
+			name:     "FleetUpdatedWithGenericSpec",
+			event:    createTestEventWithDetails(domain.FleetKind, domain.EventReasonResourceUpdated, "fleet1", createResourceUpdatedDetails(t, domain.Spec)),
 			expected: true,
 		},
 		{
@@ -346,7 +406,7 @@ func TestShouldRenderDevice(t *testing.T) {
 		{
 			name:     "DeltaGenerationCompleted",
 			event:    createTestEvent(domain.DeviceKind, domain.EventReasonDeltaGenerationCompleted, "device1"),
-			expected: false,
+			expected: true,
 		},
 	}
 
@@ -489,6 +549,54 @@ func (m *MockConsumer) Close() {
 	m.Called()
 }
 
+func TestDispatchTasks_EnrollmentHookNotifyUsesWorkerContext(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	orgId := uuid.New()
+	erName := "test-device"
+	log := logrus.New()
+	mockConsumer := &MockConsumer{}
+	mockDeviceSvc := deviceservice.NewMockService(ctrl)
+
+	eventWithOrgId := worker_client.EventWithOrgId{
+		OrgId: orgId,
+		Event: domain.Event{
+			InvolvedObject: domain.ObjectReference{
+				Kind: domain.EnrollmentRequestKind,
+				Name: erName,
+			},
+			Reason: domain.EventReasonEnrollmentRequestApproved,
+		},
+	}
+	payload, err := json.Marshal(eventWithOrgId)
+	require.NoError(t, err)
+
+	mockConsumer.On("Complete", mock.Anything, "entry-123", payload, mock.MatchedBy(func(e error) bool { return e == nil })).Return(nil)
+
+	// Device with no enrollment-hooks snapshot: notify returns after GetDevice.
+	// Assert the context deadline is the notify budget (~10m), not the 10s event timeout.
+	mockDeviceSvc.EXPECT().GetDevice(gomock.Any(), orgId, erName).
+		DoAndReturn(func(ctx context.Context, _ uuid.UUID, _ string) (*domain.Device, domain.Status) {
+			deadline, ok := ctx.Deadline()
+			require.True(t, ok, "notify context should have a deadline")
+			remaining := time.Until(deadline)
+			assert.Greater(t, remaining, EventProcessingTimeout,
+				"deadline remaining %v looks like the per-event timeout; dispatch should pass workerCtx", remaining)
+			assert.InDelta(t, EnrollmentHookNotifyProcessingTimeout.Seconds(), remaining.Seconds(), 5.0,
+				"deadline remaining should be ~%v (notify processing timeout)", EnrollmentHookNotifyProcessingTimeout)
+			return &domain.Device{
+				Metadata: domain.ObjectMeta{Name: lo.ToPtr(erName)},
+				Status:   &domain.DeviceStatus{},
+			}, domain.StatusOK()
+		})
+
+	handler := TaskConsumer{DeviceSvc: mockDeviceSvc}.dispatch()
+	err = handler(context.Background(), payload, "entry-123", mockConsumer, log)
+	require.NoError(t, err)
+	mockConsumer.AssertExpectations(t)
+}
+
 func TestDispatchTasks_WithNilMetrics(t *testing.T) {
 	ctx := context.Background()
 	log := logrus.New()
@@ -514,7 +622,7 @@ func TestDispatchTasks_WithNilMetrics(t *testing.T) {
 	mockConsumer.On("Complete", mock.Anything, "entry-123", payload, mock.MatchedBy(func(e error) bool { return e == nil })).Return(nil)
 
 	// Create dispatcher with nil metrics
-	handler := dispatchTasks(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	handler := TaskConsumer{}.dispatch()
 
 	// Execute handler
 	err = handler(ctx, payload, "entry-123", mockConsumer, log)
@@ -549,13 +657,223 @@ func TestDispatchTasks_WithNilMetrics_SuccessfulProcessing(t *testing.T) {
 	mockConsumer.On("Complete", mock.Anything, "entry-123", payload, mock.MatchedBy(func(e error) bool { return e == nil })).Return(nil)
 
 	// Create dispatcher with nil metrics
-	handler := dispatchTasks(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	handler := TaskConsumer{}.dispatch()
 
 	// Execute handler
 	err = handler(ctx, payload, "entry-123", mockConsumer, log)
 
 	// Should complete successfully
 	assert.NoError(t, err)
+	mockConsumer.AssertExpectations(t)
+}
+
+func TestDispatchTasks_FleetValidationAcknowledgesInvalidConfigAndRetriesOperationalErrors(t *testing.T) {
+	tests := []struct {
+		name             string
+		repositoryStatus domain.Status
+		lookupRepository bool
+		wantQueueRetry   bool
+	}{
+		{
+			name: "When Fleet configuration is invalid it should acknowledge the event",
+		},
+		{
+			name:             "When referenced repository is missing it should acknowledge the event",
+			repositoryStatus: domain.StatusResourceNotFound(domain.RepositoryKind, "repo-1"),
+			lookupRepository: true,
+		},
+		{
+			name:             "When repository lookup fails it should retry the event",
+			repositoryStatus: domain.StatusInternalServerError("repository store unavailable"),
+			lookupRepository: true,
+			wantQueueRetry:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			fleetName := "test-fleet"
+			fleet := createTestFleet(fleetName, nil)
+			configs := []domain.ConfigProviderSpec{{}}
+			if tt.lookupRepository {
+				configs = []domain.ConfigProviderSpec{makeGitConfigItem(t, "repo-config", "repo-1", "main")}
+			}
+			fleet.Spec.Template.Spec.Config = &configs
+			orgID := uuid.New()
+
+			mockFleetSvc := fleetservice.NewMockService(ctrl)
+			mockRepositorySvc := repositoryservice.NewMockService(ctrl)
+			mockEventSvc := eventservice.NewMockService(ctrl)
+			mockFleetSvc.EXPECT().GetFleet(gomock.Any(), orgID, fleetName, gomock.Any()).Return(fleet, domain.StatusOK())
+			mockFleetSvc.EXPECT().OverwriteFleetRepositoryRefs(gomock.Any(), orgID, fleetName, gomock.Any()).Return(domain.StatusOK())
+			mockFleetSvc.EXPECT().UpdateFleetConditions(gomock.Any(), orgID, fleetName, gomock.Any()).Return(domain.StatusOK())
+			if tt.lookupRepository {
+				mockRepositorySvc.EXPECT().GetRepository(gomock.Any(), orgID, "repo-1").Return(nil, tt.repositoryStatus)
+			}
+			if tt.wantQueueRetry {
+				mockEventSvc.EXPECT().CreateEvent(gomock.Any(), orgID, gomock.Any())
+			}
+
+			eventWithOrgID := worker_client.EventWithOrgId{
+				OrgId: orgID,
+				Event: createTestEvent(domain.FleetKind, domain.EventReasonDependencyChangeDetected, fleetName),
+			}
+			payload, err := json.Marshal(eventWithOrgID)
+			require.NoError(t, err)
+
+			mockConsumer := &MockConsumer{}
+			var queueErr error
+			mockConsumer.On("Complete", mock.Anything, "entry-123", payload, mock.Anything).
+				Run(func(args mock.Arguments) {
+					queueErr, _ = args.Get(3).(error)
+				}).Return(nil).Once()
+
+			handler := TaskConsumer{
+				FleetSvc:      mockFleetSvc,
+				RepositorySvc: mockRepositorySvc,
+				EventSvc:      mockEventSvc,
+			}.dispatch()
+			err = handler(context.Background(), payload, "entry-123", mockConsumer, logrus.New())
+
+			if tt.wantQueueRetry {
+				require.Error(t, err)
+				require.Error(t, queueErr)
+				assert.ErrorContains(t, err, "repository store unavailable")
+			} else {
+				require.NoError(t, err)
+				assert.NoError(t, queueErr)
+			}
+			mockConsumer.AssertExpectations(t)
+		})
+	}
+}
+
+func TestDispatchTasks_DeviceLabelReconciliationRetriesConfigurationFailures(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	orgID := uuid.New()
+	eventWithOrgID := worker_client.EventWithOrgId{
+		OrgId: orgID,
+		Event: createTestEvent(domain.DeviceKind, domain.EventReasonResourceUpdated, "device1"),
+	}
+	payload, err := json.Marshal(eventWithOrgID)
+	require.NoError(t, err)
+
+	mockEventSvc := eventservice.NewMockService(ctrl)
+	mockEventSvc.EXPECT().CreateEvent(gomock.Any(), orgID, gomock.Any()).Times(1)
+	mockConsumer := &MockConsumer{}
+	var queueErr error
+	mockConsumer.On("Complete", mock.Anything, "entry-123", payload, mock.Anything).
+		Run(func(args mock.Arguments) {
+			queueErr, _ = args.Get(3).(error)
+		}).Return(nil).Once()
+
+	handler := TaskConsumer{EventSvc: mockEventSvc}.dispatch()
+	err = handler(context.Background(), payload, "entry-123", mockConsumer, logrus.New())
+	require.ErrorContains(t, err, "device label reconciliation is not configured")
+	require.ErrorContains(t, queueErr, "device label reconciliation is not configured")
+	mockConsumer.AssertExpectations(t)
+}
+
+func TestDispatchTasks_DeviceLabelReconciliationCompletesAfterReconcilerReturns(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	orgID := uuid.New()
+	service := labelsyncmappingservice.NewMockService(ctrl)
+	outcomes := []labelsyncmappingservice.MappingOutcome{{MappingID: uuid.New()}}
+	postWriteChecksComplete := false
+	service.EXPECT().ReconcileDeviceLabels(gomock.Any(), orgID, "device1").DoAndReturn(
+		func(context.Context, uuid.UUID, string) (labelsyncmappingservice.ReconciliationResult, error) {
+			postWriteChecksComplete = true
+			return labelsyncmappingservice.ReconciliationResult{MappingOutcomes: outcomes}, nil
+		},
+	)
+	eventWithOrgID := worker_client.EventWithOrgId{
+		OrgId: orgID,
+		Event: createTestEvent(domain.DeviceKind, domain.EventReasonResourceUpdated, "device1"),
+	}
+	payload, err := json.Marshal(eventWithOrgID)
+	require.NoError(t, err)
+	mockConsumer := &MockConsumer{}
+	mockConsumer.On("Complete", mock.Anything, "entry-123", payload, nil).Run(func(mock.Arguments) {
+		require.True(t, postWriteChecksComplete, "event completed before the label reconciliation post-write checks returned")
+	}).Return(nil).Once()
+
+	handler := TaskConsumer{LabelSyncMappingSvc: service}.dispatch()
+	err = handler(context.Background(), payload, "entry-123", mockConsumer, logrus.New())
+	require.NoError(t, err)
+	mockConsumer.AssertExpectations(t)
+}
+
+func TestDispatchTasks_DeviceLabelReconciliationRetriesReconciliationErrors(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	orgID := uuid.New()
+	mappingID := uuid.New()
+	mappingErr := errors.New("mapping evaluation failed")
+	reconcileErr := errors.New("reconciliation conflict")
+	outcomes := []labelsyncmappingservice.MappingOutcome{{MappingID: mappingID, Err: mappingErr}}
+	service := labelsyncmappingservice.NewMockService(ctrl)
+	service.EXPECT().ReconcileDeviceLabels(gomock.Any(), orgID, "device1").Return(
+		labelsyncmappingservice.ReconciliationResult{MappingOutcomes: outcomes}, reconcileErr,
+	)
+
+	eventWithOrgID := worker_client.EventWithOrgId{
+		OrgId: orgID,
+		Event: createTestEvent(domain.DeviceKind, domain.EventReasonResourceUpdated, "device1"),
+	}
+	payload, err := json.Marshal(eventWithOrgID)
+	require.NoError(t, err)
+	mockEventSvc := eventservice.NewMockService(ctrl)
+	mockEventSvc.EXPECT().CreateEvent(gomock.Any(), orgID, gomock.Any()).Times(1)
+	mockConsumer := &MockConsumer{}
+	var queueErr error
+	mockConsumer.On("Complete", mock.Anything, "entry-123", payload, mock.Anything).
+		Run(func(args mock.Arguments) {
+			queueErr, _ = args.Get(3).(error)
+		}).Return(nil).Once()
+
+	handler := TaskConsumer{EventSvc: mockEventSvc, LabelSyncMappingSvc: service}.dispatch()
+	err = handler(context.Background(), payload, "entry-123", mockConsumer, logrus.New())
+	require.ErrorContains(t, err, "reconciliation conflict")
+	require.ErrorContains(t, queueErr, "reconciliation conflict")
+	mockConsumer.AssertExpectations(t)
+}
+
+func TestDispatchTasks_DeviceLabelOwnershipFailureSkipsRollout(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	orgID := uuid.New()
+	event := createTestEventWithDetails(
+		domain.DeviceKind,
+		domain.EventReasonResourceUpdated,
+		"device1",
+		createResourceUpdatedDetails(t, domain.Labels),
+	)
+	eventWithOrgID := worker_client.EventWithOrgId{OrgId: orgID, Event: event}
+	payload, err := json.Marshal(eventWithOrgID)
+	require.NoError(t, err)
+
+	deviceSvc := deviceservice.NewMockService(ctrl)
+	deviceSvc.EXPECT().GetDevice(gomock.Any(), orgID, "device1").
+		Return(nil, domain.StatusInternalServerError("selector store unavailable")).Times(1)
+	fleetSvc := fleetservice.NewMockService(ctrl)
+	eventSvc := eventservice.NewMockService(ctrl)
+	eventSvc.EXPECT().CreateEvent(gomock.Any(), orgID, gomock.Any()).Times(1)
+
+	mockConsumer := &MockConsumer{}
+	var completedErr error
+	mockConsumer.On("Complete", mock.Anything, "entry-123", payload, mock.Anything).
+		Run(func(args mock.Arguments) {
+			completedErr, _ = args.Get(3).(error)
+		}).Return(nil).Once()
+
+	handler := TaskConsumer{
+		DeviceSvc: deviceSvc,
+		FleetSvc:  fleetSvc,
+		EventSvc:  eventSvc,
+	}.dispatch()
+	err = handler(context.Background(), payload, "entry-123", mockConsumer, logrus.New())
+	require.ErrorContains(t, err, "fleetSelectorMatching")
+	require.ErrorContains(t, err, "selector store unavailable")
+	require.ErrorContains(t, completedErr, "selector store unavailable")
 	mockConsumer.AssertExpectations(t)
 }
 
@@ -572,7 +890,7 @@ func TestDispatchTasks_WithNilMetrics_InvalidPayload(t *testing.T) {
 	mockConsumer.On("Complete", mock.Anything, "entry-123", payload, nil).Return(nil)
 
 	// Create dispatcher with nil metrics
-	handler := dispatchTasks(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	handler := TaskConsumer{}.dispatch()
 
 	// Execute handler
 	err := handler(ctx, payload, "entry-123", mockConsumer, log)
@@ -580,4 +898,40 @@ func TestDispatchTasks_WithNilMetrics_InvalidPayload(t *testing.T) {
 	// Should return no error (parsing errors are not retryable)
 	assert.NoError(t, err)
 	mockConsumer.AssertExpectations(t)
+}
+
+func TestShouldEnrollmentHookNotify(t *testing.T) {
+	tests := []struct {
+		name     string
+		event    domain.Event
+		expected bool
+	}{
+		{
+			name:     "When EnrollmentRequestApproved it should return true",
+			event:    createTestEvent(domain.EnrollmentRequestKind, domain.EventReasonEnrollmentRequestApproved, "device1"),
+			expected: true,
+		},
+		{
+			name:     "When ResourceCreated on device it should return false",
+			event:    createTestEvent(domain.DeviceKind, domain.EventReasonResourceCreated, "device1"),
+			expected: false,
+		},
+		{
+			name:     "When ResourceUpdated on enrollment request it should return false",
+			event:    createTestEvent(domain.EnrollmentRequestKind, domain.EventReasonResourceUpdated, "er1"),
+			expected: false,
+		},
+		{
+			name:     "When EnrollmentRequestApprovalFailed it should return false",
+			event:    createTestEvent(domain.EnrollmentRequestKind, domain.EventReasonEnrollmentRequestApprovalFailed, "device1"),
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := shouldEnrollmentHookNotify(tt.event)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
 }

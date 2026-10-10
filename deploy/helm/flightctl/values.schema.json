@@ -185,7 +185,8 @@
                   "type": "array",
                   "description": "List of OAuth2 scopes to request",
                   "items": { "type": "string" }
-                }
+                },
+                "identityCacheTTL": { "type": "string", "description": "TTL for AAP identity cache (Go duration string, e.g. 45s, 2m)" }
               }
             },
             "openshift": {
@@ -500,9 +501,17 @@
           "type": "string",
           "description": "Time budget for a single device render operation including VM conversion and DB writes (default 60s)"
         },
+        "imageDigestCacheTTL": {
+          "type": "string",
+          "description": "Maximum age of cached OCI image digest resolutions used during delta preparation (default 15m)"
+        },
+        "helmImageRefsCacheTTL": {
+          "type": "string",
+          "description": "Maximum age of cached Helm workload image references before the chart is rendered again (default 15m)"
+        },
         "vmRender": {
           "type": "object",
-          "description": "VM application render options passed to vm-to-quadlet",
+          "description": "VM application render options passed to vm-to-quadlet by both worker services",
           "additionalProperties": false,
           "properties": {
             "launcherImage": {
@@ -621,6 +630,36 @@
                     "interval": { "type": "string", "description": "Interval for the repository-tester task, which probes Repository resources and sets their Accessible condition" }
                   }
                 }
+              }
+            },
+            "deltaPrepareDeadline": {
+              "type": "object",
+              "description": "Deadline sweep schedule for delta prepares",
+              "additionalProperties": false,
+              "properties": {
+                "schedule": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "interval": { "type": "string", "description": "Interval for the delta prepare deadline sweep" }
+                  }
+                }
+              }
+            },
+            "labelMappingScan": {
+              "type": "object",
+              "description": "Periodic label mapping scan configuration",
+              "additionalProperties": false,
+              "properties": {
+                "schedule": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "interval": { "type": "string", "default": "2m", "description": "Interval for the label mapping scan task" }
+                  }
+                },
+                "pageSize": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 1000, "description": "Maximum number of devices in each label mapping scan page" },
+                "timeBudget": { "type": "string", "default": "30s", "description": "Maximum work time per label mapping scan invocation" }
               }
             }
           }
@@ -755,6 +794,8 @@
         "logLevel": { "type": "string", "description": "Log level for ImageBuilder Worker" },
         "maxConcurrentBuilds": { "type": "integer", "description": "Maximum concurrent builds" },
         "defaultTTL": { "type": "string", "description": "Default TTL for build resources" },
+        "imageBuilderTimeout": { "type": "string", "description": "Inactivity timeout for image builds and exports" },
+        "timeoutCheckTaskInterval": { "type": "string", "description": "Interval between image build and export timeout checks" },
         "rpmRepoUrl": { "type": "string", "description": "RPM repository URL to add via dnf config-manager --add-repo for flightctl-agent package" },
         "rpmRepoAdd": { "type": "boolean", "description": "Whether to add the RPM repository via dnf config-manager --add-repo (defaults to true)" },
         "rpmRepoEnable": { "type": "string", "description": "RPM repository name to enable via --enablerepo for flightctl-agent package installation" },
@@ -1144,6 +1185,10 @@
         "timeout": {
           "type": "string",
           "description": "Per-job timeout for generating a delta (Go duration, e.g. 30m). Defaults to 30m when omitted or <= 0"
+        },
+        "maxWaitForDelta": {
+          "type": "string",
+          "description": "Optional prepare wait cap (Go duration, e.g. 10m). Omitted means no deadline. 0s generates then resumes immediately"
         }
       }
     },

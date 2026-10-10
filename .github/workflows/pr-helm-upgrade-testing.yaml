@@ -72,6 +72,9 @@ jobs:
     with:
       repository: flightctl/flightctl
       ref: ${{ github.base_ref || 'main' }}
+      # The baseline ref is the target branch, which predates the fips-validate
+      # Makefile target; FIPS validation only applies to the PR's images.
+      validate_fips: false
 
   build-pr:
     needs: [check-changes]
@@ -125,7 +128,8 @@ jobs:
         id: get-ip
         run: |
           source ./test/scripts/functions
-          BASE_DOMAIN=$(get_ext_ip).nip.io
+          IP=$(get_ext_ip)
+          BASE_DOMAIN="${IP}.nip.io"
           echo "$BASE_DOMAIN"
           echo "base-domain=$BASE_DOMAIN" >> "$GITHUB_OUTPUT"
 

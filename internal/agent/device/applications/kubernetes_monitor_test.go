@@ -13,6 +13,7 @@ import (
 	"github.com/flightctl/flightctl/internal/agent/device/applications/provider"
 	"github.com/flightctl/flightctl/internal/agent/device/errors"
 	"github.com/flightctl/flightctl/internal/agent/device/fileio"
+	"github.com/flightctl/flightctl/internal/chartutil"
 	"github.com/flightctl/flightctl/pkg/executer"
 	"github.com/flightctl/flightctl/pkg/log"
 	testutil "github.com/flightctl/flightctl/test/util"
@@ -20,6 +21,26 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 )
+
+func TestKubernetesMonitorUpdateAfterRestart(t *testing.T) {
+	require := require.New(t)
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	logger := log.NewPrefixLogger("test")
+	monitor := newTestKubernetesMonitor(logger, executer.NewMockExecuter(ctrl), fileio.NewMockReadWriter(ctrl), "/tmp/kubeconfig")
+	volumeManager, err := provider.NewVolumeManager(logger, "app", v1beta1.AppTypeHelm, v1beta1.CurrentProcessUsername, nil)
+	require.NoError(err)
+	app := &application{
+		id: "app", path: "/var/lib/flightctl/helm/charts/app",
+		status: &v1beta1.DeviceApplicationStatus{Name: "app", AppType: v1beta1.AppTypeHelm},
+		volume: volumeManager,
+	}
+	require.NoError(monitor.Update(app))
+	require.Same(app, monitor.apps[app.ID()])
+	require.Len(monitor.actions, 1)
+	require.Equal(lifecycle.ActionUpdate, monitor.actions[0].Type)
+	require.Equal(app.ID(), monitor.actions[0].ID)
+}
 
 func TestKubernetesMonitor_QueueLifecycle(t *testing.T) {
 	const appName = "my-helm-app"
@@ -275,7 +296,7 @@ func TestKubernetesMonitor_StopApp_PropagatesHandlerError(t *testing.T) {
 	}
 
 	appID := lifecycle.GenerateAppID(appName, v1beta1.CurrentProcessUsername)
-	namespace := helm.AppNamespace(nil, appName)
+	namespace := chartutil.AppNamespace(nil, appName)
 	mockExec.EXPECT().ExecuteWithContext(gomock.Any(), "kubectl", []string{
 		"scale", "deployment,statefulset",
 		"-l", fmt.Sprintf("%s=%s", helm.AppLabelKey, appID),
@@ -465,7 +486,7 @@ func TestKubernetesMonitor_ExecuteActions_LifecycleActionFailureContinues(t *tes
 
 	// Queue a Stop action; make kubectl scale fail.
 	appID := lifecycle.GenerateAppID(appName, v1beta1.CurrentProcessUsername)
-	namespace := helm.AppNamespace(nil, appName)
+	namespace := chartutil.AppNamespace(nil, appName)
 	mockExec.EXPECT().ExecuteWithContext(gomock.Any(), "kubectl", []string{
 		"scale", "deployment,statefulset",
 		"-l", fmt.Sprintf("%s=%s", helm.AppLabelKey, appID),
@@ -490,6 +511,56 @@ func newTestKubernetesMonitor(log *log.PrefixLogger, mockExec executer.Executer,
 	return NewKubernetesMonitor(log, cliClients, rwFactory)
 }
 
+func TestKubernetesMonitorUpdatePodStatusCollectsImageSnapshot(t *testing.T) {
+	app := &application{workloads: []Workload{{
+		ID:   "old-uid",
+		Name: "app-pod",
+		Images: []WorkloadImage{{
+			Image: "quay.io/acme/old:v1",
+		}},
+	}}}
+	monitor := &KubernetesMonitor{monitor: &monitor{log: log.NewPrefixLogger("test")}}
+	pod := &kubernetesPod{}
+	pod.Kind = "Pod"
+	pod.Metadata.Name = "app-pod"
+	pod.Metadata.UID = "new-uid"
+	pod.Spec.Containers = []kubernetesContainerSpec{{Name: "web", Image: "quay.io/acme/web:latest"}}
+	pod.Spec.InitContainers = []kubernetesContainerSpec{{Name: "setup", Image: "quay.io/acme/setup:v2"}}
+	pod.Status.Phase = podPhaseRunning
+	pod.Status.ContainerStatuses = []kubernetesContainerStatus{{
+		Name:    "web",
+		ImageID: "docker-pullable://quay.io/acme/web@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		Ready:   true,
+	}}
+	pod.Status.InitContainerStatuses = []kubernetesContainerStatus{{
+		Name:    "setup",
+		ImageID: "containerd://sha256:opaque",
+		Ready:   true,
+	}}
+
+	monitor.updatePodStatus(app, pod)
+
+	workload, ok := app.Workload("app-pod")
+	require.True(t, ok)
+	require.Equal(t, "new-uid", workload.ID)
+	require.Equal(t, []WorkloadImage{
+		{Image: "quay.io/acme/web:latest", Digest: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
+		{Image: "quay.io/acme/setup:v2"},
+	}, workload.Images)
+
+	// A later pod snapshot replaces the old set so removed containers cannot
+	// leave image references in the application status.
+	pod.Spec.Containers = []kubernetesContainerSpec{{Name: "web", Image: "quay.io/acme/web:v2"}}
+	pod.Spec.InitContainers = nil
+	pod.Status.InitContainerStatuses = nil
+	pod.Status.ContainerStatuses = []kubernetesContainerStatus{{Name: "web", Ready: true}}
+	monitor.updatePodStatus(app, pod)
+
+	workload, ok = app.Workload("app-pod")
+	require.True(t, ok)
+	require.Equal(t, []WorkloadImage{{Image: "quay.io/acme/web:v2"}}, workload.Images)
+}
+
 // testKubeCLIClients implements client.CLIClients for KubernetesMonitor tests.
 type testKubeCLIClients struct {
 	kube *client.Kube
@@ -505,7 +576,7 @@ func (c *testKubeCLIClients) CRI() *client.CRI       { return nil }
 // setupKubeScaleMock sets up the mock expectation for kubectl scale --replicas=N.
 func setupKubeScaleMock(mockExec *executer.MockExecuter, appName, kubeconfigPath string, replicas int) *gomock.Call {
 	appID := lifecycle.GenerateAppID(appName, v1beta1.CurrentProcessUsername)
-	namespace := helm.AppNamespace(nil, appName)
+	namespace := chartutil.AppNamespace(nil, appName)
 	return mockExec.EXPECT().ExecuteWithContext(gomock.Any(), "kubectl", []string{
 		"scale", "deployment,statefulset",
 		"-l", fmt.Sprintf("%s=%s", helm.AppLabelKey, appID),
@@ -519,7 +590,7 @@ func setupKubeScaleMock(mockExec *executer.MockExecuter, appName, kubeconfigPath
 // returns the calls in order so callers can chain them with preceding/following expectations.
 // Uses gomock.Any() for the helm args to avoid depending on the OSExecutableResolver path.
 func setupHelmUpgradeMock(mockExec *executer.MockExecuter, mockRW *fileio.MockReadWriter, appName, kubeconfigPath string) []*gomock.Call {
-	namespace := helm.AppNamespace(nil, appName)
+	namespace := chartutil.AppNamespace(nil, appName)
 	versionCall := mockExec.EXPECT().ExecuteWithContext(gomock.Any(), "helm", gomock.Any()).Return("v3.14.0", "", 0)
 	getNamespaceCall := mockExec.EXPECT().ExecuteWithContext(gomock.Any(), "kubectl", []string{
 		"get", "namespace", namespace, "--kubeconfig", kubeconfigPath,

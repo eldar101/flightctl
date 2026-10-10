@@ -255,16 +255,18 @@ func updateServerSideDeviceUpdatedStatus(device *domain.Device, ctx context.Cont
 	}
 
 	// Override UpToDate if the device has an OS target it cannot satisfy.
-	// Requires capabilities.osMode to be reported; legacy devices without capabilities skip this check.
+	// Requires the OS mode to be reported; legacy devices without it skip this check.
+	// Prefer status.systemInfo.osMode, falling back to the deprecated
+	// status.capabilities.osMode for devices reported by older agents.
+	osMode := domain.DeviceStatusOsMode(device.Status)
 	if device.Status.Updated.Status == domain.DeviceUpdatedStatusUpToDate &&
-		device.Spec != nil && device.Spec.Os != nil &&
-		device.Status.Capabilities != nil && device.Status.Capabilities.OsMode != nil {
+		device.Spec != nil && device.Spec.Os != nil && osMode != nil {
 		hasOsTarget := device.Spec.Os.Image != "" || device.Spec.Os.CatalogItemRef != nil
 		if hasOsTarget {
 			if device.Spec.Os.Image != "" && device.Status.Os.Image != device.Spec.Os.Image {
 				device.Status.Updated.Status = domain.DeviceUpdatedStatusOutOfDate
 				device.Status.Updated.Info = lo.ToPtr(fmt.Sprintf("Device OS image mismatch: running %q, expected %q.", device.Status.Os.Image, device.Spec.Os.Image))
-			} else if *device.Status.Capabilities.OsMode == domain.OsModePackage &&
+			} else if *osMode == domain.OsModePackage &&
 				device.Spec.Os.CatalogItemRef != nil && device.Spec.Os.Image == "" {
 				device.Status.Updated.Status = domain.DeviceUpdatedStatusOutOfDate
 				device.Status.Updated.Info = lo.ToPtr("Device has a catalog OS target that cannot be satisfied.")
@@ -332,13 +334,17 @@ func KeepDBDeviceStatus(device, dbDevice *domain.Device) {
 	if device.Status.Integrity.Status == domain.DeviceIntegrityStatusUnknown {
 		device.Status.Integrity = dbDevice.Status.Integrity
 	}
-
 	// Preserve service-side statuses that should take precedence over agent-reported status
 	// These statuses are set by the service based on annotations and should not be overwritten
 	if dbDevice.Status.Summary.Status == domain.DeviceSummaryStatusAwaitingReconnect ||
 		dbDevice.Status.Summary.Status == domain.DeviceSummaryStatusConflictPaused {
 		device.Status.Summary.Status = dbDevice.Status.Summary.Status
 		device.Status.Summary.Info = dbDevice.Status.Summary.Info
+	}
+
+	// Preserve server-owned enrollment hook snapshot; the agent never reports this field.
+	if dbDevice.Status.EnrollmentHooks != nil {
+		device.Status.EnrollmentHooks = dbDevice.Status.EnrollmentHooks
 	}
 }
 
@@ -578,5 +584,46 @@ func EmitSpecValidEvents(ctx context.Context, device *domain.Device, oldConditio
 			message = newCondition.Message
 		}
 		createEvent(ctx, getDeviceSpecInvalidEvent(ctx, deviceName, message))
+	}
+}
+
+// EmitEnrollmentHookEvents emits events for EnrollmentHooks condition changes.
+// Events are selected based on the new condition reason:
+//   - Succeeded  → EnrollmentHookSucceeded
+//   - Failed     → EnrollmentHookFailed
+//   - ManualOverride → EnrollmentHookManualOverride
+//
+// NotifyFailed is emitted directly by the worker's notify path (not via condition diff).
+func EmitEnrollmentHookEvents(ctx context.Context, device *domain.Device, oldCondition, newCondition *domain.Condition,
+	createEvent func(context.Context, *domain.Event),
+	log logrus.FieldLogger,
+) {
+	deviceName := *device.Metadata.Name
+
+	if newCondition == nil {
+		return
+	}
+
+	log.Infof("Device %s: EnrollmentHooks transition: old=%v, new=%v/%s",
+		deviceName,
+		oldCondition != nil,
+		newCondition.Status,
+		newCondition.Reason,
+	)
+
+	switch newCondition.Reason {
+	case domain.EnrollmentHooksReasonSucceeded:
+		log.Infof("Device %s: Emitting EnrollmentHookSucceededEvent", deviceName)
+		createEvent(ctx, GetEnrollmentHookSucceededEvent(ctx, deviceName))
+	case domain.EnrollmentHooksReasonFailed:
+		log.Infof("Device %s: Emitting EnrollmentHookFailedEvent", deviceName)
+		message := "Unknown"
+		if newCondition.Message != "" {
+			message = newCondition.Message
+		}
+		createEvent(ctx, GetEnrollmentHookFailedEvent(ctx, deviceName, message))
+	case domain.EnrollmentHooksReasonManualOverride:
+		log.Infof("Device %s: Emitting EnrollmentHookManualOverrideEvent", deviceName)
+		createEvent(ctx, GetEnrollmentHookManualOverrideEvent(ctx, deviceName))
 	}
 }

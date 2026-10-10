@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -376,10 +377,11 @@ func (c *Client) V1Alpha1() *v1alpha1client.ClientWithResponses {
 
 // Start starts the token refresh loop if a refresher is configured.
 // The provided context is used as the parent context for the refresh loop.
-func (c *Client) Start(ctx context.Context) {
+func (c *Client) Start(ctx context.Context) error {
 	if c.refresher != nil {
-		c.refresher.Start(ctx)
+		return c.refresher.Start(ctx)
 	}
+	return nil
 }
 
 // Stop stops the token refresh loop if a refresher is configured.
@@ -414,10 +416,11 @@ type ImageBuilderClient struct {
 
 // Start starts the token refresh loop if a refresher is configured.
 // The provided context is used as the parent context for the refresh loop.
-func (c *ImageBuilderClient) Start(ctx context.Context) {
+func (c *ImageBuilderClient) Start(ctx context.Context) error {
 	if c.refresher != nil {
-		c.refresher.Start(ctx)
+		return c.refresher.Start(ctx)
 	}
+	return nil
 }
 
 // Stop stops the token refresh loop if a refresher is configured.
@@ -721,8 +724,8 @@ func addClientCertToTLSConfig(tlsConfig *tls.Config, config *Config) error {
 	return nil
 }
 
-// NewGRPCClientFromConfig returns a new gRPC Client from the given config.
-func NewGRPCClientFromConfig(config *Config, endpoint string) (grpc_v1.RouterServiceClient, error) {
+// dialGRPCFromConfig dials a gRPC connection using the given client config.
+func dialGRPCFromConfig(config *Config, endpoint string) (*grpc.ClientConn, error) {
 	grpcEndpoint := config.Service.Server
 	if endpoint != "" {
 		grpcEndpoint = endpoint
@@ -741,22 +744,21 @@ func NewGRPCClientFromConfig(config *Config, endpoint string) (grpc_v1.RouterSer
 	if string(config.Service.CertificateAuthorityData) != "" {
 		caPool, err := certutil.NewPoolFromBytes(config.Service.CertificateAuthorityData)
 		if err != nil {
-			return nil, fmt.Errorf("NewHTTPClientFromConfig: parsing CA certs: %w", err)
+			return nil, fmt.Errorf("dialGRPCFromConfig: parsing CA certs: %w", err)
 		}
 		tlsConfig.RootCAs = caPool
 	}
 
 	u, err := url.Parse(grpcEndpoint)
 	if err != nil {
-		return nil, fmt.Errorf("NewHTTPClientFromConfig: parsing CA certs: %w", err)
+		return nil, fmt.Errorf("dialGRPCFromConfig: parsing endpoint: %w", err)
 	}
-	tlsServerName := u.Hostname()
-	tlsConfig.ServerName = tlsServerName
+	tlsConfig.ServerName = u.Hostname()
 
 	if len(config.AuthInfo.ClientCertificateData) > 0 {
 		clientCert, err := tls.X509KeyPair(config.AuthInfo.ClientCertificateData, config.AuthInfo.ClientKeyData)
 		if err != nil {
-			return nil, fmt.Errorf("NewHTTPClientFromConfig: parsing client cert and key: %w", err)
+			return nil, fmt.Errorf("dialGRPCFromConfig: parsing client cert and key: %w", err)
 		}
 		tlsConfig.Certificates = []tls.Certificate{clientCert}
 	}
@@ -765,21 +767,36 @@ func NewGRPCClientFromConfig(config *Config, endpoint string) (grpc_v1.RouterSer
 	grpcEndpoint = strings.TrimPrefix(grpcEndpoint, "https://")
 	grpcEndpoint = strings.TrimSuffix(grpcEndpoint, "/")
 
-	client, err := grpc.NewClient(grpcEndpoint,
+	conn, err := grpc.NewClient(grpcEndpoint,
 		grpc.WithTransportCredentials(credentials.NewTLS(&tlsConfig)),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
 			Time:                30 * time.Second, // Send keepalive ping every 30s
 			Timeout:             10 * time.Second, // Wait 10s for server response
 			PermitWithoutStream: true,             // Send even if no active RPCs
 		}))
-
 	if err != nil {
-		return nil, fmt.Errorf("NewGRPCClientFromConfig: creating gRPC client: %w", err)
+		return nil, fmt.Errorf("dialGRPCFromConfig: creating gRPC client: %w", err)
 	}
+	return conn, nil
+}
 
-	router := grpc_v1.NewRouterServiceClient(client)
+// NewGRPCClientFromConfig returns a new gRPC RouterService client from the given config.
+func NewGRPCClientFromConfig(config *Config, endpoint string) (grpc_v1.RouterServiceClient, error) {
+	conn, err := dialGRPCFromConfig(config, endpoint)
+	if err != nil {
+		return nil, err
+	}
+	return grpc_v1.NewRouterServiceClient(conn), nil
+}
 
-	return router, nil
+// NewEnrollmentGRPCClientFromConfig returns a new gRPC Enrollment client from the given config.
+// The caller must Close the returned closer to release the underlying connection.
+func NewEnrollmentGRPCClientFromConfig(config *Config, endpoint string) (grpc_v1.EnrollmentClient, io.Closer, error) {
+	conn, err := dialGRPCFromConfig(config, endpoint)
+	if err != nil {
+		return nil, nil, err
+	}
+	return grpc_v1.NewEnrollmentClient(conn), conn, nil
 }
 
 // DefaultFlightctlClientConfigPath returns the default path to the Flight Control client config file.

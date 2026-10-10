@@ -17,6 +17,7 @@ import (
 	"github.com/flightctl/flightctl/internal/agent/device/fileio"
 	"github.com/flightctl/flightctl/internal/agent/device/systemd"
 	"github.com/flightctl/flightctl/internal/api/common"
+	"github.com/flightctl/flightctl/internal/appspec"
 	"github.com/flightctl/flightctl/internal/quadlet"
 	"github.com/flightctl/flightctl/pkg/log"
 	"github.com/flightctl/flightctl/pkg/userutil"
@@ -140,6 +141,7 @@ func newQuadletProvider(
 			ID:                appID,
 			User:              user,
 			AppType:           v1beta1.AppTypeQuadlet,
+			Image:             imageRef,
 			Path:              appPath,
 			EnvVars:           envVars,
 			QuadletApp:        &quadletApp,
@@ -296,7 +298,7 @@ func (p *quadletProvider) Install(ctx context.Context) error {
 		}
 	}
 
-	if err := writeENVFile(p.spec.Path, p.readWriter, p.spec.EnvVars); err != nil {
+	if err := writeENVFile(p.spec.Path, p.readWriter, p.spec.EnvVars, systemdEnvReplacer); err != nil {
 		return fmt.Errorf("writing env file: %w", err)
 	}
 
@@ -357,7 +359,7 @@ func (p *quadletProvider) collectOCITargets(ctx context.Context, configProvider 
 			ClientOptsFn: containerPullOptions(configProvider, p.spec.User),
 		})
 	} else {
-		quadletSpec, err := client.ParseQuadletReferencesFromSpec(p.inlineContent)
+		quadletSpec, err := appspec.ParseQuadletReferencesFromSpec(p.inlineContent)
 		if err != nil {
 			return nil, fmt.Errorf("parsing quadlet spec: %w", err)
 		}

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	deltaconfig "github.com/flightctl/flightctl/internal/delta_worker/config"
 	"github.com/flightctl/flightctl/internal/domain"
 	"github.com/flightctl/flightctl/internal/util"
 	"github.com/samber/lo"
@@ -503,13 +504,13 @@ deltaGeneration:
 
 func TestEffectiveMaxConcurrentDeltaGenerations(t *testing.T) {
 	t.Run("When config is omitted it should default to 2", func(t *testing.T) {
-		require.Equal(t, 2, (*DeltaGenerationConfig)(nil).EffectiveMaxConcurrentDeltaGenerations())
-		require.Equal(t, 2, (&DeltaGenerationConfig{}).EffectiveMaxConcurrentDeltaGenerations())
+		require.Equal(t, 2, (*deltaconfig.DeltaGenerationConfig)(nil).EffectiveMaxConcurrentDeltaGenerations())
+		require.Equal(t, 2, (&deltaconfig.DeltaGenerationConfig{}).EffectiveMaxConcurrentDeltaGenerations())
 	})
 
 	t.Run("When value is 0 or negative it should default to 2", func(t *testing.T) {
-		require.Equal(t, 2, (&DeltaGenerationConfig{MaxConcurrentDeltaGenerations: 0}).EffectiveMaxConcurrentDeltaGenerations())
-		require.Equal(t, 2, (&DeltaGenerationConfig{MaxConcurrentDeltaGenerations: -1}).EffectiveMaxConcurrentDeltaGenerations())
+		require.Equal(t, 2, (&deltaconfig.DeltaGenerationConfig{MaxConcurrentDeltaGenerations: 0}).EffectiveMaxConcurrentDeltaGenerations())
+		require.Equal(t, 2, (&deltaconfig.DeltaGenerationConfig{MaxConcurrentDeltaGenerations: -1}).EffectiveMaxConcurrentDeltaGenerations())
 	})
 
 	t.Run("When YAML sets maxConcurrentDeltaGenerations to 4 it should be 4", func(t *testing.T) {
@@ -527,19 +528,19 @@ deltaGeneration:
 	})
 
 	t.Run("When value exceeds the limit it should cap", func(t *testing.T) {
-		require.Equal(t, maxConcurrentDeltaGenerationsLimit, (&DeltaGenerationConfig{MaxConcurrentDeltaGenerations: 1000}).EffectiveMaxConcurrentDeltaGenerations())
+		require.Equal(t, 32, (&deltaconfig.DeltaGenerationConfig{MaxConcurrentDeltaGenerations: 1000}).EffectiveMaxConcurrentDeltaGenerations())
 	})
 }
 
 func TestEffectiveTimeout(t *testing.T) {
 	t.Run("When config is omitted it should default to 30m", func(t *testing.T) {
-		require.Equal(t, 30*time.Minute, (*DeltaGenerationConfig)(nil).EffectiveTimeout())
-		require.Equal(t, 30*time.Minute, (&DeltaGenerationConfig{}).EffectiveTimeout())
+		require.Equal(t, 30*time.Minute, (*deltaconfig.DeltaGenerationConfig)(nil).EffectiveTimeout())
+		require.Equal(t, 30*time.Minute, (&deltaconfig.DeltaGenerationConfig{}).EffectiveTimeout())
 	})
 
 	t.Run("When timeout is zero or negative it should default to 30m", func(t *testing.T) {
-		require.Equal(t, 30*time.Minute, (&DeltaGenerationConfig{Timeout: 0}).EffectiveTimeout())
-		require.Equal(t, 30*time.Minute, (&DeltaGenerationConfig{Timeout: util.Duration(-1)}).EffectiveTimeout())
+		require.Equal(t, 30*time.Minute, (&deltaconfig.DeltaGenerationConfig{Timeout: 0}).EffectiveTimeout())
+		require.Equal(t, 30*time.Minute, (&deltaconfig.DeltaGenerationConfig{Timeout: util.Duration(-1)}).EffectiveTimeout())
 	})
 
 	t.Run("When YAML sets timeout to 15m it should be 15m", func(t *testing.T) {
@@ -553,18 +554,59 @@ deltaGeneration:
 	})
 }
 
+func TestEffectiveMaxWaitForDelta(t *testing.T) {
+	t.Run("When config is omitted it should return nil deadline", func(t *testing.T) {
+		require.Nil(t, (*deltaconfig.DeltaGenerationConfig)(nil).EffectiveMaxWaitForDelta())
+		require.Nil(t, (&deltaconfig.DeltaGenerationConfig{}).EffectiveMaxWaitForDelta())
+	})
+
+	t.Run("When YAML omits maxWaitForDelta it should return nil deadline", func(t *testing.T) {
+		path := writeTempConfig(t, `
+deltaGeneration:
+  timeout: 15m
+`)
+		cfg, err := Load(path)
+		require.NoError(t, err)
+		require.Nil(t, cfg.DeltaGeneration.EffectiveMaxWaitForDelta())
+	})
+
+	t.Run("When YAML sets maxWaitForDelta to 0s it should return a zero deadline", func(t *testing.T) {
+		path := writeTempConfig(t, `
+deltaGeneration:
+  maxWaitForDelta: 0s
+`)
+		cfg, err := Load(path)
+		require.NoError(t, err)
+		got := cfg.DeltaGeneration.EffectiveMaxWaitForDelta()
+		require.NotNil(t, got)
+		require.Equal(t, time.Duration(0), *got)
+	})
+
+	t.Run("When YAML sets maxWaitForDelta to 10m it should return 10m", func(t *testing.T) {
+		path := writeTempConfig(t, `
+deltaGeneration:
+  maxWaitForDelta: 10m
+`)
+		cfg, err := Load(path)
+		require.NoError(t, err)
+		got := cfg.DeltaGeneration.EffectiveMaxWaitForDelta()
+		require.NotNil(t, got)
+		require.Equal(t, 10*time.Minute, *got)
+	})
+}
+
 func TestDefaultRepositoryConfigOciRepoSpec(t *testing.T) {
 	t.Run("When registry is empty it should return nil", func(t *testing.T) {
-		spec, err := (&DefaultRepositoryConfig{}).OciRepoSpec()
+		spec, err := (&deltaconfig.DefaultRepositoryConfig{}).OciRepoSpec()
 		require.NoError(t, err)
 		require.Nil(t, spec)
-		spec, err = (*DefaultRepositoryConfig)(nil).OciRepoSpec()
+		spec, err = (*deltaconfig.DefaultRepositoryConfig)(nil).OciRepoSpec()
 		require.NoError(t, err)
 		require.Nil(t, spec)
 	})
 
 	t.Run("When username and password are set it should carry Docker auth", func(t *testing.T) {
-		spec, err := (&DefaultRepositoryConfig{
+		spec, err := (&deltaconfig.DefaultRepositoryConfig{
 			Registry:   "my-registry.com",
 			Repository: lo.ToPtr("my-org/diffs"),
 			Username:   "delta-user",
@@ -583,7 +625,7 @@ func TestDefaultRepositoryConfigOciRepoSpec(t *testing.T) {
 	})
 
 	t.Run("When scheme is set it should copy it onto the OCI spec", func(t *testing.T) {
-		spec, err := (&DefaultRepositoryConfig{
+		spec, err := (&deltaconfig.DefaultRepositoryConfig{
 			Registry: "my-registry.com",
 			Scheme:   lo.ToPtr("http"),
 		}).OciRepoSpec()
@@ -593,22 +635,28 @@ func TestDefaultRepositoryConfigOciRepoSpec(t *testing.T) {
 		require.Nil(t, spec.OciAuth)
 	})
 
-	t.Run("When only username is set it should omit OCI auth", func(t *testing.T) {
-		spec, err := (&DefaultRepositoryConfig{
+	t.Run("When only username is set it should return an error", func(t *testing.T) {
+		_, err := (&deltaconfig.DefaultRepositoryConfig{
 			Registry: "my-registry.com",
 			Username: "delta-user",
 		}).OciRepoSpec()
-		require.NoError(t, err)
-		require.NotNil(t, spec)
-		require.Nil(t, spec.OciAuth)
+		require.ErrorContains(t, err, "username and password must be configured together")
+	})
+
+	t.Run("When only password is set it should return an error", func(t *testing.T) {
+		_, err := (&deltaconfig.DefaultRepositoryConfig{
+			Registry: "my-registry.com",
+			Password: "delta-pass",
+		}).OciRepoSpec()
+		require.ErrorContains(t, err, "username and password must be configured together")
 	})
 }
 
 func TestConfig_String_RedactsDeltaGenerationDefaultRepositoryCaCrt(t *testing.T) {
 	caCrt := "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0t"
 	cfg := &Config{
-		DeltaGeneration: &DeltaGenerationConfig{
-			DefaultRepository: &DefaultRepositoryConfig{
+		DeltaGeneration: &deltaconfig.DeltaGenerationConfig{
+			DefaultRepository: &deltaconfig.DefaultRepositoryConfig{
 				Registry: "my-registry.com",
 				CaCrt:    lo.ToPtr(caCrt),
 			},
@@ -631,8 +679,8 @@ func TestConfig_String_RedactsDeltaGenerationDefaultRepositoryCaCrt(t *testing.T
 func TestValidateDeltaGenerationDefaultRepository(t *testing.T) {
 	t.Run("When only registry is set and invalid it should fail", func(t *testing.T) {
 		cfg := NewDefault()
-		cfg.DeltaGeneration = &DeltaGenerationConfig{
-			DefaultRepository: &DefaultRepositoryConfig{
+		cfg.DeltaGeneration = &deltaconfig.DeltaGenerationConfig{
+			DefaultRepository: &deltaconfig.DefaultRepositoryConfig{
 				Registry: "not a valid host",
 			},
 		}
@@ -641,8 +689,8 @@ func TestValidateDeltaGenerationDefaultRepository(t *testing.T) {
 
 	t.Run("When repository and namespace are both set it should fail", func(t *testing.T) {
 		cfg := NewDefault()
-		cfg.DeltaGeneration = &DeltaGenerationConfig{
-			DefaultRepository: &DefaultRepositoryConfig{
+		cfg.DeltaGeneration = &deltaconfig.DeltaGenerationConfig{
+			DefaultRepository: &deltaconfig.DefaultRepositoryConfig{
 				Registry:   "my-registry.com",
 				Repository: lo.ToPtr("my-org/diffs"),
 				Namespace:  lo.ToPtr("my-org"),
@@ -653,8 +701,8 @@ func TestValidateDeltaGenerationDefaultRepository(t *testing.T) {
 
 	t.Run("When credentials are set without registry it should fail", func(t *testing.T) {
 		cfg := NewDefault()
-		cfg.DeltaGeneration = &DeltaGenerationConfig{
-			DefaultRepository: &DefaultRepositoryConfig{
+		cfg.DeltaGeneration = &deltaconfig.DeltaGenerationConfig{
+			DefaultRepository: &deltaconfig.DefaultRepositoryConfig{
 				Username: "delta-user",
 				Password: "delta-pass",
 			},
@@ -664,8 +712,8 @@ func TestValidateDeltaGenerationDefaultRepository(t *testing.T) {
 
 	t.Run("When scheme is invalid it should fail", func(t *testing.T) {
 		cfg := NewDefault()
-		cfg.DeltaGeneration = &DeltaGenerationConfig{
-			DefaultRepository: &DefaultRepositoryConfig{
+		cfg.DeltaGeneration = &deltaconfig.DeltaGenerationConfig{
+			DefaultRepository: &deltaconfig.DefaultRepositoryConfig{
 				Registry: "my-registry.com",
 				Scheme:   lo.ToPtr("ftp"),
 			},
@@ -675,8 +723,8 @@ func TestValidateDeltaGenerationDefaultRepository(t *testing.T) {
 
 	t.Run("When repository is set without registry it should fail", func(t *testing.T) {
 		cfg := NewDefault()
-		cfg.DeltaGeneration = &DeltaGenerationConfig{
-			DefaultRepository: &DefaultRepositoryConfig{
+		cfg.DeltaGeneration = &deltaconfig.DeltaGenerationConfig{
+			DefaultRepository: &deltaconfig.DefaultRepositoryConfig{
 				Repository: lo.ToPtr("my-org/diffs"),
 			},
 		}
@@ -685,8 +733,8 @@ func TestValidateDeltaGenerationDefaultRepository(t *testing.T) {
 
 	t.Run("When namespace is set without registry it should fail", func(t *testing.T) {
 		cfg := NewDefault()
-		cfg.DeltaGeneration = &DeltaGenerationConfig{
-			DefaultRepository: &DefaultRepositoryConfig{
+		cfg.DeltaGeneration = &deltaconfig.DeltaGenerationConfig{
+			DefaultRepository: &deltaconfig.DefaultRepositoryConfig{
 				Namespace: lo.ToPtr("my-org"),
 			},
 		}
@@ -695,8 +743,8 @@ func TestValidateDeltaGenerationDefaultRepository(t *testing.T) {
 
 	t.Run("When skipServerVerification is set without registry it should fail", func(t *testing.T) {
 		cfg := NewDefault()
-		cfg.DeltaGeneration = &DeltaGenerationConfig{
-			DefaultRepository: &DefaultRepositoryConfig{
+		cfg.DeltaGeneration = &deltaconfig.DeltaGenerationConfig{
+			DefaultRepository: &deltaconfig.DefaultRepositoryConfig{
 				SkipServerVerification: lo.ToPtr(true),
 			},
 		}
@@ -705,8 +753,8 @@ func TestValidateDeltaGenerationDefaultRepository(t *testing.T) {
 
 	t.Run("When registry is invalid it should fail", func(t *testing.T) {
 		cfg := NewDefault()
-		cfg.DeltaGeneration = &DeltaGenerationConfig{
-			DefaultRepository: &DefaultRepositoryConfig{
+		cfg.DeltaGeneration = &deltaconfig.DeltaGenerationConfig{
+			DefaultRepository: &deltaconfig.DefaultRepositoryConfig{
 				Registry:   "not a valid host",
 				Repository: lo.ToPtr("my-org/diffs"),
 			},
@@ -716,12 +764,83 @@ func TestValidateDeltaGenerationDefaultRepository(t *testing.T) {
 
 	t.Run("When only repository is set it should pass", func(t *testing.T) {
 		cfg := NewDefault()
-		cfg.DeltaGeneration = &DeltaGenerationConfig{
-			DefaultRepository: &DefaultRepositoryConfig{
+		cfg.DeltaGeneration = &deltaconfig.DeltaGenerationConfig{
+			DefaultRepository: &deltaconfig.DefaultRepositoryConfig{
 				Registry:   "my-registry.com",
 				Repository: lo.ToPtr("my-org/diffs"),
 			},
 		}
 		require.NoError(t, Validate(cfg))
 	})
+}
+
+func TestValidateImageBuilderWorkerTimeouts(t *testing.T) {
+	tests := []struct {
+		name          string
+		imageTimeout  time.Duration
+		wantErrorText string
+	}{
+		{
+			name:          "When imageBuilderTimeout is zero it should fail",
+			imageTimeout:  0,
+			wantErrorText: "imageBuilderWorker.imageBuilderTimeout must be greater than 0",
+		},
+		{
+			name:          "When imageBuilderTimeout is negative it should fail",
+			imageTimeout:  -time.Second,
+			wantErrorText: "imageBuilderWorker.imageBuilderTimeout must be greater than 0",
+		},
+		{
+			name:         "When imageBuilderTimeout is positive it should pass",
+			imageTimeout: 5 * time.Minute,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := NewDefault()
+			cfg.ImageBuilderWorker.ImageBuilderTimeout = util.Duration(tt.imageTimeout)
+
+			err := Validate(cfg)
+			if tt.wantErrorText == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorContains(t, err, tt.wantErrorText)
+		})
+	}
+}
+
+func TestValidatePeriodicLabelMappingScanTaskConfig(t *testing.T) {
+	tests := []struct {
+		name          string
+		pageSize      *int
+		timeBudget    *util.Duration
+		wantErrorText string
+	}{
+		{name: "When mapping scan settings are omitted it should pass"},
+		{name: "When page size is one it should pass", pageSize: lo.ToPtr(1)},
+		{name: "When page size is the maximum it should pass", pageSize: lo.ToPtr(1000)},
+		{name: "When time budget is positive it should pass", timeBudget: lo.ToPtr(util.Duration(time.Second))},
+		{name: "When page size is zero it should fail", pageSize: lo.ToPtr(0), wantErrorText: "periodic.tasks.labelMappingScan.pageSize must be between 1 and 1000"},
+		{name: "When page size is negative it should fail", pageSize: lo.ToPtr(-1), wantErrorText: "periodic.tasks.labelMappingScan.pageSize must be between 1 and 1000"},
+		{name: "When page size exceeds the device list maximum it should fail", pageSize: lo.ToPtr(1001), wantErrorText: "periodic.tasks.labelMappingScan.pageSize must be between 1 and 1000"},
+		{name: "When explicit time budget is zero it should fail", timeBudget: lo.ToPtr(util.Duration(0)), wantErrorText: "periodic.tasks.labelMappingScan.timeBudget must be greater than 0"},
+		{name: "When explicit time budget is negative it should fail", timeBudget: lo.ToPtr(util.Duration(-time.Second)), wantErrorText: "periodic.tasks.labelMappingScan.timeBudget must be greater than 0"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &Config{Periodic: &periodicConfig{Tasks: periodicTasksConfig{LabelMappingScan: periodicLabelMappingScanTaskConfig{
+				PageSize:   tc.pageSize,
+				TimeBudget: tc.timeBudget,
+			}}}}
+
+			err := Validate(cfg)
+			if tc.wantErrorText == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorContains(t, err, tc.wantErrorText)
+		})
+	}
 }

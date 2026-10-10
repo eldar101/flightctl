@@ -54,6 +54,7 @@ type DeviceListParams struct {
 
 type Store interface {
 	InitialMigration(ctx context.Context) error
+	WithTransaction(ctx context.Context, fn func(ctx context.Context) error) error
 
 	// Exposed to users
 	// Create inserts a device. Duplicate names return ErrDuplicateName.
@@ -71,8 +72,14 @@ type Store interface {
 	// UpdateStatus writes status + resource_version only (service_conditions unchanged).
 	// previous is optional (first attempt only). No events; caller uses before/updated.
 	UpdateStatus(ctx context.Context, orgId uuid.UUID, device *domain.Device, previous *domain.Device) (updated *domain.Device, before *domain.Device, err error)
+	// ReplaceServiceOwnedStatus updates service-owned status fields without
+	// replacing the device's desired state or agent-owned status.
+	ReplaceServiceOwnedStatus(ctx context.Context, orgId uuid.UUID, device *domain.Device) (updated *domain.Device, before *domain.Device, err error)
 	// UpdateAnnotations merges annotations (and applies deleteKeys) via Mutate.
 	UpdateAnnotations(ctx context.Context, orgId uuid.UUID, name string, annotations map[string]string, deleteKeys []string) error
+	GetLabelSnapshot(ctx context.Context, orgId uuid.UUID, name string) (domain.DeviceLabelSnapshot, error)
+	GetLabelSyncMappingIDsByKeys(ctx context.Context, orgId uuid.UUID, labelKeys []string) (map[string][]uuid.UUID, error)
+	ApplyLabels(ctx context.Context, orgId uuid.UUID, name string, snapshot domain.DeviceLabelSnapshot, desired map[string]domain.DesiredDeviceLabel, condition *domain.Condition) (domain.DeviceLabelApplyResult, error)
 	Get(ctx context.Context, orgId uuid.UUID, name string) (*domain.Device, error)
 	List(ctx context.Context, orgId uuid.UUID, listParams DeviceListParams) (*domain.DeviceList, error)
 	Labels(ctx context.Context, orgId uuid.UUID, listParams store.ListParams) (domain.LabelList, error)
@@ -83,6 +90,7 @@ type Store interface {
 	GetLastSeen(ctx context.Context, orgId uuid.UUID, name string) (*time.Time, error)
 
 	// Used internally
+	ClearDeltaPreparingIfCurrent(ctx context.Context, orgID uuid.UUID, name string, generation int64) (bool, error)
 	OverwriteRepositoryRefs(ctx context.Context, orgId uuid.UUID, name string, repositoryNames ...string) error
 	GetRepositoryRefs(ctx context.Context, orgId uuid.UUID, name string) (*domain.RepositoryList, error)
 	RemoveConflictPausedAnnotation(ctx context.Context, orgId uuid.UUID, listParams store.ListParams) (int64, []string, error)
@@ -116,12 +124,63 @@ type DeviceStore struct {
 	genericStore *store.GenericStore[*model.Device, model.Device, domain.Device, domain.DeviceList]
 }
 
-// DeviceRendered holds rendered_* column values not represented on domain.Device.
-// When set on DeviceMutation, Mutate persists them and bumps render_timestamp.
+// DeviceRendered holds rendered_* column values and control-plane estimates
+// that are not represented directly on domain.Device. When set on
+// DeviceMutation, Mutate persists them and bumps render_timestamp.
 type DeviceRendered struct {
 	Config       string
 	Applications string
 	OsImage      string
+	// DeltaImage is the control-plane hint stored in the rendered OS spec.
+	DeltaImage     *string
+	DeltaEstimates *DeviceDeltaEstimates
+}
+
+// DeviceDeltaEstimates carries control-plane size estimates through a render
+// mutation into the service-owned status store.
+type DeviceDeltaEstimates struct {
+	OSDeltaSize           *string
+	ApplicationDeltaSizes map[string]*string
+}
+
+func renderedOsSpec(rendered *DeviceRendered) domain.DeviceOsSpec {
+	if rendered == nil {
+		return domain.DeviceOsSpec{}
+	}
+	return domain.DeviceOsSpec{Image: rendered.OsImage, DeltaImage: rendered.DeltaImage}
+}
+
+func applyRenderedDeltaEstimates(device *model.Device, estimates *DeviceDeltaEstimates) {
+	if device == nil {
+		return
+	}
+	serviceConditions := model.ServiceConditions{}
+	if device.ServiceConditions != nil {
+		serviceConditions = device.ServiceConditions.Data
+	}
+
+	storedEstimates := &model.DeviceDeltaEstimates{}
+	if estimates != nil {
+		if estimates.OSDeltaSize != nil {
+			deltaSize := *estimates.OSDeltaSize
+			storedEstimates.OS = &model.DeviceDeltaEstimate{DeltaSize: &deltaSize}
+		}
+		if len(estimates.ApplicationDeltaSizes) > 0 {
+			storedEstimates.Applications = make(map[string]model.DeviceDeltaEstimate, len(estimates.ApplicationDeltaSizes))
+			for application, deltaSize := range estimates.ApplicationDeltaSizes {
+				if deltaSize == nil {
+					continue
+				}
+				copiedDeltaSize := *deltaSize
+				storedEstimates.Applications[application] = model.DeviceDeltaEstimate{DeltaSize: &copiedDeltaSize}
+			}
+		}
+	}
+	if storedEstimates.OS == nil && len(storedEstimates.Applications) == 0 {
+		storedEstimates = nil
+	}
+	serviceConditions.DeltaEstimates = storedEstimates
+	device.ServiceConditions = model.MakeJSONField(serviceConditions)
 }
 
 // DeviceMutation is the unit apply mutates. Handlers decide all field changes.
@@ -153,6 +212,25 @@ func (m *DeviceMutation) Clone() (store.ResourceMutation[domain.Device], error) 
 	}
 	if m.Rendered != nil {
 		rendered := *m.Rendered
+		if m.Rendered.DeltaEstimates != nil {
+			estimates := *m.Rendered.DeltaEstimates
+			if estimates.ApplicationDeltaSizes != nil {
+				estimates.ApplicationDeltaSizes = make(map[string]*string, len(m.Rendered.DeltaEstimates.ApplicationDeltaSizes))
+				for application, deltaSize := range m.Rendered.DeltaEstimates.ApplicationDeltaSizes {
+					if deltaSize == nil {
+						estimates.ApplicationDeltaSizes[application] = nil
+						continue
+					}
+					copiedDeltaSize := *deltaSize
+					estimates.ApplicationDeltaSizes[application] = &copiedDeltaSize
+				}
+			}
+			if estimates.OSDeltaSize != nil {
+				copiedDeltaSize := *estimates.OSDeltaSize
+				estimates.OSDeltaSize = &copiedDeltaSize
+			}
+			rendered.DeltaEstimates = &estimates
+		}
 		out.Rendered = &rendered
 	}
 	return out, nil
@@ -171,7 +249,10 @@ func (m *DeviceMutation) RequireExisting() error {
 type DeviceApplyFunc func(m *DeviceMutation) error
 
 type mutateConfig struct {
-	withTimestamp bool
+	withTimestamp                        bool
+	allowDecommissionManagedLabelCleanup bool
+	preserveOmittedManagedLabels         bool
+	explicitLabelRemovalPaths            map[string]struct{}
 }
 
 // MutateOption configures DeviceStore.Mutate.
@@ -182,6 +263,27 @@ type MutateOption func(*mutateConfig)
 func WithTimestamp() MutateOption {
 	return func(c *mutateConfig) {
 		c.withTimestamp = true
+	}
+}
+
+// WithDecommissionManagedLabelCleanup allows decommission to remove all labels
+// owned by mappings. The update still has to set lifecycle to Decommissioning
+// and clear every device label.
+func WithDecommissionManagedLabelCleanup() MutateOption {
+	return func(c *mutateConfig) {
+		c.allowDecommissionManagedLabelCleanup = true
+	}
+}
+
+// WithManagedLabelMapReplacement preserves omitted mapping-owned labels during
+// a whole-map device label replacement, except for explicitly removed paths.
+func WithManagedLabelMapReplacement(explicitRemovalPaths []string) MutateOption {
+	return func(c *mutateConfig) {
+		c.preserveOmittedManagedLabels = true
+		c.explicitLabelRemovalPaths = make(map[string]struct{}, len(explicitRemovalPaths))
+		for _, path := range explicitRemovalPaths {
+			c.explicitLabelRemovalPaths[path] = struct{}{}
+		}
 	}
 }
 
@@ -199,7 +301,7 @@ var _ store.ResourceMutation[domain.Device] = (*DeviceMutation)(nil)
 // Make sure we conform to the Store interface
 var _ Store = (*DeviceStore)(nil)
 
-func NewDeviceStore(db *gorm.DB, log logrus.FieldLogger) Store {
+func NewDeviceStore(db *gorm.DB, log logrus.FieldLogger) *DeviceStore {
 	genericStore := store.NewGenericStore[*model.Device, model.Device, domain.Device, domain.DeviceList](
 		db,
 		log,
@@ -208,6 +310,63 @@ func NewDeviceStore(db *gorm.DB, log logrus.FieldLogger) Store {
 		model.DevicesToApiResource,
 	)
 	return &DeviceStore{dbHandler: db, log: log, genericStore: genericStore}
+}
+
+// ResumeDeltaIfCurrent clears the device's delta-preparing state only when
+// its desired spec generation still matches the prepare. The preparing condition is
+// part of the predicate so a redelivered completion event cannot claim the
+// same resource twice.
+func (s *DeviceStore) ResumeDeltaIfCurrent(ctx context.Context, orgID uuid.UUID, name string, generation int64) (bool, error) {
+	return s.clearDeltaPreparingIfCurrent(ctx, orgID, name, generation, true)
+}
+
+// ClearDeltaPreparingIfCurrent also matches an already-cleared marker, allowing
+// a deadline retry to recover its resume event after a process failure.
+func (s *DeviceStore) ClearDeltaPreparingIfCurrent(ctx context.Context, orgID uuid.UUID, name string, generation int64) (bool, error) {
+	return s.clearDeltaPreparingIfCurrent(ctx, orgID, name, generation, false)
+}
+
+func (s *DeviceStore) clearDeltaPreparingIfCurrent(ctx context.Context, orgID uuid.UUID, name string, generation int64, requirePreparing bool) (bool, error) {
+	if generation <= 0 {
+		return false, nil
+	}
+	result := s.getDB(ctx).Exec(`
+		UPDATE devices
+		SET service_conditions = (
+				jsonb_set(
+					COALESCE(service_conditions, '{}'::jsonb),
+					'{conditions}',
+					COALESCE((
+						SELECT jsonb_agg(condition_json ORDER BY ordinal)
+						FROM jsonb_array_elements(COALESCE(service_conditions->'conditions', '[]'::jsonb))
+							WITH ORDINALITY AS condition_rows(condition_json, ordinal)
+						WHERE condition_json->>'type' <> @condition_type
+					), '[]'::jsonb),
+					true
+				)
+				- 'deltaGeneration'
+			),
+			resource_version = resource_version + 1
+		WHERE org_id = @org_id
+		  AND name = @name
+		  AND deleted_at IS NULL
+		  AND generation = @generation
+		  AND (NOT @require_preparing OR EXISTS (
+				SELECT 1
+				FROM jsonb_array_elements(COALESCE(service_conditions->'conditions', '[]'::jsonb)) AS condition_rows(condition_json)
+				WHERE condition_json->>'type' = @condition_type
+		  ))
+	`, map[string]interface{}{
+		"org_id":            orgID,
+		"name":              name,
+		"generation":        generation,
+		"require_preparing": requirePreparing,
+		"condition_type":    string(domain.ConditionTypeDeviceDeltaPreparing),
+	})
+	if result.Error != nil {
+		return false, store.ErrorFromGormError(result.Error)
+	}
+	return result.RowsAffected > 0, nil
 }
 
 func (s *DeviceStore) callEventCallback(ctx context.Context, eventCallback store.EventCallback, orgId uuid.UUID, name string, oldDevice, newDevice *domain.Device, created bool, err error) {
@@ -221,7 +380,11 @@ func (s *DeviceStore) callEventCallback(ctx context.Context, eventCallback store
 }
 
 func (s *DeviceStore) getDB(ctx context.Context) *gorm.DB {
-	return s.dbHandler.WithContext(ctx)
+	return store.DB(ctx, s.dbHandler)
+}
+
+func (s *DeviceStore) WithTransaction(ctx context.Context, fn func(ctx context.Context) error) error {
+	return store.WithTransaction(ctx, s.dbHandler, fn)
 }
 
 func (s *DeviceStore) SetIntegrationTestCreateOrUpdateCallback(c store.IntegrationTestCallback) {
@@ -292,6 +455,10 @@ func (s *DeviceStore) InitialMigration(ctx context.Context) error {
 	}
 
 	if err := s.createDeviceVolumeCatalogRefIndex(db); err != nil {
+		return err
+	}
+
+	if err := s.createDeviceSystemInfoOsModeIndex(db); err != nil {
 		return err
 	}
 
@@ -431,6 +598,21 @@ func (s *DeviceStore) createDeviceVolumeCatalogRefIndex(db *gorm.DB) error {
 		WHERE deleted_at IS NULL`).Error
 }
 
+// createDeviceSystemInfoOsModeIndex creates an expression index on
+// devices(status->'systemInfo'->>'osMode') so that the
+// "status.systemInfo.osMode" field selector can use an index scan. The GIN
+// index on the whole "status" column does not index this extracted text
+// expression, so without this index PostgreSQL falls back to a sequential scan
+// of the devices table on large fleets.
+func (s *DeviceStore) createDeviceSystemInfoOsModeIndex(db *gorm.DB) error {
+	if db.Dialector.Name() != "postgres" {
+		return nil
+	}
+	return db.Exec(`CREATE INDEX IF NOT EXISTS idx_devices_system_info_os_mode
+		ON devices ((status->'systemInfo'->>'osMode'))
+		WHERE deleted_at IS NULL`).Error
+}
+
 func (s *DeviceStore) createDeviceLabelsTrigger(db *gorm.DB) error {
 	if db.Dialector.Name() == "postgres" {
 		triggerSQL := `
@@ -542,7 +724,7 @@ func (s *DeviceStore) Mutate(ctx context.Context, orgId uuid.UUID, name string, 
 		},
 		PersistUpdate: func(ctx context.Context, orgId uuid.UUID, _ string, before *domain.Device, m store.ResourceMutation[domain.Device]) (bool, error) {
 			dm := m.(*DeviceMutation)
-			return s.Update(ctx, orgId, before, dm.Device, dm.Rendered, dm.PreserveGeneration)
+			return s.update(ctx, orgId, before, dm.Device, dm.Rendered, dm.PreserveGeneration, cfg)
 		},
 	}
 	if cfg.withTimestamp {
@@ -561,7 +743,8 @@ func (s *DeviceStore) Mutate(ctx context.Context, orgId uuid.UUID, name string, 
 }
 
 // UpdateStatus writes only status + resource_version so service_conditions
-// (SpecValid, DependencySync, …) are left intact. previous is optional (first attempt).
+// (SpecValid, DependencySync, delta estimates, …) are left intact. previous is
+// optional (first attempt).
 func (s *DeviceStore) UpdateStatus(ctx context.Context, orgId uuid.UUID, device *domain.Device, previous *domain.Device) (*domain.Device, *domain.Device, error) {
 	if device == nil {
 		return nil, nil, flterrors.ErrResourceIsNil
@@ -572,6 +755,7 @@ func (s *DeviceStore) UpdateStatus(ctx context.Context, orgId uuid.UUID, device 
 	if err != nil {
 		return nil, nil, err
 	}
+	fromAPI.OrgID = orgId
 
 	var before, updated *domain.Device
 	attempt := 0
@@ -596,14 +780,16 @@ func (s *DeviceStore) UpdateStatus(ctx context.Context, orgId uuid.UUID, device 
 		if rvErr != nil {
 			return false, flterrors.ErrIllegalResourceVersionFormat
 		}
-		// Only OrgID/Name are needed for GORM to target the row by primary key; no need to
-		// convert the rest of current (spec, labels, annotations, ...).
-		existing := &model.Device{Resource: model.Resource{OrgID: orgId, Name: name}}
-
-		result := s.getDB(ctx).Model(existing).Where("resource_version = ?", rv).Updates(map[string]interface{}{
-			"status":           fromAPI.Status,
-			"resource_version": gorm.Expr("resource_version + 1"),
-		})
+		// Return the stored service conditions with the CAS update so the API
+		// response can merge estimates with the new agent status without a read.
+		var returned model.Device
+		result := s.getDB(ctx).Model(&returned).
+			Where("org_id = ? AND name = ? AND resource_version = ?", orgId, name, rv).
+			Clauses(clause.Returning{Columns: []clause.Column{{Name: "service_conditions"}}}).
+			Updates(map[string]interface{}{
+				"status":           fromAPI.Status,
+				"resource_version": gorm.Expr("resource_version + 1"),
+			})
 		if result.Error != nil {
 			err := store.ErrorFromGormError(result.Error)
 			return strings.Contains(err.Error(), "deadlock"), err
@@ -611,15 +797,50 @@ func (s *DeviceStore) UpdateStatus(ctx context.Context, orgId uuid.UUID, device 
 		if result.RowsAffected == 0 {
 			return true, flterrors.ErrNoRowsUpdated
 		}
-		// Shallow copy: Metadata is a value type, so reassigning next.Metadata.ResourceVersion
-		// below doesn't touch before.Metadata.ResourceVersion; Status is fully replaced, not
-		// mutated in place.
+		statusModel := &model.Device{
+			Status:            fromAPI.Status,
+			ServiceConditions: returned.ServiceConditions,
+		}
+		mergedStatusResource, err := statusModel.ToApiResource()
+		if err != nil {
+			return false, err
+		}
 		next := *current
-		next.Status = device.Status
+		next.Status = mergedStatusResource.Status
+		if next.Status != nil && device.Status != nil {
+			next.Status.LastSeen = device.Status.LastSeen
+		}
 		next.Metadata.ResourceVersion = lo.ToPtr(strconv.FormatInt(rv+1, 10))
 		updated = &next
 		return false, nil
 	})
+	return updated, before, err
+}
+
+// ReplaceServiceOwnedStatus persists the service-owned portions of a device's
+// status while retaining the rest of the resource from the CAS-fresh row.
+// Callers provide a device loaded by the service layer and may update service
+// conditions (for example, delta-preparing) without changing the desired spec
+// or agent-owned status fields.
+func (s *DeviceStore) ReplaceServiceOwnedStatus(ctx context.Context, orgId uuid.UUID, device *domain.Device) (*domain.Device, *domain.Device, error) {
+	if device == nil || device.Metadata.Name == nil {
+		return nil, nil, flterrors.ErrResourceIsNil
+	}
+	name := *device.Metadata.Name
+	updated, before, _, err := s.Mutate(ctx, orgId, name, nil, func(m *DeviceMutation) error {
+		if err := m.RequireExisting(); err != nil {
+			return err
+		}
+		if device.Status == nil {
+			return nil
+		}
+		if m.Device.Status == nil {
+			m.Device.Status = &domain.DeviceStatus{}
+		}
+		m.Device.Status.Conditions = device.Status.Conditions
+		m.Device.Status.DeltaGeneration = device.Status.DeltaGeneration
+		return nil
+	}, WithTimestamp())
 	return updated, before, err
 }
 
@@ -660,8 +881,9 @@ func (s *DeviceStore) Create(ctx context.Context, orgId uuid.UUID, device *domai
 			apps = "[]"
 		}
 		deviceModel.RenderedApplications = model.MakeJSONField(json.RawMessage(apps))
-		deviceModel.RenderedOs = model.MakeJSONField(domain.DeviceOsSpec{Image: rendered.OsImage})
+		deviceModel.RenderedOs = model.MakeJSONField(renderedOsSpec(rendered))
 		deviceModel.RenderTimestamp = time.Now()
+		applyRenderedDeltaEstimates(deviceModel, rendered.DeltaEstimates)
 	}
 
 	result := s.getDB(ctx).Create(deviceModel)
@@ -674,6 +896,10 @@ func (s *DeviceStore) Create(ctx context.Context, orgId uuid.UUID, device *domai
 // Update writes a device update. Returns retry=true on lost optimistic lock / deadlock.
 // rendered is optional; when nil, rendered_* columns are left unchanged.
 func (s *DeviceStore) Update(ctx context.Context, orgId uuid.UUID, before, device *domain.Device, rendered *DeviceRendered, preserveGeneration bool) (bool, error) {
+	return s.update(ctx, orgId, before, device, rendered, preserveGeneration, &mutateConfig{})
+}
+
+func (s *DeviceStore) update(ctx context.Context, orgId uuid.UUID, before, device *domain.Device, rendered *DeviceRendered, preserveGeneration bool, cfg *mutateConfig) (bool, error) {
 	existing, err := model.NewDeviceFromApiResource(before)
 	if err != nil {
 		return false, err
@@ -685,6 +911,24 @@ func (s *DeviceStore) Update(ctx context.Context, orgId uuid.UUID, before, devic
 		return false, err
 	}
 	fromAPI.OrgID = orgId
+	if cfg.preserveOmittedManagedLabels {
+		if err := s.preserveOmittedManagedLabels(ctx, orgId, existing, fromAPI, device, cfg.explicitLabelRemovalPaths); err != nil {
+			return false, err
+		}
+	}
+	if rendered != nil {
+		applyRenderedDeltaEstimates(fromAPI, rendered.DeltaEstimates)
+	} else {
+		preserveDeltaEstimatesFromSnapshot(fromAPI, existing)
+	}
+	var renderedStatus *domain.DeviceStatus
+	if rendered != nil {
+		updatedResource, err := fromAPI.ToApiResource()
+		if err != nil {
+			return false, err
+		}
+		renderedStatus = updatedResource.Status
+	}
 
 	// Prefer API-level Spec comparison so generation tracks the same Spec delta
 	// that event emission uses (HasSameSpecAs alone can miss union/ref changes
@@ -721,10 +965,18 @@ func (s *DeviceStore) Update(ctx context.Context, orgId uuid.UUID, before, devic
 		}
 		updates["rendered_config"] = &cfg
 		updates["rendered_applications"] = &apps
-		updates["rendered_os"] = model.MakeJSONField(domain.DeviceOsSpec{Image: rendered.OsImage})
+		updates["rendered_os"] = model.MakeJSONField(renderedOsSpec(rendered))
 		updates["render_timestamp"] = time.Now()
 	}
 
+	decommissionCleanup := cfg.allowDecommissionManagedLabelCleanup && device != nil &&
+		device.Status != nil && device.Status.Lifecycle.Status == domain.DeviceLifecycleStatusDecommissioning &&
+		len(lo.FromPtr(device.Metadata.Labels)) == 0
+	if !decommissionCleanup {
+		if err := s.rejectManagedLabelChanges(ctx, orgId, existing.Name, map[string]string(existing.Labels), map[string]string(fromAPI.Labels)); err != nil {
+			return false, err
+		}
+	}
 	result := s.getDB(ctx).Model(existing).Where("resource_version = ?", lo.FromPtr(existing.ResourceVersion)).Updates(updates)
 	if result.Error != nil {
 		err := store.ErrorFromGormError(result.Error)
@@ -734,9 +986,33 @@ func (s *DeviceStore) Update(ctx context.Context, orgId uuid.UUID, before, devic
 		return true, flterrors.ErrNoRowsUpdated
 	}
 
+	if renderedStatus != nil {
+		if device.Status != nil {
+			renderedStatus.LastSeen = device.Status.LastSeen
+		}
+		device.Status = renderedStatus
+	}
 	device.Metadata.Generation = lo.ToPtr(generation)
 	device.Metadata.ResourceVersion = lo.ToPtr(strconv.FormatInt(lo.FromPtr(existing.ResourceVersion)+1, 10))
 	return false, nil
+}
+
+// preserveDeltaEstimatesFromSnapshot keeps delta estimates service-owned for
+// non-render updates, including when the stored snapshot has no estimates.
+func preserveDeltaEstimatesFromSnapshot(updated, existing *model.Device) {
+	serviceConditions := model.ServiceConditions{}
+	if updated.ServiceConditions != nil {
+		serviceConditions = updated.ServiceConditions.Data
+	}
+	// Copy the value unconditionally: nil in the snapshot must clear any
+	// caller-supplied estimates extracted from the mutated API status. The
+	// resource-version check retries if the snapshot changed during this update.
+	if existing != nil && existing.ServiceConditions != nil {
+		serviceConditions.DeltaEstimates = existing.ServiceConditions.Data.DeltaEstimates
+	} else {
+		serviceConditions.DeltaEstimates = nil
+	}
+	updated.ServiceConditions = model.MakeJSONField(serviceConditions)
 }
 
 func (s *DeviceStore) getWithTimestamp(ctx context.Context, orgId uuid.UUID, name string, opts ...model.APIResourceOption) (*domain.Device, error) {
@@ -959,10 +1235,33 @@ func (s *DeviceStore) Labels(ctx context.Context, orgId uuid.UUID, listParams st
 }
 
 func (s *DeviceStore) Delete(ctx context.Context, orgId uuid.UUID, name string, eventCallback store.EventCallback) (bool, error) {
-	deleted, err := s.genericStore.Delete(
-		ctx,
-		model.Device{Resource: model.Resource{OrgID: orgId, Name: name}},
-		store.Resource{Table: "enrollment_requests", OrgID: orgId.String(), Name: name})
+	var rowsAffected int64
+	err := s.getDB(ctx).Transaction(func(innerTx *gorm.DB) error {
+		// Delete the device
+		result := innerTx.Unscoped().Delete(&model.Device{Resource: model.Resource{OrgID: orgId, Name: name}})
+		if result.Error != nil {
+			return store.ErrorFromGormError(result.Error)
+		}
+		rowsAffected = result.RowsAffected
+
+		// Delete associated enrollment requests
+		if err := innerTx.Unscoped().
+			Table("enrollment_requests").
+			Where("org_id = ? AND name = ? AND spec IS NOT NULL", orgId.String(), name).
+			Delete(nil).Error; err != nil {
+			return store.ErrorFromGormError(err)
+		}
+
+		// Purge enrollment hook notify secrets (uses device_name, not name)
+		if err := innerTx.
+			Where("org_id = ? AND device_name = ?", orgId, name).
+			Delete(&model.EnrollmentHookNotifySecret{}).Error; err != nil {
+			return store.ErrorFromGormError(err)
+		}
+
+		return nil
+	})
+	deleted := err == nil && rowsAffected != 0
 	if deleted && eventCallback != nil {
 		s.callEventCallback(ctx, eventCallback, orgId, name, nil, nil, false, err)
 	}
@@ -1152,7 +1451,7 @@ func (s *DeviceStore) Summary(ctx context.Context, orgId uuid.UUID, listParams s
 		"status.applicationsSummary.status",
 		"status.summary.status",
 		"status.updated.status",
-		"status.capabilities.osMode")
+		store.OsModeStatusSelector)
 	if err != nil {
 		return nil, store.ErrorFromGormError(err)
 	}
@@ -1160,7 +1459,7 @@ func (s *DeviceStore) Summary(ctx context.Context, orgId uuid.UUID, listParams s
 	applicationStatus := statusCount.List("status.applicationsSummary.status")
 	summaryStatus := statusCount.List("status.summary.status")
 	updateStatus := statusCount.List("status.updated.status")
-	osModeStatus := statusCount.List("status.capabilities.osMode")
+	osModeStatus := statusCount.List(store.OsModeStatusSelector)
 	return &domain.DevicesSummary{
 		Total:             devicesCount,
 		ApplicationStatus: applicationStatus,
@@ -1429,16 +1728,16 @@ func (s *DeviceStore) ListDevicesByServiceCondition(ctx context.Context, orgId u
 	var nextContinue *string
 	var numRemaining *int64
 
+	// Decommissioning devices are outside mapping rollouts and may retain stale conditions until deletion.
 	// Build the raw SQL query with proper pagination support for JSONB
 	baseSQL := `
 		SELECT * FROM devices
 		WHERE org_id = ?
 			AND deleted_at IS NULL
+			AND spec->'decommissioning' IS NULL
 			AND service_conditions IS NOT NULL
-			AND EXISTS (
-				SELECT 1 FROM jsonb_array_elements(service_conditions->'conditions') AS elem
-				WHERE elem->>'type' = ? AND elem->>'status' = ?
-			)`
+			AND (service_conditions->'conditions') @>
+				jsonb_build_array(jsonb_build_object('type', ?::text, 'status', ?::text))`
 
 	// Handle pagination - add WHERE condition before ORDER BY
 	var args []interface{}
@@ -1469,11 +1768,11 @@ func (s *DeviceStore) ListDevicesByServiceCondition(ctx context.Context, orgId u
 			SELECT COUNT(*) FROM devices
 			WHERE org_id = ?
 				AND deleted_at IS NULL
+				AND spec->'decommissioning' IS NULL
 				AND service_conditions IS NOT NULL
-				AND EXISTS (
-					SELECT 1 FROM jsonb_array_elements(service_conditions->'conditions') AS elem
-					WHERE elem->>'type' = ? AND elem->>'status' = ?
-				) AND name > ?`
+				AND (service_conditions->'conditions') @>
+					jsonb_build_array(jsonb_build_object('type', ?::text, 'status', ?::text))
+				AND name > ?`
 
 		countArgs := []interface{}{orgId, conditionType, conditionStatus, devices[len(devices)-1].Name}
 		if err := s.getDB(ctx).Raw(countSQL, countArgs...).Scan(&count).Error; err != nil {

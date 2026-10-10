@@ -3,11 +3,15 @@ package systeminfo
 import (
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
+	"github.com/ccoveille/go-safecast"
+	"github.com/flightctl/flightctl/api/core/v1beta1"
 	"github.com/flightctl/flightctl/internal/agent/device/fileio"
 	"github.com/flightctl/flightctl/pkg/log"
+	"github.com/samber/lo"
 	"sigs.k8s.io/yaml"
 )
 
@@ -87,7 +91,7 @@ func collectGPUInfo(log *log.PrefixLogger, reader fileio.Reader, mappingFile str
 		if err != nil {
 			log.Debugf("Could not read vendor ID for device %s: %v", entry.Name(), err)
 		} else {
-			gpuDevice.VendorID = strings.TrimSpace(string(vendorIDBytes))
+			gpuDevice.PCIVendorID = strings.TrimSpace(string(vendorIDBytes))
 		}
 
 		// device ID
@@ -96,7 +100,7 @@ func collectGPUInfo(log *log.PrefixLogger, reader fileio.Reader, mappingFile str
 		if err != nil {
 			log.Debugf("Could not read device ID for device %s: %v", entry.Name(), err)
 		} else {
-			gpuDevice.DeviceID = strings.TrimSpace(string(deviceIDBytes))
+			gpuDevice.PCIDeviceID = strings.TrimSpace(string(deviceIDBytes))
 		}
 
 		// revision ID
@@ -105,17 +109,17 @@ func collectGPUInfo(log *log.PrefixLogger, reader fileio.Reader, mappingFile str
 		if err != nil {
 			log.Debugf("Could not read revision ID for device %s: %v", entry.Name(), err)
 		} else {
-			gpuDevice.RevisionID = strings.TrimSpace(string(revisionIDBytes))
+			gpuDevice.PCIRevisionID = strings.TrimSpace(string(revisionIDBytes))
 		}
 
 		// use mapping information if available
-		if pciMappings != nil && gpuDevice.VendorID != "" {
-			if vendor, ok := pciMappings[gpuDevice.VendorID]; ok {
+		if pciMappings != nil && gpuDevice.PCIVendorID != "" {
+			if vendor, ok := pciMappings[gpuDevice.PCIVendorID]; ok {
 				gpuDevice.Vendor = vendor.VendorName
 
-				if gpuDevice.DeviceID != "" {
+				if gpuDevice.PCIDeviceID != "" {
 					for _, model := range vendor.Models {
-						if model.PCIID == gpuDevice.DeviceID {
+						if model.PCIID == gpuDevice.PCIDeviceID {
 							gpuDevice.Model = model.PCIName
 
 							if model.MemoryBytes > 0 {
@@ -164,6 +168,9 @@ func collectGPUInfo(log *log.PrefixLogger, reader fileio.Reader, mappingFile str
 		index++
 	}
 
+	platformGPUs := collectPlatformGPUs(log, reader, index)
+	gpu = append(gpu, platformGPUs...)
+
 	return gpu, nil
 }
 
@@ -205,6 +212,110 @@ func isGPU(classCode string) bool {
 	}
 
 	return false
+}
+
+type platformGPUInfo struct {
+	Vendor string
+	Model  string
+	Arch   string
+}
+
+func lookupPlatformGPU(compatible string) (platformGPUInfo, bool) {
+	switch compatible {
+	case "nvidia,gm20b":
+		return platformGPUInfo{Vendor: "NVIDIA", Model: "GM20B", Arch: "Maxwell"}, true
+	case "nvidia,gp10b":
+		return platformGPUInfo{Vendor: "NVIDIA", Model: "GP10B", Arch: "Pascal"}, true
+	case "nvidia,gv11b":
+		return platformGPUInfo{Vendor: "NVIDIA", Model: "GV11B", Arch: "Volta"}, true
+	case "nvidia,ga10b":
+		return platformGPUInfo{Vendor: "NVIDIA", Model: "GA10B", Arch: "Ampere"}, true
+	default:
+		return platformGPUInfo{}, false
+	}
+}
+
+// collectPlatformGPUs scans platform bus devices for integrated GPUs identified
+// by Device Tree compatible strings (e.g. NVIDIA Jetson SoC GPUs).
+func collectPlatformGPUs(log *log.PrefixLogger, reader fileio.Reader, startIndex int) []GPUDeviceInfo {
+	entries, err := reader.ReadDir(platformDevicesPath)
+	if err != nil {
+		log.Tracef("Could not read platform devices directory: %v", err)
+		return nil
+	}
+
+	var gpus []GPUDeviceInfo
+	for _, entry := range entries {
+		devicePath := filepath.Join(platformDevicesPath, entry.Name())
+		ueventPath := filepath.Join(devicePath, "uevent")
+
+		ueventBytes, err := reader.ReadFile(ueventPath)
+		if err != nil {
+			continue
+		}
+
+		uevent := parseUevent(ueventBytes)
+		if uevent["OF_NAME"] != "gpu" {
+			continue
+		}
+
+		var matched platformGPUInfo
+		var matchedCompat string
+		for i := 0; ; i++ {
+			key := fmt.Sprintf("OF_COMPATIBLE_%d", i)
+			compat, ok := uevent[key]
+			if !ok {
+				break
+			}
+			if info, found := lookupPlatformGPU(compat); found {
+				matched = info
+				matchedCompat = compat
+				break
+			}
+		}
+
+		gpu := GPUDeviceInfo{
+			Index: startIndex,
+		}
+
+		if matchedCompat != "" {
+			gpu.Vendor = matched.Vendor
+			gpu.Model = matched.Model
+			gpu.Arch = matched.Arch
+			gpu.PCIDeviceID = matchedCompat
+		} else {
+			log.Tracef("Platform device %s has OF_NAME=gpu but no known compatible string", entry.Name())
+			compat := uevent["OF_COMPATIBLE_0"]
+			gpu.PCIDeviceID = compat
+			// Per devicetree spec, compatible strings use "manufacturer,model" format
+			if vendor, model, ok := strings.Cut(compat, ","); ok {
+				gpu.Vendor = vendor
+				gpu.Model = model
+			}
+		}
+		gpu.MemoryBytes = getGPUMemory(devicePath, reader, log)
+
+		gpus = append(gpus, gpu)
+		startIndex++
+	}
+
+	return gpus
+}
+
+func parseUevent(data []byte) map[string]string {
+	result := make(map[string]string)
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		result[parts[0]] = parts[1]
+	}
+	return result
 }
 
 // getGPUMemory attempts to retrieve GPU memory information using simple, vendor-agnostic approaches best effort.
@@ -253,4 +364,70 @@ func getGPUMemory(devicePath string, reader fileio.Reader, log *log.PrefixLogger
 	}
 
 	return 0 // No memory info found
+}
+
+// collectGPUSystemInfo returns the structured GPU inventory for the system info.
+// GPUs are enumerated even when the "gpu" info key is not configured so the GPU
+// inventory is always reported. When the GPU collector already ran (the "gpu"
+// info key is configured) its cached result is reused instead of re-scanning.
+//
+// It returns nil on scan failure so the caller can preserve the previously
+// cached inventory: reporting an empty list would be indistinguishable from a
+// successful scan that found zero GPUs and would incorrectly clear the reported
+// GPU inventory.
+func collectGPUSystemInfo(log *log.PrefixLogger, reader fileio.Reader, hardwareMapPath string, info *Info) *[]v1beta1.DeviceGpu {
+	gpus := info.Hardware.GPU
+	if gpus == nil {
+		// The GPU collector did not run (the "gpu" info key is not configured),
+		// so enumerate GPUs directly. Collection is best effort.
+		collected, err := collectGPUInfo(log, reader, hardwareMapPath)
+		if err != nil {
+			log.Warnf("Failed to collect GPU info for system info: %v", err)
+			return nil
+		}
+		gpus = collected
+	}
+	return toDeviceSystemInfoGPUs(gpus)
+}
+
+// toDeviceSystemInfoGPUs converts the collected GPU inventory into the API GPU
+// list. The returned pointer is always non-nil (possibly an empty list) so the
+// GPU inventory is reported deterministically.
+func toDeviceSystemInfoGPUs(gpus []GPUDeviceInfo) *[]v1beta1.DeviceGpu {
+	out := make([]v1beta1.DeviceGpu, 0, len(gpus))
+	for _, gpu := range gpus {
+		entry := v1beta1.DeviceGpu{Index: int32(gpu.Index)}
+		if gpu.PCIAddress != "" {
+			entry.PciAddress = lo.ToPtr(gpu.PCIAddress)
+		}
+		if gpu.Vendor != "" {
+			entry.Vendor = lo.ToPtr(gpu.Vendor)
+		}
+		if gpu.Model != "" {
+			entry.Model = lo.ToPtr(gpu.Model)
+		}
+		if gpu.PCIDeviceID != "" {
+			entry.PciDeviceId = lo.ToPtr(gpu.PCIDeviceID)
+		}
+		if gpu.PCIVendorID != "" {
+			entry.PciVendorId = lo.ToPtr(gpu.PCIVendorID)
+		}
+		if gpu.PCIRevisionID != "" {
+			entry.PciRevisionId = lo.ToPtr(gpu.PCIRevisionID)
+		}
+		if gpu.Arch != "" {
+			entry.Arch = lo.ToPtr(gpu.Arch)
+		}
+		if len(gpu.Features) > 0 {
+			entry.Features = lo.ToPtr(slices.Clone(gpu.Features))
+		}
+		if gpu.MemoryBytes > 0 {
+			// Guard the uint64 -> int64 conversion against overflow.
+			if mem, err := safecast.ToInt64(gpu.MemoryBytes); err == nil {
+				entry.MemoryBytes = lo.ToPtr(mem)
+			}
+		}
+		out = append(out, entry)
+	}
+	return &out
 }

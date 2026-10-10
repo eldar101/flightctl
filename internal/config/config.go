@@ -16,7 +16,6 @@ import (
 	deltaconfig "github.com/flightctl/flightctl/internal/delta_worker/config"
 	"github.com/flightctl/flightctl/internal/org"
 	"github.com/flightctl/flightctl/internal/util"
-	"github.com/flightctl/flightctl/internal/util/validation"
 	"sigs.k8s.io/yaml"
 )
 
@@ -232,7 +231,7 @@ type serviceImagesConfig struct {
 
 const (
 	defaultPodmanImage            = "quay.io/podman/stable:v5.7.1"
-	defaultBootcImageBuilderImage = "quay.io/centos-bootc/bootc-image-builder@sha256:773019f6b11766ca48170a4a7bf898be4268f3c2acfd0ec1db612408b3092a90"
+	defaultBootcImageBuilderImage = "ghcr.io/osbuild/bootc-image-builder@sha256:e7aadce6b3f5639cd47d83354791931ea219891a0d113c2fe74a0f0d352b165c"
 	defaultSyftImage              = "docker.io/anchore/syft:v1.44.0"
 )
 
@@ -410,21 +409,30 @@ func (c *imageBuilderWorkerConfig) EffectiveSyftSkipTLSVerify() bool {
 
 const DefaultVirtLauncherImage = "quay.io/kubevirt/virt-launcher:v1.9.0"
 
-// DefaultRenderTimeout is the default time budget for a single device render
-// operation (config + application rendering + DB writes). It replaces the
-// shared EventProcessingTimeout for render tasks so that devices with
-// multiple VM applications have enough time for sequential vm-to-quadlet
-// subprocess invocations.
-const DefaultRenderTimeout = 60 * time.Second
+const (
+	// DefaultRenderTimeout is the default time budget for a single device render
+	// operation (config + application rendering + DB writes). It replaces the
+	// shared EventProcessingTimeout for render tasks so devices with multiple VM
+	// applications have enough time for sequential vm-to-quadlet subprocesses.
+	DefaultRenderTimeout = 60 * time.Second
+	// DefaultImageDigestCacheTTL is the default maximum age for cached OCI image
+	// digest resolutions used during delta preparation.
+	DefaultImageDigestCacheTTL = 15 * time.Minute
+	// DefaultHelmImageRefsCacheTTL is the default maximum age for cached Helm
+	// workload image references before the target chart is rendered again.
+	DefaultHelmImageRefsCacheTTL = 15 * time.Minute
+)
 
-// workerConfig holds configuration for the flightctl-worker service.
+// workerConfig holds runtime options shared by flightctl-worker and flightctl-delta-worker.
 type workerConfig struct {
-	RenderTimeout util.Duration   `json:"renderTimeout,omitempty"`
-	VmRender      *vmRenderConfig `json:"vmRender,omitempty"`
+	RenderTimeout         util.Duration   `json:"renderTimeout,omitempty"`
+	ImageDigestCacheTTL   util.Duration   `json:"imageDigestCacheTTL,omitempty"`
+	HelmImageRefsCacheTTL util.Duration   `json:"helmImageRefsCacheTTL,omitempty"`
+	VmRender              *vmRenderConfig `json:"vmRender,omitempty"`
 }
 
-// vmRenderConfig holds options for converting VmApplications to Quadlet units
-// via vm-to-quadlet.
+// vmRenderConfig holds shared options for converting VmApplications to Quadlet
+// units via vm-to-quadlet in both worker services.
 type vmRenderConfig struct {
 	LauncherImage    string            `json:"launcherImage,omitempty"`
 	LauncherImages   map[string]string `json:"launcherImages,omitempty"`
@@ -435,6 +443,8 @@ type vmRenderConfig struct {
 func NewDefaultWorkerConfig() *workerConfig {
 	passt := false
 	return &workerConfig{
+		ImageDigestCacheTTL:   util.Duration(DefaultImageDigestCacheTTL),
+		HelmImageRefsCacheTTL: util.Duration(DefaultHelmImageRefsCacheTTL),
 		VmRender: &vmRenderConfig{
 			LauncherImage:    DefaultVirtLauncherImage,
 			PasstWorkarounds: &passt,
@@ -468,6 +478,22 @@ func (c *Config) EffectiveRenderTimeout() time.Duration {
 	return c.Worker.EffectiveRenderTimeout()
 }
 
+// EffectiveImageDigestCacheTTL returns the maximum age for cached resolved image digests.
+func (c *Config) EffectiveImageDigestCacheTTL() time.Duration {
+	if c == nil || c.Worker == nil {
+		return DefaultImageDigestCacheTTL
+	}
+	return c.Worker.EffectiveImageDigestCacheTTL()
+}
+
+// EffectiveHelmImageRefsCacheTTL returns the maximum age for cached Helm workload image references.
+func (c *Config) EffectiveHelmImageRefsCacheTTL() time.Duration {
+	if c == nil || c.Worker == nil {
+		return DefaultHelmImageRefsCacheTTL
+	}
+	return c.Worker.EffectiveHelmImageRefsCacheTTL()
+}
+
 // EffectiveLauncherImage returns the virt-launcher image for osKey.
 func (c *workerConfig) EffectiveLauncherImage(osKey string) string {
 	if c == nil || c.VmRender == nil {
@@ -498,6 +524,22 @@ func (c *workerConfig) EffectiveRenderTimeout() time.Duration {
 		return time.Duration(c.RenderTimeout)
 	}
 	return DefaultRenderTimeout
+}
+
+// EffectiveImageDigestCacheTTL returns the configured image digest cache TTL.
+func (c *workerConfig) EffectiveImageDigestCacheTTL() time.Duration {
+	if c != nil && c.ImageDigestCacheTTL > 0 {
+		return time.Duration(c.ImageDigestCacheTTL)
+	}
+	return DefaultImageDigestCacheTTL
+}
+
+// EffectiveHelmImageRefsCacheTTL returns the configured Helm image refs cache TTL.
+func (c *workerConfig) EffectiveHelmImageRefsCacheTTL() time.Duration {
+	if c != nil && c.HelmImageRefsCacheTTL > 0 {
+		return time.Duration(c.HelmImageRefsCacheTTL)
+	}
+	return DefaultHelmImageRefsCacheTTL
 }
 
 // IsSBOMEnabled returns whether SBOM generation is enabled.
@@ -571,6 +613,7 @@ type authConfig struct {
 	InsecureSkipTlsVerify   bool                       `json:"insecureSkipTlsVerify,omitempty"`
 	PAMOIDCIssuer           *PAMOIDCIssuer             `json:"pamOidcIssuer,omitempty"`           // this is the issuer implementation configuration
 	DynamicProviderCacheTTL util.Duration              `json:"dynamicProviderCacheTTL,omitempty"` // TTL for dynamic auth provider cache (default: 5s)
+	AAPIdentityCacheTTL     util.Duration              `json:"aapIdentityCacheTTL,omitempty"`     // TTL for AAP identity cache (default: 45s)
 }
 
 // PAMOIDCIssuer represents an OIDC issuer that uses Linux PAM for authentication
@@ -769,6 +812,12 @@ type periodicTaskConfig struct {
 	Schedule periodicTaskScheduleConfig `json:"schedule,omitempty"`
 }
 
+type periodicLabelMappingScanTaskConfig struct {
+	Schedule   periodicTaskScheduleConfig `json:"schedule,omitempty"`
+	PageSize   *int                       `json:"pageSize,omitempty"`
+	TimeBudget *util.Duration             `json:"timeBudget,omitempty"`
+}
+
 type periodicTasksConfig struct {
 	ResourceSync periodicTaskConfig `json:"resourceSync,omitempty"`
 	// DependencySync overrides the interval for both the dependency-sync-git and
@@ -777,6 +826,9 @@ type periodicTasksConfig struct {
 	// RepositoryTester overrides the interval for the repository-tester periodic task,
 	// which probes Repository resources and sets their Accessible condition.
 	RepositoryTester periodicTaskConfig `json:"repositoryTester,omitempty"`
+	// DeltaPrepareDeadline overrides the interval for the delta prepare deadline sweep.
+	DeltaPrepareDeadline periodicTaskConfig                 `json:"deltaPrepareDeadline,omitempty"`
+	LabelMappingScan     periodicLabelMappingScanTaskConfig `json:"labelMappingScan,omitempty"`
 }
 
 type periodicConfig struct {
@@ -805,6 +857,18 @@ const DefaultDependenciesSyncPollInterval = 15 * time.Minute
 // newly added refs are discovered quickly and partial failures are retried
 // within minutes rather than waiting for the full poll interval.
 const DefaultDependencySyncTaskInterval = 3 * time.Minute
+
+// DefaultLabelMappingScanTaskInterval controls how often mapping scans run.
+const DefaultLabelMappingScanTaskInterval = 2 * time.Minute
+
+const (
+	// DefaultLabelMappingScanPageSize is the device page size used when unset.
+	DefaultLabelMappingScanPageSize = 1000
+	// DefaultLabelMappingScanTimeBudget is the per-invocation work budget when unset.
+	DefaultLabelMappingScanTimeBudget = 30 * time.Second
+	// MaxLabelMappingScanPageSize matches the device-list API maximum.
+	MaxLabelMappingScanPageSize = 1000
+)
 
 // GetDependenciesSyncPollInterval returns the configured poll interval, or the default if unset.
 func (c *Config) GetDependenciesSyncPollInterval() time.Duration {
@@ -921,13 +985,6 @@ type QuayConfig struct {
 	SkipTLSVerify bool `json:"skipTlsVerify,omitempty"`
 }
 
-type DeltaGenerationConfig = deltaconfig.DeltaGenerationConfig
-type DefaultRepositoryConfig = deltaconfig.DefaultRepositoryConfig
-
-// Kept for source compatibility with the configuration package tests while
-// the implementation lives with the delta worker.
-const maxConcurrentDeltaGenerationsLimit = 32
-
 // TrustifyConfig holds Trustify API connection and authentication details.
 type TrustifyConfig struct {
 	// Endpoint is the Trustify API base URL (e.g. "https://trustify.example.com").
@@ -1019,6 +1076,7 @@ func WithOIDCAuth(issuer, clientId string, enabled bool) ConfigOption {
 		if c.Auth == nil {
 			c.Auth = &authConfig{
 				DynamicProviderCacheTTL: util.Duration(5 * time.Second),
+				AAPIdentityCacheTTL:     util.Duration(45 * time.Second),
 			}
 		}
 		c.Auth.OIDC = &api.OIDCProviderSpec{
@@ -1036,6 +1094,7 @@ func WithOAuth2Auth(authorizationUrl, tokenUrl, userinfoUrl, issuer, clientId st
 		if c.Auth == nil {
 			c.Auth = &authConfig{
 				DynamicProviderCacheTTL: util.Duration(5 * time.Second),
+				AAPIdentityCacheTTL:     util.Duration(45 * time.Second),
 			}
 		}
 		c.Auth.OAuth2 = &api.OAuth2ProviderSpec{
@@ -1055,6 +1114,7 @@ func WithK8sAuth(apiUrl, rbacNs string) ConfigOption {
 		if c.Auth == nil {
 			c.Auth = &authConfig{
 				DynamicProviderCacheTTL: util.Duration(5 * time.Second),
+				AAPIdentityCacheTTL:     util.Duration(45 * time.Second),
 			}
 		}
 		enabled := true
@@ -1072,6 +1132,7 @@ func WithAAPAuth(apiUrl, externalApiUrl string) ConfigOption {
 		if c.Auth == nil {
 			c.Auth = &authConfig{
 				DynamicProviderCacheTTL: util.Duration(5 * time.Second),
+				AAPIdentityCacheTTL:     util.Duration(45 * time.Second),
 			}
 		}
 		enabled := true
@@ -1219,6 +1280,7 @@ func NewDefault(opts ...ConfigOption) *Config {
 		},
 		Auth: &authConfig{
 			DynamicProviderCacheTTL: util.Duration(5 * time.Second),
+			AAPIdentityCacheTTL:     util.Duration(45 * time.Second),
 		},
 		Encryption: &EncryptionConfig{
 			Keys: []EncryptionKeyConfig{
@@ -1740,10 +1802,11 @@ func Validate(cfg *Config) error {
 		}
 	}
 
-	if cfg.ImageBuilderWorker != nil {
-		if time.Duration(cfg.ImageBuilderWorker.TimeoutCheckTaskInterval) <= 0 {
-			return fmt.Errorf("imageBuilderWorker.timeoutCheckTaskInterval must be greater than 0")
-		}
+	if err := validateImageBuilderWorker(cfg.ImageBuilderWorker); err != nil {
+		return err
+	}
+	if err := validatePeriodicLabelMappingScanTask(cfg); err != nil {
+		return err
 	}
 
 	if err := validateDeltaGeneration(cfg); err != nil {
@@ -1767,40 +1830,38 @@ func Validate(cfg *Config) error {
 	return nil
 }
 
-func validateDeltaGeneration(cfg *Config) error {
-	if cfg.DeltaGeneration == nil || cfg.DeltaGeneration.DefaultRepository == nil {
+func validatePeriodicLabelMappingScanTask(cfg *Config) error {
+	if cfg.Periodic == nil {
 		return nil
 	}
-	d := cfg.DeltaGeneration.DefaultRepository
-	repoSet := d.Repository != nil && strings.TrimSpace(*d.Repository) != ""
-	nsSet := d.Namespace != nil && strings.TrimSpace(*d.Namespace) != ""
-	schemeSet := d.Scheme != nil && strings.TrimSpace(*d.Scheme) != ""
-	caSet := d.CaCrt != nil && strings.TrimSpace(*d.CaCrt) != ""
-	skipSet := d.SkipServerVerification != nil
-	credsSet := d.Username != "" || d.Password != ""
-	anySet := strings.TrimSpace(d.Registry) != "" || repoSet || nsSet || schemeSet || caSet || skipSet || credsSet
-	if anySet {
-		if errs := validation.ValidateHostIPOrFQDNWithOptionalPort(&d.Registry, "deltaGeneration.defaultRepository.registry"); len(errs) > 0 {
-			return errs[0]
-		}
+	settings := cfg.Periodic.Tasks.LabelMappingScan
+	if settings.PageSize != nil && (*settings.PageSize < 1 || *settings.PageSize > MaxLabelMappingScanPageSize) {
+		return fmt.Errorf("periodic.tasks.labelMappingScan.pageSize must be between 1 and %d", MaxLabelMappingScanPageSize)
 	}
-	if repoSet && nsSet {
-		return fmt.Errorf("deltaGeneration.defaultRepository.repository and namespace are mutually exclusive")
-	}
-	if d.Scheme != nil && *d.Scheme != "" && *d.Scheme != "http" && *d.Scheme != "https" {
-		return fmt.Errorf("deltaGeneration.defaultRepository.scheme must be http or https")
-	}
-	if repoSet {
-		if errs := validation.ValidateString(d.Repository, "deltaGeneration.defaultRepository.repository", 1, 255, validation.OciImageNameRegexp, validation.OciImageNameFmt); len(errs) > 0 {
-			return errs[0]
-		}
-	}
-	if nsSet {
-		if errs := validation.ValidateString(d.Namespace, "deltaGeneration.defaultRepository.namespace", 1, 255, validation.OciImageNameRegexp, validation.OciImageNameFmt); len(errs) > 0 {
-			return errs[0]
-		}
+	if settings.TimeBudget != nil && time.Duration(*settings.TimeBudget) <= 0 {
+		return fmt.Errorf("periodic.tasks.labelMappingScan.timeBudget must be greater than 0")
 	}
 	return nil
+}
+
+func validateImageBuilderWorker(cfg *imageBuilderWorkerConfig) error {
+	if cfg == nil {
+		return nil
+	}
+	if time.Duration(cfg.ImageBuilderTimeout) <= 0 {
+		return fmt.Errorf("imageBuilderWorker.imageBuilderTimeout must be greater than 0")
+	}
+	if time.Duration(cfg.TimeoutCheckTaskInterval) <= 0 {
+		return fmt.Errorf("imageBuilderWorker.timeoutCheckTaskInterval must be greater than 0")
+	}
+	return nil
+}
+
+func validateDeltaGeneration(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	return cfg.DeltaGeneration.Validate()
 }
 
 func validateAuthProviderRoleAssignment(roleAssignment api.AuthRoleAssignment, providerType string) error {

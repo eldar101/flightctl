@@ -16,8 +16,10 @@ import (
 	"github.com/flightctl/flightctl/internal/healthchecker"
 	"github.com/flightctl/flightctl/internal/kvstore"
 	"github.com/flightctl/flightctl/internal/rendered"
+	deviceservice "github.com/flightctl/flightctl/internal/service/device"
 	"github.com/flightctl/flightctl/internal/store"
 	devicestore "github.com/flightctl/flightctl/internal/store/device"
+	labelsyncmappingstore "github.com/flightctl/flightctl/internal/store/labelsyncmapping"
 	"github.com/flightctl/flightctl/internal/util"
 	"github.com/flightctl/flightctl/pkg/queues"
 	"github.com/google/uuid"
@@ -68,6 +70,245 @@ var _ = Describe("Device Application Status Events Integration Tests", func() {
 		}
 		return nil
 	}
+
+	Context("Agent status liveness", func() {
+		It("should persist lastSeen before connectivity reconciliation can mark the device disconnected", func() {
+			deviceName := "agent-status-last-seen-refresh"
+			_, status := suite.Device.CreateDevice(suite.Ctx, suite.OrgID, api.Device{
+				Metadata: api.ObjectMeta{Name: lo.ToPtr(deviceName)},
+				Spec:     &api.DeviceSpec{},
+			})
+			Expect(status.Code).To(Equal(int32(201)))
+
+			before, err := suite.DeviceStore.GetLastSeen(suite.Ctx, suite.OrgID, deviceName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(before).To(BeNil())
+
+			_, status = suite.Device.ReplaceDeviceStatus(suite.Ctx, suite.OrgID, deviceName, api.Device{
+				Metadata: api.ObjectMeta{Name: lo.ToPtr(deviceName)},
+				Status: &api.DeviceStatus{
+					Summary: api.DeviceSummaryStatus{Status: api.DeviceSummaryStatusOnline},
+				},
+			}, true)
+			Expect(status.Code).To(Equal(int32(200)))
+
+			after, err := suite.DeviceStore.GetLastSeen(suite.Ctx, suite.OrgID, deviceName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(after).NotTo(BeNil())
+			Expect(after.After(time.Now().UTC().Add(-time.Minute))).To(BeTrue())
+
+			devices, status := suite.Device.ListConnectivityChangedDevices(
+				suite.Ctx,
+				suite.OrgID,
+				domain.ListDevicesParams{Limit: lo.ToPtr(int32(100))},
+				time.Now().UTC().Add(-domain.DeviceDisconnectedTimeout),
+			)
+			Expect(status.Code).To(Equal(int32(200)))
+			Expect(devices.Items).To(BeEmpty())
+		})
+	})
+
+	Context("Device label mapping write protection", func() {
+		var (
+			mappingStore labelsyncmappingstore.Store
+			deviceStore  *devicestore.DeviceStore
+		)
+
+		BeforeEach(func() {
+			mappingStore = labelsyncmappingstore.NewStore(suite.DB, suite.Log)
+			deviceStore = devicestore.NewDeviceStore(suite.DB, suite.Log)
+		})
+
+		createMapping := func(name string, key *string) uuid.UUID {
+			mapping := domain.LabelSyncMapping{
+				ApiVersion: "flightctl.io/v1beta1",
+				Kind:       api.LabelSyncMappingKindLabelSyncMapping,
+				Metadata:   domain.ObjectMeta{Name: lo.ToPtr(name)},
+				Spec: domain.LabelSyncMappingSpec{
+					ResourceType: domain.LabelSyncMappingDevice,
+					Key:          key,
+					Expression:   "device.status.systemInfo.architecture",
+				},
+			}
+			_, err := mappingStore.Create(suite.Ctx, suite.OrgID, &mapping)
+			Expect(err).NotTo(HaveOccurred())
+			var mappingIDText string
+			result := suite.DB.Table("label_sync_mappings").Select("id").
+				Where("org_id = ? AND name = ?", suite.OrgID, name).Scan(&mappingIDText)
+			Expect(result.Error).NotTo(HaveOccurred())
+			mappingID, err := uuid.Parse(mappingIDText)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(mappingID).NotTo(Equal(uuid.Nil))
+			return mappingID
+		}
+
+		createDevice := func(name string, labels map[string]string) {
+			device := api.Device{
+				Metadata: api.ObjectMeta{Name: lo.ToPtr(name)},
+				Spec:     &api.DeviceSpec{},
+			}
+			if labels != nil {
+				device.Metadata.Labels = &labels
+			}
+			_, status := suite.Device.CreateDevice(suite.Ctx, suite.OrgID, device)
+			Expect(status.Code).To(Equal(int32(201)))
+		}
+
+		applyOwnedLabels := func(deviceName string, desired map[string]domain.DesiredDeviceLabel) {
+			snapshot, err := deviceStore.GetLabelSnapshot(suite.Ctx, suite.OrgID, deviceName)
+			Expect(err).NotTo(HaveOccurred())
+			_, err = deviceStore.ApplyLabels(suite.Ctx, suite.OrgID, deviceName, snapshot, desired, nil)
+			Expect(err).NotTo(HaveOccurred())
+		}
+
+		It("allows writes to scalar keys before a mapping owns output on the device", func() {
+			key := "example.com/team"
+			firstName := "scalar-write-before-output"
+			createDevice(firstName, map[string]string{key: "operator-value", "example.com/team-extra": "prefix-value"})
+			secondName := "same-scalar-key-other-device"
+			createDevice(secondName, map[string]string{key: "other-device-value"})
+			createMapping("scalar-reservation", &key)
+
+			current, status := suite.Device.GetDevice(suite.Ctx, suite.OrgID, firstName)
+			Expect(status.Code).To(Equal(int32(200)))
+			labels := lo.FromPtr(current.Metadata.Labels)
+			labels[key] = "operator-update"
+			labels["example.com/team-suffix"] = "still-writable"
+			current.Metadata.Labels = &labels
+			_, status = suite.Device.ReplaceDevice(suite.Ctx, suite.OrgID, firstName, *current, nil, true, true)
+			Expect(status.Code).To(Equal(int32(200)))
+		})
+
+		It("rejects only changed owned keys and keeps the managed-label annotation server-controlled", func() {
+			key := "example.com/managed"
+			mappingID := createMapping("owned-scalar", &key)
+			deviceName := "managed-write-protection"
+			createDevice(deviceName, map[string]string{key: "mapped-value", "manual": "preserved"})
+			applyOwnedLabels(deviceName, map[string]domain.DesiredDeviceLabel{
+				key:      {Value: "mapped-value", MappingID: &mappingID},
+				"manual": {Value: "preserved"},
+			})
+
+			current, status := suite.Device.GetDevice(suite.Ctx, suite.OrgID, deviceName)
+			Expect(status.Code).To(Equal(int32(200)))
+			Expect(lo.FromPtr(current.Metadata.Annotations)[domain.DeviceAnnotationManagedLabels]).To(Equal("[\"example.com/managed\"]"))
+			changed := lo.FromPtr(current.Metadata.Labels)
+			changed[key] = "forged"
+			current.Metadata.Labels = &changed
+			_, status = suite.Device.ReplaceDevice(suite.Ctx, suite.OrgID, deviceName, *current, nil, true, true)
+			Expect(status.Code).To(Equal(int32(409)))
+			Expect(status.Message).To(Equal(flterrors.ErrManagedLabelConflict.Error()))
+
+			current, status = suite.Device.GetDevice(suite.Ctx, suite.OrgID, deviceName)
+			Expect(status.Code).To(Equal(int32(200)))
+			current.Metadata.Labels = &map[string]string{"manual": "preserved"}
+			_, status = suite.Device.ReplaceDevice(suite.Ctx, suite.OrgID, deviceName, *current, nil, true, true)
+			Expect(status.Code).To(Equal(int32(409)))
+			Expect(status.Message).To(Equal(flterrors.ErrManagedLabelConflict.Error()))
+
+			current, status = suite.Device.GetDevice(suite.Ctx, suite.OrgID, deviceName)
+			Expect(status.Code).To(Equal(int32(200)))
+			labels := lo.FromPtr(current.Metadata.Labels)
+			labels["example.com/managed-extra"] = "writable"
+			annotations := lo.FromPtr(current.Metadata.Annotations)
+			annotations[domain.DeviceAnnotationManagedLabels] = "[\"forged\"]"
+			current.Metadata.Labels = &labels
+			current.Metadata.Annotations = &annotations
+			_, status = deviceservice.ReplaceDeviceFromUntrusted(suite.Ctx, suite.Device, suite.OrgID, deviceName, *current, nil, true, true)
+			Expect(status.Code).To(Equal(int32(200)))
+
+			current, status = suite.Device.GetDevice(suite.Ctx, suite.OrgID, deviceName)
+			Expect(status.Code).To(Equal(int32(200)))
+			Expect(lo.FromPtr(current.Metadata.Annotations)[domain.DeviceAnnotationManagedLabels]).To(Equal("[\"example.com/managed\"]"))
+			spoofedStatusLabels := map[string]string{key: "status-spoof"}
+			statusDevice := api.Device{
+				Metadata: api.ObjectMeta{Name: lo.ToPtr(deviceName), Labels: &spoofedStatusLabels},
+				Status:   &api.DeviceStatus{LastSeen: lo.ToPtr(time.Now())},
+			}
+			_, status = suite.Device.ReplaceDeviceStatus(suite.Ctx, suite.OrgID, deviceName, statusDevice, true)
+			Expect(status.Code).To(Equal(int32(200)))
+			current, status = suite.Device.GetDevice(suite.Ctx, suite.OrgID, deviceName)
+			Expect(status.Code).To(Equal(int32(200)))
+			Expect(lo.FromPtr(current.Metadata.Labels)).To(Equal(map[string]string{
+				key:                         "mapped-value",
+				"manual":                    "preserved",
+				"example.com/managed-extra": "writable",
+			}))
+		})
+
+		It("allows decommission to clear mapping-owned labels", func() {
+			key := "example.com/managed"
+			mappingID := createMapping("decommission-managed-label", &key)
+			deviceName := "decommission-managed-label-device"
+			createDevice(deviceName, map[string]string{key: "mapped-value", "manual": "preserved"})
+			applyOwnedLabels(deviceName, map[string]domain.DesiredDeviceLabel{
+				key:      {Value: "mapped-value", MappingID: &mappingID},
+				"manual": {Value: "preserved"},
+			})
+
+			result, status := suite.Device.DecommissionDevice(suite.Ctx, suite.OrgID, deviceName, api.DeviceDecommission{
+				Target: api.DeviceDecommissionTargetTypeUnenroll,
+			})
+			Expect(status.Code).To(Equal(int32(200)))
+			Expect(lo.FromPtr(result.Metadata.Labels)).To(BeEmpty())
+			Expect(lo.FromPtr(result.Metadata.Annotations)).NotTo(HaveKey(domain.DeviceAnnotationManagedLabels))
+
+			snapshot, err := deviceStore.GetLabelSnapshot(suite.Ctx, suite.OrgID, deviceName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(snapshot.Labels).To(BeEmpty())
+		})
+
+		It("allows mapping output to take over user labels and removes them without restoring prior values", func() {
+			mappingID := createMapping("map-output", nil)
+			cases := []struct {
+				deviceName string
+				userValue  string
+				mapValue   string
+			}{
+				{deviceName: "different-value-takeover", userValue: "user-value", mapValue: "mapped-value"},
+				{deviceName: "same-value-takeover", userValue: "same-value", mapValue: "same-value"},
+			}
+			for _, testCase := range cases {
+				createDevice(testCase.deviceName, map[string]string{"custominfo/site": testCase.userValue, "manual": "preserved"})
+				applyOwnedLabels(testCase.deviceName, map[string]domain.DesiredDeviceLabel{
+					"custominfo/site": {Value: testCase.mapValue, MappingID: &mappingID},
+					"manual":          {Value: "preserved"},
+				})
+				device, status := suite.Device.GetDevice(suite.Ctx, suite.OrgID, testCase.deviceName)
+				Expect(status.Code).To(Equal(int32(200)))
+				Expect(lo.FromPtr(device.Metadata.Labels)).To(Equal(map[string]string{
+					"custominfo/site": testCase.mapValue,
+					"manual":          "preserved",
+				}))
+			}
+
+			deleted, err := mappingStore.Delete(suite.Ctx, suite.OrgID, "map-output")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(deleted).To(BeTrue())
+			for _, deviceName := range []string{"different-value-takeover", "same-value-takeover"} {
+				applyOwnedLabels(deviceName, map[string]domain.DesiredDeviceLabel{
+					"manual": {Value: "preserved"},
+				})
+				device, status := suite.Device.GetDevice(suite.Ctx, suite.OrgID, deviceName)
+				Expect(status.Code).To(Equal(int32(200)))
+				Expect(lo.FromPtr(device.Metadata.Labels)).To(Equal(map[string]string{"manual": "preserved"}))
+			}
+			finalized, err := mappingStore.FinalizeDelete(suite.Ctx, suite.OrgID, "map-output")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(finalized).To(BeTrue())
+
+			device, status := suite.Device.GetDevice(suite.Ctx, suite.OrgID, "different-value-takeover")
+			Expect(status.Code).To(Equal(int32(200)))
+			labels := lo.FromPtr(device.Metadata.Labels)
+			labels["custominfo/site"] = "operator-after-cleanup"
+			device.Metadata.Labels = &labels
+			_, status = suite.Device.ReplaceDevice(suite.Ctx, suite.OrgID, "different-value-takeover", *device, nil, true, true)
+			Expect(status.Code).To(Equal(int32(200)))
+			device, status = suite.Device.GetDevice(suite.Ctx, suite.OrgID, "different-value-takeover")
+			Expect(status.Code).To(Equal(int32(200)))
+			Expect(lo.FromPtr(device.Metadata.Labels)["custominfo/site"]).To(Equal("operator-after-cleanup"))
+		})
+	})
 
 	Context("New device application status transitions", func() {
 		It("should generate DeviceApplicationError event when new device reports error applications", func() {
@@ -314,10 +555,10 @@ var _ = Describe("Device Application Status Events Integration Tests", func() {
 			_, status = suite.Device.ReplaceDeviceStatus(suite.Ctx, suite.OrgID, deviceName, deviceWithCriticalResources, true)
 			Expect(status.Code).To(Equal(int32(200)))
 
-			// Verify events were generated for CPU and Memory issues but NOT for Disk
-			// We should have: ResourceCreated + DeviceCPUCritical + DeviceMemoryWarning + DeviceApplicationHealthy + DeviceContentUpToDate
+			// Verify events were generated for CPU and Memory issues but NOT for Disk.
+			// The status change also emits an identity-only ResourceUpdated event for label reconciliation.
 			events := getEventsForDevice(deviceName)
-			Expect(len(events)).To(Equal(4))
+			Expect(len(events)).To(Equal(5))
 
 			// Check that we have the right events
 			eventReasons := make([]string, len(events))
@@ -326,6 +567,7 @@ var _ = Describe("Device Application Status Events Integration Tests", func() {
 			}
 			Expect(eventReasons).To(ContainElements(
 				"ResourceCreated",
+				"ResourceUpdated",
 				"DeviceCPUCritical",
 				"DeviceMemoryWarning",
 				"DeviceApplicationHealthy",
@@ -356,10 +598,10 @@ var _ = Describe("Device Application Status Events Integration Tests", func() {
 			_, status = suite.Device.ReplaceDeviceStatus(suite.Ctx, suite.OrgID, deviceName, deviceWithHealthyResources, true)
 			Expect(status.Code).To(Equal(int32(200)))
 
-			// Verify events were generated for CPU and Memory recovery
-			// We should now have: ResourceCreated + DeviceCPUCritical + DeviceMemoryWarning + DeviceApplicationHealthy + ResourceUpdated + DeviceCPUNormal + DeviceMemoryNormal
+			// Verify events were generated for CPU and Memory recovery.
+			// Each status update contributes an identity-only ResourceUpdated event.
 			events = getEventsForDevice(deviceName)
-			Expect(len(events)).To(Equal(7))
+			Expect(len(events)).To(Equal(9))
 
 			// Check that we have the recovery events
 			eventReasons = make([]string, len(events))
@@ -368,6 +610,8 @@ var _ = Describe("Device Application Status Events Integration Tests", func() {
 			}
 			Expect(eventReasons).To(ContainElements(
 				"ResourceCreated",
+				"ResourceUpdated",
+				"ResourceUpdated",
 				"DeviceCPUCritical",
 				"DeviceMemoryWarning",
 				"DeviceApplicationHealthy",
@@ -1866,7 +2110,7 @@ var _ = Describe("Device Application Status Events Integration Tests", func() {
 			renderedConfig, err := buildRenderedConfig("update-rendered-device-config")
 			Expect(err).ToNot(HaveOccurred())
 
-			status = suite.Device.UpdateRenderedDevice(suite.Ctx, suite.OrgID, deviceName, renderedConfig, "", "hash1", "", nil, false)
+			status = suite.Device.UpdateRenderedDevice(suite.Ctx, suite.OrgID, deviceName, renderedConfig, "", "hash1", "", nil, false, nil)
 			Expect(status.Code).To(Equal(int32(200)))
 
 			updated, err := suite.DeviceStore.Get(suite.Ctx, suite.OrgID, deviceName)

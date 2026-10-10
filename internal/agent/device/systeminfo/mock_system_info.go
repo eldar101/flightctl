@@ -69,6 +69,18 @@ func (mr *MockManagerMockRecorder) BootTime() *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "BootTime", reflect.TypeOf((*MockManager)(nil).BootTime))
 }
 
+// CollectPending mocks base method.
+func (m *MockManager) CollectPending(ctx context.Context) {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "CollectPending", ctx)
+}
+
+// CollectPending indicates an expected call of CollectPending.
+func (mr *MockManagerMockRecorder) CollectPending(ctx any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CollectPending", reflect.TypeOf((*MockManager)(nil).CollectPending), ctx)
+}
+
 // IsRebooted mocks base method.
 func (m *MockManager) IsRebooted() bool {
 	m.ctrl.T.Helper()
@@ -93,6 +105,18 @@ func (m *MockManager) RegisterCollector(ctx context.Context, key string, fn Coll
 func (mr *MockManagerMockRecorder) RegisterCollector(ctx, key, fn any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RegisterCollector", reflect.TypeOf((*MockManager)(nil).RegisterCollector), ctx, key, fn)
+}
+
+// Run mocks base method.
+func (m *MockManager) Run(ctx context.Context) {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "Run", ctx)
+}
+
+// Run indicates an expected call of Run.
+func (mr *MockManagerMockRecorder) Run(ctx any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Run", reflect.TypeOf((*MockManager)(nil).Run), ctx)
 }
 
 // Status mocks base method.

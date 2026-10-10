@@ -111,6 +111,8 @@ global:
         - "write"
       # -- Optional prefix for org names from this provider (e.g. "aap-"). Incoming org names are exposed as prefix + name.
       organizationNamePrefix: ""
+      # -- TTL for AAP identity cache (Go duration string, e.g. "45s", "2m")
+      identityCacheTTL: "45s"
     openshift:
       # -- Create default flightctl-admin ServiceAccount with admin access
       createAdminUser: true
@@ -316,7 +318,11 @@ worker:
   clusterLevelSecretAccess: false
   # -- Time budget for a single device render operation including VM conversion and DB writes (default "60s")
   renderTimeout: "60s"
-  # -- VM application render options passed to vm-to-quadlet
+  # -- Maximum age of cached OCI image digest resolutions used during delta preparation (default "15m")
+  imageDigestCacheTTL: "15m"
+  # -- Maximum age of cached Helm workload image references before the chart is rendered again (default "15m")
+  helmImageRefsCacheTTL: "15m"
+  # -- VM application render options passed to vm-to-quadlet by both worker services
   vmRender:
     # -- virt-launcher image used when converting VmApplications to Quadlet units (leave empty to use the worker default)
     launcherImage: ""
@@ -356,13 +362,26 @@ periodic:
   consumers: 5
   # -- Allow flightctl-periodic to list/watch secrets at the cluster level for change detection
   clusterLevelSecretAccess: false
+  tasks:
+    # -- Delta prepare deadline sweep schedule
+    deltaPrepareDeadline:
+      schedule:
+        # -- How often flightctl-periodic checks for expired delta prepares
+        interval: 1m
+    labelMappingScan:
+      schedule:
+        # -- How often to scan devices after a label mapping changes
+        interval: 2m
+      # -- Maximum number of devices in each label mapping scan page (1–1000)
+      pageSize: 1000
+      # -- Maximum work time per label mapping scan invocation
+      timeBudget: 30s
   # -- Metrics configuration for flightctl-periodic
   metrics:
     # -- Enable Prometheus metrics endpoint
     enabled: true
     # -- Address for the metrics HTTP server
     address: ":15690"
-
 # -- Remote Access Configuration
 remoteAccess:
   # -- Enable remote access service
@@ -452,6 +471,10 @@ imageBuilderWorker:
   maxConcurrentBuilds: 2
   # -- Default TTL for image build resources
   defaultTTL: 168h
+  # -- Inactivity timeout for image builds and exports
+  imageBuilderTimeout: 3m
+  # -- Interval between image build and export timeout checks
+  timeoutCheckTaskInterval: 1m
   # -- Enable privileged mode for container-in-container builds
   privileged: true
   # -- Secret name containing yum repository configuration files, mounted at /etc/yum.repos.d
@@ -654,6 +677,8 @@ deltaGeneration:
   maxConcurrentDeltaGenerations: 2
   # -- Per-job timeout for oci-delta/ORAS. Defaults to 30m when omitted or <= 0.
   timeout: 30m
+  # -- Optional prepare wait cap (Go duration, e.g. 10m). Omitted means no deadline. 0s generates then resumes immediately.
+  # maxWaitForDelta: 10m
 
 # -- Upgrade hooks
 upgradeHooks:

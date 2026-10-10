@@ -47,6 +47,14 @@ func endSpan(span trace.Span, st domain.Status) {
 	span.End()
 }
 
+func (_d *TracedDeviceService) ClearDeltaPreparingIfCurrent(ctx context.Context, orgID uuid.UUID, name string, generation int64) (b1 bool, s1 domain.Status) {
+	ctx, span := startSpan(ctx, "ClearDeltaPreparingIfCurrent")
+
+	b1, s1 = _d.inner.ClearDeltaPreparingIfCurrent(ctx, orgID, name, generation)
+	endSpan(span, s1)
+	return b1, s1
+}
+
 func (_d *TracedDeviceService) CountDevices(ctx context.Context, orgId uuid.UUID, params domain.ListDevicesParams, annotationSelector *selector.AnnotationSelector) (i1 int64, s1 domain.Status) {
 	ctx, span := startSpan(ctx, "CountDevices")
 
@@ -207,6 +215,14 @@ func (_d *TracedDeviceService) MarkDevicesRolloutSelection(ctx context.Context, 
 	return s1
 }
 
+func (_d *TracedDeviceService) OverrideDeviceEnrollmentHook(ctx context.Context, orgId uuid.UUID, name string) (dp1 *domain.Device, s1 domain.Status) {
+	ctx, span := startSpan(ctx, "OverrideDeviceEnrollmentHook")
+
+	dp1, s1 = _d.inner.OverrideDeviceEnrollmentHook(ctx, orgId, name)
+	endSpan(span, s1)
+	return dp1, s1
+}
+
 func (_d *TracedDeviceService) OverwriteDeviceRepositoryRefs(ctx context.Context, orgId uuid.UUID, name string, repositoryNames ...string) (s1 domain.Status) {
 	ctx, span := startSpan(ctx, "OverwriteDeviceRepositoryRefs")
 
@@ -251,6 +267,14 @@ func (_d *TracedDeviceService) ReplaceDeviceStatus(ctx context.Context, orgId uu
 	ctx, span := startSpan(ctx, "ReplaceDeviceStatus")
 
 	dp1, s1 = _d.inner.ReplaceDeviceStatus(ctx, orgId, name, device, refreshLastSeen)
+	endSpan(span, s1)
+	return dp1, s1
+}
+
+func (_d *TracedDeviceService) ReplaceServiceOwnedStatus(ctx context.Context, orgId uuid.UUID, name string, device domain.Device) (dp1 *domain.Device, s1 domain.Status) {
+	ctx, span := startSpan(ctx, "ReplaceServiceOwnedStatus")
+
+	dp1, s1 = _d.inner.ReplaceServiceOwnedStatus(ctx, orgId, name, device)
 	endSpan(span, s1)
 	return dp1, s1
 }
@@ -343,10 +367,10 @@ func (_d *TracedDeviceService) UpdateDeviceAnnotations(ctx context.Context, orgI
 	return s1
 }
 
-func (_d *TracedDeviceService) UpdateRenderedDevice(ctx context.Context, orgId uuid.UUID, name string, renderedConfig string, renderedApplications string, specHash string, osImage string, configFingerprints []domain.DependencySyncConfigRefStatus, forceUpdate bool) (s1 domain.Status) {
+func (_d *TracedDeviceService) UpdateRenderedDevice(ctx context.Context, orgId uuid.UUID, name string, renderedConfig string, renderedApplications string, specHash string, osImage string, configFingerprints []domain.DependencySyncConfigRefStatus, forceUpdate bool, osHints *RenderedOSHints) (s1 domain.Status) {
 	ctx, span := startSpan(ctx, "UpdateRenderedDevice")
 
-	s1 = _d.inner.UpdateRenderedDevice(ctx, orgId, name, renderedConfig, renderedApplications, specHash, osImage, configFingerprints, forceUpdate)
+	s1 = _d.inner.UpdateRenderedDevice(ctx, orgId, name, renderedConfig, renderedApplications, specHash, osImage, configFingerprints, forceUpdate, osHints)
 	endSpan(span, s1)
 	return s1
 }

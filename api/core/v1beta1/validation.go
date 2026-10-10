@@ -103,8 +103,8 @@ func (r DeviceSpec) Validate(fleetTemplate bool) []error {
 		if len(r.Os.Image) > 0 && r.Os.CatalogItemRef != nil {
 			allErrs = append(allErrs, errors.New("cannot have both image and catalog item ref for device OS"))
 		}
-		if r.Os.DeltaImage != nil && len(*r.Os.DeltaImage) > 0 {
-			allErrs = append(allErrs, validateOciImageReference(r.Os.DeltaImage, "spec.os.deltaImage", fleetTemplate)...)
+		if r.Os.DeltaImage != nil {
+			allErrs = append(allErrs, fmt.Errorf("spec.os.deltaImage is read-only and cannot be set directly; the control plane generates it in the rendered device spec"))
 		}
 	}
 	if r.Config != nil {
@@ -608,8 +608,8 @@ func (r *RolloutPolicy) Validate() []error {
 	if r == nil {
 		return nil
 	}
-	if r.DeviceSelection == nil && r.DisruptionBudget == nil {
-		errs = append(errs, errors.New("at least one of [DeviceSelection, DisruptionBudget] must be defined"))
+	if r.DeviceSelection == nil && r.DisruptionBudget == nil && r.DeltaGeneration == nil {
+		errs = append(errs, errors.New("at least one of [DeviceSelection, DisruptionBudget, DeltaGeneration] must be defined"))
 	}
 	errs = append(errs, r.DeviceSelection.Validate()...)
 	errs = append(errs, r.DisruptionBudget.Validate()...)
@@ -918,6 +918,7 @@ func (a ApplicationProviderSpec) Validate() []error {
 
 func (a InlineApplicationProviderSpec) Validate(appType AppType, fleetTemplate bool) []error {
 	allErrs := []error{}
+	allErrs = append(allErrs, validateApplicationDeltaHintsReadOnly(nil, a.DeltaImages, "spec.applications[]")...)
 
 	var appValidator applicationValidator
 	switch appType {
@@ -1245,6 +1246,7 @@ func validateContainerApplication(app ApplicationProviderSpec, appName string, f
 			allErrs = append(allErrs, fmt.Errorf("invalid container image provider: %w", err))
 		} else {
 			allErrs = append(allErrs, validateOciImageReference(&spec.Image, pathPrefix+".image", fleetTemplate)...)
+			allErrs = append(allErrs, validateApplicationDeltaHintsReadOnly(spec.DeltaImage, spec.DeltaImages, pathPrefix)...)
 		}
 		catalogItemRefSpec, _ := container.AsCatalogItemRefApplicationProviderSpec()
 		allErrs = append(allErrs, validateExclusiveAppSource(spec.Image, catalogItemRefSpec.CatalogItemRef)...)
@@ -1304,6 +1306,9 @@ func validateHelmApplication(app ApplicationProviderSpec, appName string, fleetT
 			allErrs = append(allErrs, fmt.Errorf("invalid helm image provider: %w", err))
 		} else {
 			allErrs = append(allErrs, validateOciImageReference(&spec.Image, pathPrefix+".image", fleetTemplate)...)
+			if !allowLifecycleFields {
+				allErrs = append(allErrs, validateApplicationDeltaHintsReadOnly(spec.DeltaImage, spec.DeltaImages, pathPrefix)...)
+			}
 		}
 		catalogItemRefSpec, _ := helm.AsCatalogItemRefApplicationProviderSpec()
 		allErrs = append(allErrs, validateExclusiveAppSource(spec.Image, catalogItemRefSpec.CatalogItemRef)...)
@@ -1351,6 +1356,7 @@ func validateComposeApplication(app ApplicationProviderSpec, appName string, fle
 			allErrs = append(allErrs, fmt.Errorf("invalid compose image provider: %w", err))
 		} else {
 			allErrs = append(allErrs, validateOciImageReference(&imageSpec.Image, pathPrefix+".image", fleetTemplate)...)
+			allErrs = append(allErrs, validateApplicationDeltaHintsReadOnly(imageSpec.DeltaImage, imageSpec.DeltaImages, pathPrefix)...)
 		}
 		catalogItemRefSpec, _ := compose.AsCatalogItemRefApplicationProviderSpec()
 		allErrs = append(allErrs, validateExclusiveAppSource(imageSpec.Image, catalogItemRefSpec.CatalogItemRef)...)
@@ -1399,6 +1405,7 @@ func validateQuadletApplication(app ApplicationProviderSpec, appName string, fle
 			allErrs = append(allErrs, fmt.Errorf("invalid quadlet image provider: %w", err))
 		} else {
 			allErrs = append(allErrs, validateOciImageReference(&imageSpec.Image, pathPrefix+".image", fleetTemplate)...)
+			allErrs = append(allErrs, validateApplicationDeltaHintsReadOnly(imageSpec.DeltaImage, imageSpec.DeltaImages, pathPrefix)...)
 		}
 		catalogItemRefSpec, _ := quadlet.AsCatalogItemRefApplicationProviderSpec()
 		allErrs = append(allErrs, validateExclusiveAppSource(imageSpec.Image, catalogItemRefSpec.CatalogItemRef)...)
@@ -1537,12 +1544,14 @@ func validateVmApplication(app ApplicationProviderSpec, appName string, fleetTem
 			allErrs = append(allErrs, fmt.Errorf("invalid vm image provider: %w", err))
 		} else {
 			allErrs = append(allErrs, validateOciImageReference(&imageSpec.Image, pathPrefix+".image", fleetTemplate)...)
+			allErrs = append(allErrs, validateApplicationDeltaHintsReadOnly(imageSpec.DeltaImage, imageSpec.DeltaImages, pathPrefix)...)
 		}
 	case InlineApplicationProviderType:
 		inlineSpec, err := vm.AsInlineApplicationProviderSpec()
 		if err != nil {
 			allErrs = append(allErrs, fmt.Errorf("invalid vm inline provider: %w", err))
 		} else {
+			allErrs = append(allErrs, validateApplicationDeltaHintsReadOnly(nil, inlineSpec.DeltaImages, pathPrefix)...)
 			v := &vmValidator{appName: appName}
 			seenPath := make(map[string]struct{}, len(inlineSpec.Inline))
 			for i := range inlineSpec.Inline {
@@ -1925,6 +1934,24 @@ func validateOciImageReference(imageRef *string, path string, fleetTemplate bool
 		allErrs = append(allErrs, validation.ValidateOciImageReferenceWithTemplates(imageRef, path)...)
 	}
 
+	return allErrs
+}
+
+// validateApplicationDeltaHintsReadOnly rejects control-plane-generated fields
+// when they appear in a client-submitted desired application spec.
+func validateApplicationDeltaHintsReadOnly(
+	deltaImage *string,
+	deltaImages *[]ImageDeltaHint,
+	pathPrefix string,
+) []error {
+	var allErrs []error
+	if deltaImage != nil {
+		allErrs = append(allErrs, fmt.Errorf("%s.deltaImage is read-only and cannot be set directly; the control plane generates it in the rendered application spec", pathPrefix))
+	}
+	if deltaImages == nil {
+		return allErrs
+	}
+	allErrs = append(allErrs, fmt.Errorf("%s.deltaImages is read-only and cannot be set directly; the control plane generates it in the rendered application spec", pathPrefix))
 	return allErrs
 }
 
@@ -2688,6 +2715,42 @@ func (p *EnrollmentHookPolicy) Validate() []error {
 	}
 
 	return allErrs
+}
+
+// Validate validates a LabelSyncMapping resource.
+func (m *LabelSyncMapping) Validate() []error {
+	if m == nil {
+		return nil
+	}
+
+	allErrs := validation.ValidateResourceName(m.Metadata.Name)
+	allErrs = append(allErrs, validation.ValidateLabels(m.Metadata.Labels)...)
+	allErrs = append(allErrs, validation.ValidateAnnotations(m.Metadata.Annotations)...)
+	if m.Spec.ResourceType != LabelSyncMappingSpecResourceTypeDevice {
+		allErrs = append(allErrs, fmt.Errorf("spec.resourceType must be %q", LabelSyncMappingSpecResourceTypeDevice))
+	}
+	if m.Spec.Expression == "" {
+		allErrs = append(allErrs, errors.New("spec.expression must not be empty"))
+	}
+	if m.Spec.Key != nil && len(validation.ValidateLabelKey(*m.Spec.Key)) > 0 {
+		allErrs = append(allErrs, fmt.Errorf("spec.key must be a valid qualified label key"))
+	}
+	return allErrs
+}
+
+// ValidateUpdate ensures resource identity and type remain immutable.
+func (m *LabelSyncMapping) ValidateUpdate(newObj *LabelSyncMapping) []error {
+	if newObj == nil {
+		return []error{errors.New("updated LabelSyncMapping must not be nil")}
+	}
+	var err []error
+	if newObj.Metadata.Name != nil && (m.Metadata.Name == nil || *m.Metadata.Name != *newObj.Metadata.Name) {
+		err = append(err, errors.New("metadata.name is immutable"))
+	}
+	if m.Spec.ResourceType != newObj.Spec.ResourceType {
+		err = append(err, errors.New("spec.resourceType is immutable"))
+	}
+	return err
 }
 
 func validateEnrollmentHookAction(action *EnrollmentHookHttpAction, orig EnrollmentHookHttpAction, prefix string) []error {

@@ -4,10 +4,13 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/flightctl/flightctl/internal/agent/device/fileio"
+	"github.com/flightctl/flightctl/internal/util"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
+	"sigs.k8s.io/yaml"
 )
 
 var yamlConfig = `enrollment-service:
@@ -523,4 +526,168 @@ enrollment:
 		require.Error(err)
 		require.Contains(err.Error(), "failurePolicy")
 	})
+}
+
+func TestSystemInfoCollectionInterval(t *testing.T) {
+	t.Run("When no drop-ins exist and system-info-periodic interval is below the minimum it should fail loading", func(t *testing.T) {
+		require := require.New(t)
+
+		configDir := t.TempDir()
+		dataDir := filepath.Join(configDir, "data")
+		readWriter := fileio.NewReadWriter(fileio.NewReader(), fileio.NewWriter())
+		require.NoError(readWriter.MkdirAll(dataDir, 0o755))
+		configFile := filepath.Join(configDir, "config.yaml")
+		require.NoError(readWriter.WriteFile(configFile, []byte(yamlConfig+`
+system-info-periodic:
+  interval: 1s
+`), 0o600))
+
+		cfg := NewDefault()
+		cfg.ConfigDir = configDir
+		cfg.DataDir = dataDir
+		cfg.readWriter = readWriter
+		err := cfg.LoadWithOverrides(configFile)
+		require.ErrorContains(err, "minimum system info periodic interval is 2s have 1s")
+	})
+
+	t.Run("When a drop-in sets system-info-periodic interval it should override the base interval", func(t *testing.T) {
+		require := require.New(t)
+
+		configDir := t.TempDir()
+		dataDir := filepath.Join(configDir, "data")
+		readWriter := fileio.NewReadWriter(fileio.NewReader(), fileio.NewWriter())
+		require.NoError(readWriter.MkdirAll(dataDir, 0o755))
+		configFile := filepath.Join(configDir, "config.yaml")
+		require.NoError(readWriter.WriteFile(configFile, []byte(yamlConfig+`
+system-info-periodic:
+  interval: 1m
+`), 0o600))
+
+		dropinDir := filepath.Join(configDir, "conf.d")
+		require.NoError(readWriter.MkdirAll(dropinDir, 0o755))
+		require.NoError(readWriter.WriteFile(filepath.Join(dropinDir, "10-system-info-periodic.yaml"), []byte("system-info-periodic:\n  interval: 5m\n"), 0o600))
+
+		cfg := NewDefault()
+		cfg.ConfigDir = configDir
+		cfg.DataDir = dataDir
+		cfg.readWriter = readWriter
+		require.NoError(cfg.LoadWithOverrides(configFile))
+		require.Equal(util.Duration(5*time.Minute), cfg.SystemInfoCollectionInterval())
+	})
+
+	t.Run("When system-info-periodic interval is set it should use that interval", func(t *testing.T) {
+		require := require.New(t)
+
+		cfg := NewDefault()
+		customInterval := util.Duration(5 * time.Minute)
+		cfg.SystemInfoPeriodic.Interval = customInterval
+
+		result := cfg.SystemInfoCollectionInterval()
+		require.Equal(customInterval, result)
+	})
+
+	t.Run("When system-info-periodic interval is zero it should fall back to StatusUpdateInterval", func(t *testing.T) {
+		require := require.New(t)
+
+		cfg := NewDefault()
+		// SystemInfoPeriodic.Interval is zero by default
+
+		result := cfg.SystemInfoCollectionInterval()
+		require.Equal(cfg.StatusUpdateInterval, result)
+	})
+
+	t.Run("When system-info-periodic interval is absent it should fall back to StatusUpdateInterval", func(t *testing.T) {
+		require := require.New(t)
+
+		cfg := NewDefault()
+		cfg.StatusUpdateInterval = util.Duration(30 * time.Second)
+
+		result := cfg.SystemInfoCollectionInterval()
+		require.Equal(util.Duration(30*time.Second), result)
+	})
+
+	t.Run("When system-info-periodic interval is below the minimum it should fail validation", func(t *testing.T) {
+		require := require.New(t)
+
+		cfg := NewDefault()
+		cfg.SystemInfoPeriodic.Interval = util.Duration(time.Second)
+		err := cfg.validateSyncIntervals()
+		require.ErrorContains(err, "minimum system info periodic interval is 2s have 1s")
+	})
+
+	t.Run("When system-info-periodic interval is negative it should fail validation", func(t *testing.T) {
+		require := require.New(t)
+
+		cfg := NewDefault()
+		cfg.SystemInfoPeriodic.Interval = util.Duration(-time.Minute)
+		err := cfg.validateSyncIntervals()
+		require.ErrorContains(err, "minimum system info periodic interval is 2s have -1m0s")
+	})
+
+	t.Run("When system-info-periodic interval is zero no validation should occur", func(t *testing.T) {
+		require := require.New(t)
+
+		cfg := NewDefault()
+		cfg.SystemInfoPeriodic.Interval = util.Duration(0)
+		err := cfg.validateSyncIntervals()
+		require.NoError(err)
+	})
+}
+
+func TestSystemInfoCustomYAMLDeserialization(t *testing.T) {
+	tests := []struct {
+		name          string
+		yamlInput     string
+		expectNil     bool
+		expectedLen   int
+		expectedValue []string
+	}{
+		{
+			name:      "When system-info-custom is absent in YAML it should deserialize as nil",
+			yamlInput: "log-level: info\n",
+			expectNil: true,
+		},
+		{
+			name:        "When system-info-custom is empty list it should deserialize as non-nil with len 0",
+			yamlInput:   "system-info-custom: []\n",
+			expectNil:   false,
+			expectedLen: 0,
+		},
+		{
+			name:          "When system-info-custom has an explicit key it should deserialize with that key",
+			yamlInput:     "system-info-custom:\n  - my-key\n",
+			expectNil:     false,
+			expectedLen:   1,
+			expectedValue: []string{"my-key"},
+		},
+		{
+			name:          "When system-info-custom has wildcard it should deserialize as ['*']",
+			yamlInput:     "system-info-custom:\n  - '*'\n",
+			expectNil:     false,
+			expectedLen:   1,
+			expectedValue: []string{"*"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require := require.New(t)
+
+			var cfg Config
+			err := yaml.Unmarshal([]byte(tt.yamlInput), &cfg)
+			require.NoError(err)
+
+			if tt.expectNil {
+				require.Nil(cfg.SystemInfoCustom, "expected SystemInfoCustom to be nil")
+				return
+			}
+
+			require.NotNil(cfg.SystemInfoCustom, "expected SystemInfoCustom to be non-nil")
+			require.Len(cfg.SystemInfoCustom, tt.expectedLen)
+
+			if tt.expectedValue != nil {
+				require.Equal(tt.expectedValue, cfg.SystemInfoCustom)
+			}
+		})
+	}
 }

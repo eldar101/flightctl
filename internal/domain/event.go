@@ -2,6 +2,7 @@ package domain
 
 import (
 	"context"
+	"strconv"
 
 	v1beta1 "github.com/flightctl/flightctl/api/core/v1beta1"
 	"github.com/flightctl/flightctl/internal/consts"
@@ -103,9 +104,15 @@ const (
 	EventReasonPrepareDeltas                   = v1beta1.EventReasonPrepareDeltas
 	EventReasonDeltaGenerationProgress         = v1beta1.EventReasonDeltaGenerationProgress
 	EventReasonDeltaGenerationCompleted        = v1beta1.EventReasonDeltaGenerationCompleted
+	EventReasonEnrollmentHookSucceeded         = v1beta1.EventReasonEnrollmentHookSucceeded
+	EventReasonEnrollmentHookFailed            = v1beta1.EventReasonEnrollmentHookFailed
+	EventReasonEnrollmentHookNotifyFailed      = v1beta1.EventReasonEnrollmentHookNotifyFailed
+	EventReasonEnrollmentHookManualOverride    = v1beta1.EventReasonEnrollmentHookManualOverride
 )
 
 const EventReasonGenerateDelta EventReason = "GenerateDelta"
+const EventReasonDeltaGenerationComplete EventReason = "DeltaGenerationComplete"
+const EventReasonDeltaPrepareComplete EventReason = "DeltaPrepareComplete"
 
 // ========== Event Details Types ==========
 
@@ -153,11 +160,12 @@ const (
 	ApplicationLifecycleActionRestart = v1beta1.ApplicationLifecycleActionRestart
 
 	// Updated field constants with prefix (descriptive)
-	UpdatedFieldLabels       = v1beta1.Labels
-	UpdatedFieldOwner        = v1beta1.Owner
-	UpdatedFieldSpec         = v1beta1.Spec
-	UpdatedFieldSpecSelector = v1beta1.SpecSelector
-	UpdatedFieldSpecTemplate = v1beta1.SpecTemplate
+	UpdatedFieldLabels                   = v1beta1.Labels
+	UpdatedFieldOwner                    = v1beta1.Owner
+	UpdatedFieldSpec                     = v1beta1.Spec
+	UpdatedFieldSpecSelector             = v1beta1.SpecSelector
+	UpdatedFieldSpecTemplate             = v1beta1.SpecTemplate
+	UpdatedFieldEnrollmentHooksCondition = v1beta1.StatusConditionsEnrollmentHooks
 
 	// Direct aliases for compatibility
 	Labels       = v1beta1.Labels
@@ -199,6 +207,8 @@ var warningReasons = map[EventReason]struct{}{
 	EventReasonResourceSyncSyncFailed:          {},
 	EventReasonFleetRolloutFailed:              {},
 	EventReasonDependencySyncProbeFailed:       {},
+	EventReasonEnrollmentHookFailed:            {},
+	EventReasonEnrollmentHookNotifyFailed:      {},
 }
 
 // GetEventType determines the event type based on the event reason
@@ -249,4 +259,15 @@ func GetBaseEvent(ctx context.Context, resourceKind ResourceKind, resourceName s
 	event.Details = details
 
 	return &event
+}
+
+// GetDeviceDeltaGenerationCompletedEvent identifies the spec generation whose
+// preparation completed, so a queued notification cannot resume a newer spec.
+func GetDeviceDeltaGenerationCompletedEvent(ctx context.Context, name string, generation int64) *Event {
+	event := GetBaseEvent(ctx, DeviceKind, name, EventReasonDeltaGenerationCompleted, "Delta generation completed.", nil)
+	if event.Metadata.Annotations == nil {
+		event.Metadata.Annotations = &map[string]string{}
+	}
+	(*event.Metadata.Annotations)[EventAnnotationDeltaGeneration] = strconv.FormatInt(generation, 10)
+	return event
 }

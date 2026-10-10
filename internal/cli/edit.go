@@ -44,6 +44,7 @@ func getValidEditResourceKinds() []ResourceKind {
 		RepositoryKind,
 		CertificateSigningRequestKind,
 		EnrollmentHookPolicyKind,
+		LabelSyncMappingKind,
 	}
 }
 
@@ -155,7 +156,7 @@ func (o *EditOptions) Validate(args []string) error {
 
 	// Check if resource type supports editing
 	switch kind {
-	case DeviceKind, FleetKind, RepositoryKind, CertificateSigningRequestKind, AuthProviderKind, EnrollmentHookPolicyKind:
+	case DeviceKind, FleetKind, RepositoryKind, CertificateSigningRequestKind, AuthProviderKind, EnrollmentHookPolicyKind, LabelSyncMappingKind:
 		// These are supported for editing
 	default:
 		return errEditNotAllowed{kind}
@@ -174,7 +175,9 @@ func (o *EditOptions) Run(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("creating client: %w", err)
 	}
-	clientWithResponses.Start(ctx)
+	if err := clientWithResponses.Start(ctx); err != nil {
+		return err
+	}
 	defer clientWithResponses.Stop()
 
 	kind, name, err := parseAndValidateKindName(args[0])
@@ -505,6 +508,9 @@ func (o *EditOptions) executePatchOperation(ctx context.Context, client *apiclie
 	case EnrollmentRequestKind:
 		response, err := client.PatchEnrollmentRequestWithBodyWithResponse(ctx, name, contentType, reader)
 		return o.extractResponseData(response, err)
+	case LabelSyncMappingKind:
+		response, err := client.PatchLabelSyncMappingWithBodyWithResponse(ctx, name, contentType, reader)
+		return o.extractResponseData(response, err)
 	default:
 		return nil, nil, fmt.Errorf("unsupported resource kind for editing: %s (PATCH not supported)", kind)
 	}
@@ -518,7 +524,7 @@ func (o *EditOptions) extractResponseData(response interface{}, err error) (*htt
 
 	// Use reflection to extract response data (since different APIs return different types)
 	v := reflect.ValueOf(response)
-	if v.Kind() == reflect.Ptr && !v.IsNil() {
+	if v.Kind() == reflect.Pointer && !v.IsNil() {
 		v = v.Elem()
 	}
 
