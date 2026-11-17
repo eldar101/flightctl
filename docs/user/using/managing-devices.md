@@ -4,7 +4,7 @@
 
 The first time the Flight Control Agent runs, it generates a cryptographic key pair that serves as the device's unique cryptographic identity. The pair's private key never leaves the device, so that the device cannot be duplicated or impersonated. The cryptographic identity is registered with the Flight Control Service during enrollment and gets wiped during device decommissioning.
 
-When the device is not yet enrolled, the agent performs service discovery to find its Flight Control Service instance. It then establishes a secure, mTLS-protected network connection to the Service using the X.509 enrollment certificate it has been provided with during image building or device provisioning. Next, it submits an Enrollment Request to the service that includes a description of the device's hardware and operating system as well as an X.509 Certificate Signing Request (CSR) including its cryptographic identity to obtain its initial management certificate. At this point, the device is not yet considered trusted and therefore remains quarantined in a "device lobby" until its Enrollment Request has been approved or denied by an authorized user (e.g. a administrator, an installer persona, or an auto-approver process).
+When the device is not yet enrolled, the agent performs service discovery to find its Flight Control Service instance. It then establishes a secure, mTLS-protected network connection to the Service using the X.509 enrollment certificate it has been provided with during image building or device provisioning. The Service accepts that certificate only while the Certificate Signing Request that issued it is approved. Next, the device submits an Enrollment Request that includes a description of its hardware and operating system as well as an X.509 Certificate Signing Request (CSR) containing its cryptographic identity to obtain its initial management certificate. At this point, the device is not yet considered trusted and therefore remains quarantined in a "device lobby" until its Enrollment Request has been approved or denied by an authorized user (for example, an administrator, an installer persona, or an auto-approver process).
 
 > [!NOTE]
 > The device **management certificate** is automatically renewed by the `flightctl-agent`
@@ -69,7 +69,7 @@ For hook configuration, failure policies, and restart behavior, see [Using enrol
 
 ## Viewing the Device Inventory and Device Details
 
-Flight Control automatically gathers system information from each device to help identify its hardware, OS, and environment. This data is shown in the `status.systemInfo` field. Fields can optionally be promoted to labels during the enrollment process, this must be done manually or through external automation. Promoting fields to labels enables powerful grouping and querying capabilities, such as filtering devices by region or OS version. You can also define your own fields in `status.systemInfo.customInfo`, allowing the agent to collect user-defined metadata through custom commands.
+Flight Control automatically gathers system information from each device to help identify its hardware, OS, and environment. This data is shown in the `status.systemInfo` field. You can promote fields to labels during enrollment with the agent's `label-from-systeminfo` configuration, or synchronize them to labels after enrollment with `LabelSyncMapping` resources. Promoted labels support grouping and filtering devices by attributes such as region or OS version. See [Managing dynamic label mappings](managing-dynamic-mappings.md) for server-side mappings.
 
 ### Considerations for System Information
 
@@ -405,22 +405,26 @@ The device's `status.os.deltaSize` reports the known size of the control-plane-g
 
 ### Using CI-published OS deltas
 
-You can publish an OS delta from CI to reduce the image data a device downloads during an OS update. Create the delta from the device's current OS image to the target OS image, then publish it as an OCI 1.1 referrer of the target image.
+You can publish an OS delta from CI to reduce the image data a device downloads during an OS update. Create the delta from a source OS image available in the device's bootc-managed store to the target OS image, then publish it as an OCI 1.1 referrer of the target image.
 
 For the agent to discover the delta, publish it with these values:
 
 - Publish it in the same repository as the target OS image.
-- Set the referrer's `subject` to the target image manifest.
+- Set the referrer's `subject.digest` to the target platform manifest digest.
 - Set `artifactType` to `application/vnd.io.github.containers.oci-delta.v1`.
-- Set the `io.github.containers.delta.source` annotation to the digest of the source OS image. This must match the device's current OS image digest.
+- Set the `io.github.containers.delta.source` annotation to the digest of the source OS image. The source image must be available in the device's bootc-managed store. Booted, staged, rollback, and cached OS images can provide the source. An image present only in Podman application storage does not qualify.
 
-For example, for a target at `quay.io/example/os:v2`, publish the delta referrer in `quay.io/example/os` and set its subject to the target manifest digest.
+For example, for a target at `quay.io/example/os:v2`, publish the delta referrer in `quay.io/example/os` and set its `subject.digest` to the target platform manifest digest.
+
+The agent looks for referrers of the target platform manifest digest in the target image repository. If the registry returns 404 or reports an unknown manifest, the agent also checks the Referrers Tag Schema. It also checks this schema when Skopeo does not support the referrers command. A CI-published referrer does not require a `spec.os.deltaImage` hint. An existing hint takes precedence over referrer discovery and is accepted only when its OCI `subject.digest` matches the target platform manifest digest. The agent validates the source digest declared by the delta artifact. For discovery, it selects the locally usable delta with the smallest total download size, including the manifest, configuration, and layers. Equal sizes are resolved by image reference in lexical order.
 
 The agent discovers matching referrers directly in the target image repository using the registry's referrers API or the Referrers Tag Schema compatibility path. Flight Control sets the read-only `spec.os.deltaImage` field for available generated deltas; the agent tries that reference first, then uses referrer discovery when the reference is absent.
 
 The device uses its existing OS image pull credentials to pull the target image and delta. See [Using Image Pull Secrets](#using-image-pull-secrets) for private registries.
 
-The agent uses a full image pull when a matching delta is unavailable or a delta pull or apply fails. See [OS delta status](../references/device-api-statuses.md#os-delta-status) for outcome definitions and how to inspect the result of an OS delta update.
+If a hint is unusable, or a selected delta fails during download, reconstruction, or staging, the agent reports `Fallback` with a reason and attempts a full image pull. It reports `Applied` after staging both the reconstruction and the desired registry reference. Reconciliation fails if full-image recovery also fails. See [OS delta status](../references/device-api-statuses.md#os-delta-status) for how to inspect these results.
+
+When the desired OS image is already booted or cached in container storage, the agent reuses it without inspecting the registry digest, discovering deltas, or pulling the image again. A cached tag is reused even if its registry content has changed. If no delta outcome is already recorded for that desired image, the agent reports `NotRequired`; it retains earlier outcomes such as `Applied` or `Fallback`. Delta discovery and validation run only when the desired image needs to be fetched. Full-image prefetch uses `PullIfNotPresent`.
 
 ### Using Image Pull Secrets
 
@@ -533,6 +537,16 @@ ssh-keyscan gitlab.com >> known_hosts
 ssh-keyscan private-git-server.com >> known_hosts
 ```
 
+For an SSH repository that uses a non-default port, scan that port explicitly:
+
+```console
+ssh-keyscan -p 443 ssh.github.com >> known_hosts
+```
+
+The resulting entry uses the bracketed `[host]:port` form. Flight Control
+requires that exact entry when the repository URL specifies a custom port; it
+does not reuse a host-key entry for a different port.
+
 Example `known_hosts` file content:
 
 ```text
@@ -581,6 +595,17 @@ spec:
     sshPrivateKey: <base64-encoded-private-key>
     # Optional: privateKeyPassphrase: your-passphrase
     # Optional: skipServerVerification: true
+```
+
+Standard URI-form SSH URLs are also supported. This form is useful when SSH
+must use a non-default port, for example:
+
+```yaml
+spec:
+  type: git
+  url: ssh://git@ssh.github.com:443/myorg/private-repo.git
+  sshConfig:
+    sshPrivateKey: <base64-encoded-private-key>
 ```
 
 ##### HTTPS Authentication
@@ -763,14 +788,16 @@ Flight Control evaluates reported main and nested image references as delta gene
 | ----------- | -------------------------- | ----------------- |
 | Container | Main container image and container images used by volumes. | Podman. |
 | Compose or Quadlet | Application package when delivered as an OCI container image, workload container images, and container images used by volumes. | Podman. |
-| Helm | Workload container images referenced by tags. Digest-pinned images currently use regular CRI pulls. | CRI-O or containerd. Other CRI runtimes use full image pulls. |
+| Helm | Workload container images referenced by tags or digests. | CRI-O or containerd. Other CRI runtimes use full image pulls. |
 | VM | OCI container images used by the VM application. | Podman. |
 
-The main application package, when delivered as an OCI artifact, and the Helm chart itself use regular package pulls. Workload images and image-backed volumes are evaluated individually for delta generation and application. Digest-pinned Helm workload images currently use regular CRI image pulls. See [CRI configuration](#cri-configuration) for local image reuse requirements.
+The main application package, when delivered as an OCI artifact, and the Helm chart itself use regular package pulls. Workload images and image-backed volumes are evaluated individually for delta generation and application. See [CRI configuration](#cri-configuration) for local image reuse requirements.
 
-For a CI-published application image delta, follow the OCI 1.1 referrer convention in [CI-published OS deltas](#using-ci-published-os-deltas). Publish the referrer in the target image's repository. Set its `subject` to the target manifest, `artifactType` to `application/vnd.io.github.containers.oci-delta.v1`, and the `io.github.containers.delta.source` annotation to the source application's image digest from `status.applications[].imageDigests[].digest`. The agent discovers matching referrers directly in that repository.
+For a CI-published application image delta, follow the OCI 1.1 referrer convention in [CI-published OS deltas](#using-ci-published-os-deltas). Publish the referrer in the target image's repository. Set its `subject.digest` to the target platform manifest digest, `artifactType` to `application/vnd.io.github.containers.oci-delta.v1`, and the `io.github.containers.delta.source` annotation to the source application's image digest from `status.applications[].imageDigests[].digest`. The agent discovers matching referrers for the target platform manifest digest in that repository.
 
 Flight Control supplies generated application deltas to the agent automatically. For each image target, the agent uses an available generated delta or discovers a matching CI-published referrer. Otherwise, it pulls the full image for the current update.
+
+For `PullIfNotPresent` workload targets, a locally cached image is reused even when its mutable registry tag has moved. The agent does not inspect that tag or pull again during a cache hit. Delta discovery and pulls happen only when the target is missing from the local runtime store.
 
 Generated deltas are downloaded from the configured storage target. CI-published deltas are discovered in the target image's repository. For diagnostics, see [Verifying delta registry access](troubleshooting.md#verifying-delta-registry-access) and [Inspecting delta image references](troubleshooting.md#inspecting-delta-image-references).
 
@@ -1221,7 +1248,7 @@ runtime-endpoint: unix:///run/containerd/containerd.sock
 image-endpoint: unix:///run/containerd/containerd.sock
 ```
 
-When an OCI delta is available for a Helm workload image, the agent reconstructs it and imports it into the local CRI runtime. Containerd hosts use `ctr` and the `k8s.io` namespace. Digest-pinned workload images use a regular pull because reconstruction can change the manifest digest. If delta import is unavailable or fails, the agent falls back to `crictl pull`.
+When an OCI delta is available for a Helm workload image, the agent reconstructs it and imports it into the local CRI runtime. Containerd hosts use `ctr` and the `k8s.io` namespace. After import, the agent pulls the requested reference so the runtime records the registry's canonical manifest digest. If delta import is unavailable or fails, the agent falls back to `crictl pull`.
 
 Kubernetes can use the imported image without contacting the registry when the workload's `imagePullPolicy` allows local reuse. With `Always`, Kubernetes asks the runtime to resolve the image remotely, which can fetch layers whose digests differ from the reconstructed image.
 
@@ -2240,6 +2267,10 @@ Each device can define two independent schedules in the `updatePolicy` section o
 
 * **`downloadSchedule`**: Defines when the device is allowed to download update artifacts such as OS image layers.
 * **`updateSchedule`**: Defines when the device is allowed to apply updates.
+
+Firmware updater authorization metadata can be refreshed outside download windows
+so that devices can receive updater revocations. This does not download updater
+programs or firmware artifacts.
 
 Each schedule supports:
 

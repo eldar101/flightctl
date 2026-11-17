@@ -19,6 +19,7 @@ import (
 	"github.com/flightctl/flightctl/internal/agent/device/deltastatus"
 	"github.com/flightctl/flightctl/internal/agent/device/dependency"
 	"github.com/flightctl/flightctl/internal/agent/device/fileio"
+	firmwarepolicy "github.com/flightctl/flightctl/internal/agent/device/firmwarepolicy"
 	"github.com/flightctl/flightctl/internal/agent/device/hook"
 	imagepruning "github.com/flightctl/flightctl/internal/agent/device/image_pruning"
 	"github.com/flightctl/flightctl/internal/agent/device/lifecycle"
@@ -305,6 +306,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	pullConfigResolver := dependency.NewPullConfigResolver(a.log, rwFactory)
 
 	// create application manager
+	appDataCache := applicationprovider.NewAppDataCache()
 	applicationsManager := applications.NewManager(
 		a.log,
 		rwFactory,
@@ -313,6 +315,8 @@ func (a *Agent) Run(ctx context.Context) error {
 		systemInfoManager,
 		systemdManagerFactory,
 		pullConfigResolver,
+		applications.WithDeltaStatusStore(deltaStatusStore),
+		applications.WithAppDataCache(appDataCache),
 	)
 
 	// register the application manager with the shutdown manager
@@ -467,6 +471,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		rwFactory,
 		a.log,
 		systemInfoManager.BootTime(),
+		applications.WithControllerAppDataCache(appDataCache),
 	)
 
 	// create image pruning manager
@@ -481,6 +486,11 @@ func (a *Agent) Run(ctx context.Context) error {
 		a.config.ImagePruning,
 		a.config.DataDir,
 	)
+
+	firmwarePolicy, err := firmwarepolicy.New(deviceName, a.config.DataDir, rootReadWriter, bootstrap.ManagementClient(), a.log)
+	if err != nil {
+		return fmt.Errorf("initialize firmware policy receiver: %w", err)
+	}
 
 	// create agent
 	agent := device.NewAgent(
@@ -510,6 +520,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		criticalCh,
 		backoff,
 		a.log,
+		device.WithFirmwarePolicyReceiver(firmwarePolicy, specManager.Watch()),
 	)
 
 	// Populate collectors registered during startup before asynchronous work begins.
@@ -536,6 +547,8 @@ func (a *Agent) Run(ctx context.Context) error {
 	appConsoleWatcher := specManager.Watch()
 	startAsync(consoleManager.Run)
 	startAsync(func(ctx context.Context) { applicationsManager.RunConsole(ctx, appConsoleWatcher) })
+	// Once firmware is used, policy polling progresses independently of target delivery.
+	startAsync(firmwarePolicy.Run)
 	startAsync(specManager.Publisher().Run)
 	startAsync(certManager.Run)
 

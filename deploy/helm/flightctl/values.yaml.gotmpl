@@ -3,6 +3,12 @@
 # This section contains parameters common to all the components in the deployment, including sub-charts, ui charts, etc.
 
 global:
+  # -- Administrator-owned firmware updater catalog input. This is independent of the application Catalog API.
+  firmwareUpdaterCatalog:
+    # -- Existing ConfigMap name in each runtime namespace. Empty uses retained database state. Use a new immutable ConfigMap name for each higher revision.
+    configMapName: ""
+    # -- ConfigMap data key containing the complete validated administrator catalog document.
+    key: "updaters.yaml"
   # -- Enable OpenShift extensions - one of 'auto', 'true', 'false'.
   enableOpenShiftExtensions: "auto"
   # -- Enable MultiCluster Engine extensions - one of 'auto', 'true', 'false'.
@@ -16,8 +22,8 @@ global:
   # - auto: If cert-manager is installed, use it; otherwise, fall back to builtin.
   generateCertificates: "auto"
   # -- Whether to use generated TLS certificates on edge-terminated routes via externalCertificate.
-  # - auto: use externalCertificate on fresh install and preserve existing behavior on upgrade.
-  # - true: always use externalCertificate.
+  # - auto: use externalCertificate for synchronous builtin certificates, or configure it after the generated Secret exists for asynchronous certificates.
+  # - true: use externalCertificate; with cert-manager, configure it after the generated Secret exists.
   # - false: never use externalCertificate (rely on default router cert).
   routeExternalCertificate: "auto"
   # -- A separate Namespace to which non-user-facing components should be deployed for increased security isolation.
@@ -55,6 +61,8 @@ global:
       # -- Optional prefix for org names from this provider (e.g. "k8s-"). Incoming org name is exposed as prefix + name.
       organizationNamePrefix: ""
     oidc:
+      # -- Authorization prompt exposed to login clients. Empty string omits the prompt parameter; omitted or null defaults to select_account.
+      prompt: "select_account"
       # -- OIDC Client ID
       clientId: "flightctl-client"
       # -- List of OIDC scopes to request (e.g. openid, profile, email, roles, offline_access)
@@ -340,7 +348,14 @@ organizations:
       spec:
         resourceType: Device
         key: feature.flightctl.io/os.mode
-        expression: status.systemInfo.osMode
+        expression: >-
+          has(status.systemInfo.osMode) && status.systemInfo.osMode != null
+            && status.systemInfo.osMode != ""
+            ? status.systemInfo.osMode
+            : has(status.capabilities) && status.capabilities != null
+              && has(status.capabilities.osMode) && status.capabilities.osMode != null
+              ? status.capabilities.osMode
+              : dyn(null)
 
     # END GENERATED INITIAL LABEL SYNC MAPPINGS
 
@@ -766,6 +781,8 @@ deltaGeneration:
   maxConcurrentDeltaGenerations: 2
   # -- Per-job timeout for oci-delta/ORAS. Defaults to 30m when omitted or <= 0.
   timeout: 30m
+  # -- Timeout for terminal-generation completion fan-out. Defaults to 10m when omitted or <= 0.
+  completionTimeout: 10m
   # -- Optional prepare wait cap (Go duration, e.g. 10m). Omitted means no deadline. 0s generates then resumes immediately.
   # maxWaitForDelta: 10m
 

@@ -5,8 +5,10 @@ import (
 	"encoding/csv"
 	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/flightctl/flightctl/api/core/v1beta1"
@@ -152,7 +154,7 @@ func newQuadletProvider(
 	}
 
 	if cfg != nil && cfg.appDataCache != nil {
-		if cachedData, found := cfg.appDataCache[appName]; found {
+		if cachedData, found := cfg.appDataCache[p.ID()]; found {
 			p.AppData = cachedData
 		}
 	}
@@ -280,18 +282,16 @@ func (p *quadletProvider) writeInlineContent(appPath string) error {
 }
 
 func (p *quadletProvider) Install(ctx context.Context) error {
-	if p.AppData != nil {
-		p.log.Debugf("Cleaning up cached app data before Install")
-		if cleanupErr := p.AppData.Cleanup(); cleanupErr != nil {
-			p.log.Warnf("Failed to cleanup cached app data: %v", cleanupErr)
-		}
-		p.AppData = nil
-	}
-
+	p.spec.Volume.ResolveImageMountVolumes(ctx, p.podman)
 	if p.isImageBased() {
-		if err := p.extractOCIContents(ctx, p.spec.Path); err != nil {
+		p.spec.ImageDigest = ""
+		p.spec.ImageOCIType = ""
+		digestValue, ociType, err := installOCIParentContents(ctx, p.podman, p.log, p.readWriter, p.imageRef, p.spec.Path, p.AppData)
+		if err != nil {
 			return fmt.Errorf("extracting OCI contents: %w", err)
 		}
+		p.spec.ImageDigest = digestValue
+		p.spec.ImageOCIType = string(ociType)
 	} else {
 		if err := p.writeInlineContent(p.spec.Path); err != nil {
 			return fmt.Errorf("writing inline content: %w", err)
@@ -310,8 +310,11 @@ func (p *quadletProvider) Install(ctx context.Context) error {
 		}
 		p.spec.Volume.AddVolumes(quadletVolumes)
 	}
+	if err := bindQuadletImageVolumes(ctx, p.podman, p.readWriter, p.spec.Path, p.spec.ID, p.spec.Lifetime, p.spec.User, p.log); err != nil {
+		return fmt.Errorf("binding Quadlet image volumes: %w", err)
+	}
 
-	if err := installQuadlet(p.readWriter, p.log, p.spec.Path, quadletSystemdTargetPath(p.spec.User, p.spec.ID), p.spec.ID); err != nil {
+	if err := installQuadlet(p.readWriter, p.log, p.spec.Path, quadletSystemdTargetPath(p.spec.User, p.spec.ID), p.spec.ID, p.spec.User); err != nil {
 		return fmt.Errorf("installing quadlet: %w", err)
 	}
 
@@ -319,14 +322,6 @@ func (p *quadletProvider) Install(ctx context.Context) error {
 }
 
 func (p *quadletProvider) Remove(ctx context.Context) error {
-	if p.AppData != nil {
-		p.log.Debugf("Cleaning up cached app data before Remove")
-		if cleanupErr := p.AppData.Cleanup(); cleanupErr != nil {
-			p.log.Warnf("Failed to cleanup cached app data: %v", cleanupErr)
-		}
-		p.AppData = nil
-	}
-
 	targetPath := quadletSystemdTargetPath(p.spec.User, p.spec.ID)
 	if err := p.readWriter.RemoveFile(targetPath); err != nil {
 		return fmt.Errorf("removing quadlet target file: %w", err)
@@ -397,7 +392,7 @@ func (p *quadletProvider) extractNestedTargets(ctx context.Context, configProvid
 		return &AppData{}, nil
 	}
 
-	appData, err := extractAppDataFromOCITarget(ctx, p.podman, p.readWriter, p.spec.Name, p.imageRef, v1beta1.AppTypeQuadlet, p.spec.User, configProvider)
+	appData, err := extractAppDataFromOCITarget(ctx, p.podman, p.readWriter, p.log, p.spec.Name, p.imageRef, v1beta1.AppTypeQuadlet, p.spec.User, configProvider)
 	if err != nil {
 		return nil, err
 	}
@@ -409,31 +404,17 @@ func (p *quadletProvider) parentIsAvailable(ctx context.Context) (string, string
 		return "", "", true, nil
 	}
 
-	if p.podman.ImageExists(ctx, p.imageRef) {
-		digest, err := p.podman.ImageDigest(ctx, p.imageRef)
-		if err != nil {
-			return "", "", false, fmt.Errorf("getting image digest: %w", err)
-		}
-		return p.imageRef, digest, true, nil
-	}
-
-	if p.podman.ArtifactExists(ctx, p.imageRef) {
-		digest, err := p.podman.ArtifactDigest(ctx, p.imageRef)
-		if err != nil {
-			return "", "", false, fmt.Errorf("getting artifact digest: %w", err)
-		}
-		return p.imageRef, digest, true, nil
-	}
-
-	return p.imageRef, "", false, nil
+	return availableOCIParent(ctx, p.podman, p.log, p.imageRef)
 }
 
 type quadletInstaller struct {
-	readWriter  fileio.ReadWriter
-	logger      *log.PrefixLogger
-	appUnitPath string
-	targetPath  string
-	appID       string
+	readWriter      fileio.ReadWriter
+	logger          *log.PrefixLogger
+	appUnitPath     string
+	targetPath      string
+	appID           string
+	user            v1beta1.Username
+	eventConfigPath string
 }
 
 // installQuadlet prepares Podman quadlet files for use with flightctl by applying namespacing,
@@ -501,18 +482,24 @@ type quadletInstaller struct {
 //	    myapp-.volume.d/
 //	      99-flightctl.conf      (flightctl overrides)
 //	    .env                     (preserved as-is)
-func installQuadlet(readWriter fileio.ReadWriter, logger *log.PrefixLogger, appUnitPath string, targetPath string, appID string) error {
+func installQuadlet(readWriter fileio.ReadWriter, logger *log.PrefixLogger, appUnitPath string, targetPath string, appID string, user v1beta1.Username) error {
 	q := &quadletInstaller{
 		readWriter:  readWriter,
 		logger:      logger,
 		appUnitPath: appUnitPath,
 		targetPath:  targetPath,
 		appID:       appID,
+		user:        user,
 	}
 	return q.install()
 }
 
 func (q *quadletInstaller) install() error {
+	var err error
+	q.eventConfigPath, err = ensureQuadletEventConfiguration(q.readWriter, filepath.Dir(q.appUnitPath), q.user)
+	if err != nil {
+		return fmt.Errorf("ensuring Podman event configuration: %w", err)
+	}
 	entries, err := q.readWriter.ReadDir(q.appUnitPath)
 	if err != nil {
 		return fmt.Errorf("reading directory: %w", err)
@@ -612,6 +599,39 @@ func (q *quadletInstaller) install() error {
 	}
 
 	return nil
+}
+
+// ensureQuadletEventConfiguration maintains the agent-owned configuration shared
+// by one user's Quadlet applications. Stop commands need it after app removal.
+func ensureQuadletEventConfiguration(rw fileio.ReadWriter, quadletRoot string, user v1beta1.Username) (string, error) {
+	uid, gid := strconv.Itoa(os.Geteuid()), strconv.Itoa(os.Getegid())
+	if !user.IsCurrentProcessUser() {
+		userUID, userGID, _, err := userutil.LookupUser(user)
+		if err != nil {
+			return "", fmt.Errorf("looking up user %s: %w", user, err)
+		}
+		uid, gid = strconv.FormatUint(uint64(userUID), 10), strconv.FormatUint(uint64(userGID), 10)
+	}
+	configPath := filepath.Join(quadletRoot, client.PodmanEventsConfigFilename)
+	file, err := rw.CreateManagedFile(v1beta1.FileSpec{
+		Path: configPath, Content: client.PodmanEventsConfigContents,
+		Mode: lo.ToPtr(int(fileio.DefaultFilePermissions)), User: v1beta1.Username(uid), Group: gid,
+	})
+	if err != nil {
+		return "", err
+	}
+	upToDate, err := file.IsUpToDate()
+	// An unreadable agent-owned file can still be atomically replaced through
+	// its parent directory to restore the required contents and permissions.
+	if err != nil && !errors.Is(err, fs.ErrPermission) {
+		return "", err
+	}
+	if !upToDate {
+		if err := file.Write(); err != nil {
+			return "", err
+		}
+	}
+	return configPath, nil
 }
 
 func namespacedQuadlet(appID string, name string) string {
@@ -787,6 +807,9 @@ func (q *quadletInstaller) createQuadletDropIn(extension string, hasEnvFile bool
 
 	unit := quadlet.NewEmptyUnit()
 	unit.Add("Unit", "PartOf", quadlet.NamespaceResource(q.appID, lifecycle.QuadletTargetName))
+	// [Service] sets the host Podman environment, including generated VM helpers.
+	// [Container] Environment would only configure the application inside it.
+	unit.Add("Service", "Environment", fmt.Sprintf("%q", "CONTAINERS_CONF_OVERRIDE="+strings.ReplaceAll(q.eventConfigPath, "%", "%%")))
 
 	// add label for tracking quadlet events by app id
 	switch extension {

@@ -2,7 +2,6 @@ package device
 
 import (
 	"context"
-	"reflect"
 
 	"github.com/flightctl/flightctl/internal/consts"
 	"github.com/flightctl/flightctl/internal/domain"
@@ -34,14 +33,6 @@ func EmitDeviceUpdatedEvent(ctx context.Context, eventsService events.Service, l
 
 	// Only generate status change events when the device is not being created
 	if !created {
-		if oldDevice != nil && newDevice != nil && !reflect.DeepEqual(oldDevice.Status, newDevice.Status) {
-			// Emit an identity-only update so the worker can reconcile from committed state.
-			// Focused events below describe known status transitions; mapped label changes
-			// are only known after all current mappings have been evaluated.
-			event := domain.GetBaseEvent(ctx, domain.DeviceKind, name, domain.EventReasonResourceUpdated, "Device status changed", nil)
-			eventsService.CreateEvent(ctx, orgId, event)
-		}
-
 		statusUpdates := common.ComputeDeviceStatusChanges(ctx, oldDevice, newDevice, orgId)
 
 		// Deduplicate DeviceDisconnected events - if multiple status fields changed to Unknown,
@@ -72,6 +63,9 @@ func EmitDeviceUpdatedEvent(ctx context.Context, eventsService events.Service, l
 	// Spec changes must trigger ResourceUpdated even when Generation is missing/unchanged
 	// on the before/after snapshots (render tasks key off UpdatedFields=Spec).
 	updateDetails = ensureSpecUpdatedField(updateDetails, oldDevice, newDevice)
+	if domain.DeviceRequiresFirmwareHold(oldDevice) != domain.DeviceRequiresFirmwareHold(newDevice) {
+		updateDetails = ensureUpdatedField(updateDetails, domain.UpdatedFieldStatusFirmware)
+	}
 	// Fleet matching needs an explicit gate-change field when the agent reports
 	// hook completion; a generic status event only reconciles device labels.
 	if domain.IsDeviceEnrollmentHooksGated(oldDevice) && !domain.IsDeviceEnrollmentHooksGated(newDevice) {
@@ -134,15 +128,19 @@ func ensureSpecUpdatedField(details *domain.ResourceUpdatedDetails, oldDevice, n
 	if !deviceSpecsChanged(oldDevice, newDevice) {
 		return details
 	}
+	return ensureUpdatedField(details, domain.Spec)
+}
+
+func ensureUpdatedField(details *domain.ResourceUpdatedDetails, field domain.ResourceUpdatedDetailsUpdatedFields) *domain.ResourceUpdatedDetails {
 	if details == nil {
 		details = &domain.ResourceUpdatedDetails{}
 	}
-	for _, field := range details.UpdatedFields {
-		if field == domain.Spec {
+	for _, existing := range details.UpdatedFields {
+		if existing == field {
 			return details
 		}
 	}
-	details.UpdatedFields = append(details.UpdatedFields, domain.Spec)
+	details.UpdatedFields = append(details.UpdatedFields, field)
 	return details
 }
 

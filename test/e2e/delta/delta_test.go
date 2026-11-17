@@ -64,7 +64,7 @@ type deltaUpdateSnapshot struct {
 }
 
 var _ = Describe("OS delta hold", Label("delta"), Serial, func() {
-	It("When a fleet OS image changes with a writable delta target it should hold then apply a generated OS delta", func() {
+	It("When a fleet OS image changes with a writable delta target it should hold then apply a generated OS delta", Label("OCP-90800"), func() {
 		harness := e2e.GetWorkerHarness()
 		createWritableDeltaRepo(harness)
 
@@ -84,7 +84,7 @@ var _ = Describe("OS delta hold", Label("delta"), Serial, func() {
 		waitSettledOSDeltaUpdate(harness, fleetName, deviceId, v2Image, deltaUpdateExpectGeneratedAndUsed, eventBaseline)
 	})
 
-	It("When generateDelta is false it should write the new OS spec without FleetDeltaPreparing", func() {
+	It("When generateDelta is false it should write the new OS spec without FleetDeltaPreparing", Label("OCP-90799"), func() {
 		harness := e2e.GetWorkerHarness()
 		createWritableDeltaRepo(harness)
 
@@ -104,7 +104,7 @@ var _ = Describe("OS delta hold", Label("delta"), Serial, func() {
 			"device spec is V2 and UpToDate without waiting for generation", TIMEOUT)
 	})
 
-	It("When maxWaitForDelta expires it should roll out the OS without a deltaImage hint", func() {
+	It("When maxWaitForDelta expires it should roll out the OS without a deltaImage hint", Label("OCP-90798"), func() {
 		temporarilyUseFastDeltaPrepareDeadlinePoll()
 
 		harness := e2e.GetWorkerHarness()
@@ -126,12 +126,30 @@ var _ = Describe("OS delta hold", Label("delta"), Serial, func() {
 		waitSettledOSDeltaUpdate(harness, fleetName, deviceId, v2Image, deltaUpdateExpectGenerationButNotUsed, eventBaseline)
 	})
 
-	It("When a standalone device OS spec changes with a writable delta target it should delay render then hint", Label("standalone"), func() {
+	It("When a standalone device OS spec changes with a writable delta target it should delay render then hint", Label("standalone"), Label("OCP-90797"), func() {
 		harness := e2e.GetWorkerHarness()
-		createWritableDeltaRepo(harness)
 
 		deviceId, _ := harness.EnrollAndWaitForOnlineStatus()
 		waitDeviceUpToDate(harness, deviceId, "device UpToDate on current OS")
+
+		By("booting the registry base image so the delta source is available in the target repository")
+		baseImage := harness.GetDeviceImageRefForFleet(auxSvcs.Registry.Host, auxSvcs.Registry.Port, util.DeviceTags.Base)
+		Expect(harness.UpdateDeviceWithRetries(deviceId, func(device *v1beta1.Device) {
+			if device.Spec == nil {
+				device.Spec = &v1beta1.DeviceSpec{}
+			}
+			device.Spec.Os = &v1beta1.DeviceOsSpec{Image: baseImage}
+		})).To(Succeed())
+		harness.WaitForDeviceContents(deviceId, "device UpToDate on the registry base OS", func(device *v1beta1.Device) bool {
+			return device.Status != nil && device.Status.Os.Image == baseImage &&
+				device.Status.Updated.Status == v1beta1.DeviceUpdatedStatusUpToDate
+		}, LONGTIMEOUT)
+		sourceDigest := getDeltaDevice(harness, deviceId).Status.Os.ImageDigest
+		Expect(sourceDigest).NotTo(BeEmpty())
+		_, err := harness.ResolveImage(applicationRegistryEndpoint(), util.DeviceImageRegistryPath, sourceDigest)
+		Expect(err).NotTo(HaveOccurred(), "booted OS source digest %s must be available in the delta target repository", sourceDigest)
+
+		createWritableDeltaRepo(harness)
 		requireDeltaGenerationSupport(harness, deviceId)
 
 		v2Image := harness.GetDeviceImageRefForFleet(auxSvcs.Registry.Host, auxSvcs.Registry.Port, util.DeviceTags.V2)
@@ -147,7 +165,7 @@ var _ = Describe("OS delta hold", Label("delta"), Serial, func() {
 		waitSettledOSDeltaUpdate(harness, "", deviceId, v2Image, deltaUpdateExpectGeneratedAndUsed, eventBaseline)
 	})
 
-	It("When there is no writable delta target it should update OS without a hint", func() {
+	It("When there is no writable delta target it should update OS without a hint", Label("OCP-90796"), func() {
 		harness := e2e.GetWorkerHarness()
 
 		fleetName := "delta-os-no-target"
@@ -278,7 +296,6 @@ func osFleetSpec(harness *e2e.Harness, fleetName, imageTag string, policy *v1bet
 }
 
 func requireDeltaGenerationSupport(harness *e2e.Harness, deviceId string) {
-	infra.RequireOciDeltaAvailable(harness.Context, setup.GetDefaultProviders())
 	device, err := harness.GetDevice(deviceId)
 	if err != nil {
 		Fail(fmt.Sprintf("get device %s: %v", deviceId, err))
@@ -351,47 +368,47 @@ func waitForRolloutWithoutDeltaPreparing(harness *e2e.Harness, fleetName, device
 	deviceProgress := generationProgressTracker{lastChange: time.Now()}
 	lastLifecycleProgress := time.Now()
 	var settledAt time.Time
-	Eventually(func() error {
+	Eventually(func() (bool, error) {
 		fleet, err := harness.GetFleet(fleetName)
 		if err != nil {
-			return fmt.Errorf("get fleet %s: %w", fleetName, err)
+			return pollNil(fmt.Errorf("get fleet %s: %w", fleetName, err))
 		}
 		failIfDeltaPreparingFailed(fleet)
 		if fleetConditionTrue(fleet, v1beta1.ConditionTypeFleetDeltaPreparing) {
-			return StopTrying(fmt.Sprintf("fleet %s unexpectedly entered FleetDeltaPreparing", fleetName))
+			return pollNil(StopTrying(fmt.Sprintf("fleet %s unexpectedly entered FleetDeltaPreparing", fleetName)))
 		}
 
 		device, err := harness.GetDevice(deviceId)
 		if err != nil {
-			return fmt.Errorf("get device %s: %w", deviceId, err)
+			return pollNil(fmt.Errorf("get device %s: %w", deviceId, err))
 		}
 		if device.Status == nil {
-			return fmt.Errorf("device %s has no status", deviceId)
+			return pollNil(fmt.Errorf("device %s has no status", deviceId))
 		}
 		lifecycle, observedProgress, err := observeDeltaLifecycleEvents(harness, fleetName, deviceId, baseline, loggedEvents, &fleetProgress, &deviceProgress)
 		if err != nil {
-			return err
+			return pollNil(err)
 		}
 		if observedProgress {
 			lastLifecycleProgress = time.Now()
 		}
 		if lifecycle.generationProgress {
-			return StopTrying(fmt.Sprintf("device %s unexpectedly observed DeltaGenerationProgress while delta generation is disabled", deviceId))
+			return pollNil(StopTrying(fmt.Sprintf("device %s unexpectedly observed DeltaGenerationProgress while delta generation is disabled", deviceId)))
 		}
 		failIfDeviceDeltaPreparingFailed(device)
 		if deviceConditionTrue(device, v1beta1.ConditionTypeDeviceDeltaPreparing) {
-			return StopTrying(fmt.Sprintf("device %s unexpectedly entered DeviceDeltaPreparing", deviceId))
+			return pollNil(StopTrying(fmt.Sprintf("device %s unexpectedly entered DeviceDeltaPreparing", deviceId)))
 		}
 
 		rendered, err := tryRenderedDevice(harness, deviceId)
 		if err != nil {
 			if time.Since(lastLifecycleProgress) > rolloutProgressStall {
-				return StopTrying(fmt.Sprintf("device %s rollout made no observable progress for %s", deviceId, rolloutProgressStall))
+				return pollNil(StopTrying(fmt.Sprintf("device %s rollout made no observable progress for %s", deviceId, rolloutProgressStall)))
 			}
-			return err
+			return pollNil(err)
 		}
 		if renderedOsImage(rendered) == v2Image && renderedDeltaImage(rendered) != "" {
-			return StopTrying(fmt.Sprintf("device %s rendered unexpected OS delta hint %q", deviceId, renderedDeltaImage(rendered)))
+			return pollNil(StopTrying(fmt.Sprintf("device %s rendered unexpected OS delta hint %q", deviceId, renderedDeltaImage(rendered))))
 		}
 		deviceSettled := deviceOsImage(device) == v2Image &&
 			device.Status.Updated.Status == v1beta1.DeviceUpdatedStatusUpToDate &&
@@ -399,18 +416,18 @@ func waitForRolloutWithoutDeltaPreparing(harness *e2e.Harness, fleetName, device
 		if !deviceSettled {
 			settledAt = time.Time{}
 			if time.Since(lastLifecycleProgress) > rolloutProgressStall {
-				return StopTrying(fmt.Sprintf("device %s rollout made no observable progress for %s", deviceId, rolloutProgressStall))
+				return pollNil(StopTrying(fmt.Sprintf("device %s rollout made no observable progress for %s", deviceId, rolloutProgressStall)))
 			}
-			return fmt.Errorf("device %s has not reached UpToDate on %q (reported image %q, rendered image %q)", deviceId, v2Image, device.Status.Os.Image, renderedOsImage(rendered))
+			return pollNil(fmt.Errorf("device %s has not reached UpToDate on %q (reported image %q, rendered image %q)", deviceId, v2Image, device.Status.Os.Image, renderedOsImage(rendered)))
 		}
 		if settledAt.IsZero() {
 			settledAt = time.Now()
 		}
 		if !lifecycle.deviceContentUpToDate {
-			return retrySettledEvent(fmt.Errorf("device %s reached the target state without a DeviceContentUpToDate event", deviceId), settledAt)
+			return pollNil(retrySettledEvent(fmt.Errorf("device %s reached the target state without a DeviceContentUpToDate event", deviceId), settledAt))
 		}
-		return nil
-	}, timeout, POLLING).Should(BeNil(), description)
+		return pollNil(nil)
+	}, timeout, POLLING).Should(BeTrue(), description)
 }
 
 func waitSettledOSDeltaUpdate(harness *e2e.Harness, fleetName, deviceId, v2Image string, expectation deltaUpdateExpectation, baseline deltaEventBaseline) {
@@ -420,26 +437,34 @@ func waitSettledOSDeltaUpdate(harness *e2e.Harness, fleetName, deviceId, v2Image
 		loggedEvents:          make(map[string]struct{}),
 		lastLifecycleProgress: time.Now(),
 	}
-	Eventually(func() error {
+	Eventually(func() (bool, error) {
 		snapshot, err := observeOSDeltaUpdate(harness, fleetName, deviceId, expectation, baseline, &tracker)
 		if err != nil {
-			return err
+			return pollNil(err)
 		}
 
 		rendered, err := renderedDeviceOrWaitForProgress(harness, fleetName, deviceId, expectation, snapshot.lifecycle, &tracker)
 		if err != nil {
-			return err
+			return pollNil(err)
 		}
 		if !deviceOSDeltaUpdateSettled(snapshot.device, rendered, v2Image) {
 			tracker.settledAt = time.Time{}
-			return retryUnsettledOSDeltaUpdate(snapshot, rendered, expectation, fleetName, deviceId, v2Image, &tracker)
+			return pollNil(retryUnsettledOSDeltaUpdate(snapshot, rendered, expectation, fleetName, deviceId, v2Image, &tracker))
 		}
 
 		if tracker.settledAt.IsZero() {
 			tracker.settledAt = time.Now()
 		}
-		return validateSettledOSDeltaUpdate(snapshot, rendered, expectation, fleetName, deviceId, v2Image, tracker.settledAt)
-	}, LONGTIMEOUT, POLLING).Should(BeNil())
+		return pollNil(validateSettledOSDeltaUpdate(snapshot, rendered, expectation, fleetName, deviceId, v2Image, tracker.settledAt))
+	}, LONGTIMEOUT, POLLING).Should(BeTrue())
+}
+
+// pollNil succeeds only when err is nil. Retry errors and StopTrying stay in the
+// error return. Gomega treats a lone error return as the matched value, so a later
+// StopTrying would fail BeNil against the previous retry ("At one point, however,
+// the function did return successfully").
+func pollNil(err error) (bool, error) {
+	return err == nil, err
 }
 
 func observeOSDeltaUpdate(harness *e2e.Harness, fleetName, deviceId string, expectation deltaUpdateExpectation, baseline deltaEventBaseline, tracker *deltaUpdateWaitTracker) (deltaUpdateSnapshot, error) {
@@ -642,7 +667,7 @@ func observeDeltaLifecycleEvents(harness *e2e.Harness, fleetName, deviceId strin
 
 func observeDeltaGenerationProgress(events []v1beta1.Event, kind, name string, observation *deltaLifecycleObservation) error {
 	for _, event := range events {
-		if event.Reason != v1beta1.EventReasonDeltaGenerationProgress {
+		if !isDeltaGenerationLifecycleReason(event.Reason) {
 			continue
 		}
 		if event.Details == nil {
@@ -680,6 +705,18 @@ func observeDeltaGenerationProgress(events []v1beta1.Event, kind, name string, o
 		}
 	}
 	return nil
+}
+
+func isDeltaGenerationLifecycleReason(reason v1beta1.EventReason) bool {
+	switch reason {
+	case v1beta1.EventReasonDeltaGenerationProgress,
+		v1beta1.EventReasonDeltaGenerationSucceeded,
+		v1beta1.EventReasonDeltaGenerationFailed,
+		v1beta1.EventReasonDeltaGenerationRejected:
+		return true
+	default:
+		return false
+	}
 }
 
 func expectedGenerationProgressPending(expectation deltaUpdateExpectation, observation deltaLifecycleObservation, fleetName, deviceId string) (bool, string) {
@@ -801,7 +838,7 @@ func logDeltaEventsOnce(events []v1beta1.Event, loggedEvents map[string]struct{}
 			continue
 		}
 		loggedEvents[*event.Metadata.Name] = struct{}{}
-		if event.Reason == v1beta1.EventReasonDeltaGenerationProgress && progress != nil {
+		if isDeltaGenerationLifecycleReason(event.Reason) && progress != nil {
 			progress.lastChange = time.Now()
 		}
 		observedProgress = isDeltaLifecycleProgressEvent(event.Reason) || observedProgress
@@ -811,9 +848,11 @@ func logDeltaEventsOnce(events []v1beta1.Event, loggedEvents map[string]struct{}
 }
 
 func isDeltaLifecycleProgressEvent(reason v1beta1.EventReason) bool {
+	if isDeltaGenerationLifecycleReason(reason) {
+		return true
+	}
 	switch reason {
-	case v1beta1.EventReasonDeltaGenerationProgress,
-		v1beta1.EventReasonDeltaGenerationCompleted,
+	case v1beta1.EventReasonDeltaGenerationCompleted,
 		v1beta1.EventReasonDeviceContentOutOfDate,
 		v1beta1.EventReasonDeviceContentUpdating,
 		v1beta1.EventReasonDeviceIsRebooting,

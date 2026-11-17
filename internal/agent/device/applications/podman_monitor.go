@@ -19,10 +19,13 @@ import (
 	appconsole "github.com/flightctl/flightctl/internal/agent/device/applications/console"
 	"github.com/flightctl/flightctl/internal/agent/device/applications/lifecycle"
 	"github.com/flightctl/flightctl/internal/agent/device/applications/provider"
+	"github.com/flightctl/flightctl/internal/agent/device/deltastatus"
 	"github.com/flightctl/flightctl/internal/agent/device/errors"
 	"github.com/flightctl/flightctl/internal/agent/device/fileio"
 	"github.com/flightctl/flightctl/internal/agent/device/systemd"
 	"github.com/flightctl/flightctl/pkg/log"
+	"github.com/mohae/deepcopy"
+	"github.com/opencontainers/go-digest"
 	"github.com/samber/lo"
 )
 
@@ -31,6 +34,7 @@ const (
 	quadletSystemdLabel           = "PODMAN_SYSTEMD_UNIT"
 	podmanHealthStatusEvent       = "health_status"
 	composeServiceLabel           = "com.docker.compose.service"
+	maxPodmanEventBytes           = 4 * 1024 * 1024
 )
 
 type PodmanMonitor struct {
@@ -58,13 +62,32 @@ type pendingRecovery struct {
 	allServices        bool
 }
 
+// PodmanMonitorOption configures optional Podman monitor dependencies.
+type PodmanMonitorOption func(*podmanMonitorOptions)
+
+type podmanMonitorOptions struct {
+	deltaStatusStore *deltastatus.Store
+}
+
+// WithPodmanMonitorDeltaStatusStore supplies the store used by application lifecycle handlers.
+func WithPodmanMonitorDeltaStatusStore(store *deltastatus.Store) PodmanMonitorOption {
+	return func(options *podmanMonitorOptions) {
+		options.deltaStatusStore = store
+	}
+}
+
 func NewPodmanMonitor(
 	log *log.PrefixLogger,
 	podmanFactory client.PodmanFactory,
 	systemdFactory systemd.ManagerFactory,
 	bootTime string,
 	rwFactory fileio.ReadWriterFactory,
+	options ...PodmanMonitorOption,
 ) *PodmanMonitor {
+	var configured podmanMonitorOptions
+	for _, option := range options {
+		option(&configured)
+	}
 	// don't fail for this. This is being parsed purely for informational reasons in the event something fails
 	startTime, err := time.Parse(time.RFC3339, bootTime)
 	if err != nil {
@@ -75,8 +98,8 @@ func NewPodmanMonitor(
 		clientFactory:  podmanFactory,
 		systemdFactory: systemdFactory,
 		handlers: map[v1beta1.AppType]lifecycle.ActionHandler{
-			v1beta1.AppTypeCompose: lifecycle.NewCompose(log, rwFactory, podmanFactory),
-			v1beta1.AppTypeQuadlet: lifecycle.NewQuadlet(log, rwFactory, systemdFactory, podmanFactory),
+			v1beta1.AppTypeCompose: lifecycle.NewCompose(log, rwFactory, podmanFactory, lifecycle.WithDeltaStatusStore(configured.deltaStatusStore)),
+			v1beta1.AppTypeQuadlet: lifecycle.NewQuadlet(log, rwFactory, systemdFactory, podmanFactory, lifecycle.WithDeltaStatusStore(configured.deltaStatusStore)),
 		},
 		watchers:               make(map[v1beta1.Username]*podmanEventWatcher),
 		apps:                   make(map[string]Application),
@@ -244,6 +267,7 @@ func (m *PodmanMonitor) QueueLifecycle(appID string, desiredState v1beta1.Applic
 	m.actions = append(m.actions, lifecycle.Action{
 		ID:                 appID,
 		Name:               app.Name(),
+		Lifetime:           app.ImageSnapshot().Lifetime,
 		User:               app.User(),
 		AppType:            app.AppType(),
 		Path:               app.Path(),
@@ -332,6 +356,7 @@ func (m *PodmanMonitor) Ensure(ctx context.Context, app Application) error {
 		Type:     lifecycle.ActionAdd,
 		User:     app.User(),
 		Name:     appName,
+		Lifetime: app.ImageSnapshot().Lifetime,
 		ID:       appID,
 		Path:     app.Path(),
 		Embedded: app.IsEmbedded(),
@@ -356,12 +381,13 @@ func (m *PodmanMonitor) QueueRemove(app Application) error {
 	appName := app.Name()
 
 	action := lifecycle.Action{
-		AppType: app.AppType(),
-		Type:    lifecycle.ActionRemove,
-		Name:    appName,
-		User:    app.User(),
-		ID:      appID,
-		Volumes: provider.ToLifecycleVolumes(app.Volume().List()),
+		AppType:  app.AppType(),
+		Type:     lifecycle.ActionRemove,
+		Name:     appName,
+		Lifetime: app.ImageSnapshot().Lifetime,
+		User:     app.User(),
+		ID:       appID,
+		Volumes:  provider.ToLifecycleVolumes(app.Volume().List()),
 	}
 
 	m.actions = append(m.actions, action)
@@ -382,13 +408,14 @@ func (m *PodmanMonitor) QueueUpdate(app Application) error {
 
 	// currently we don't support updating embedded applications
 	action := lifecycle.Action{
-		AppType: app.AppType(),
-		Type:    lifecycle.ActionUpdate,
-		Name:    app.Name(),
-		User:    app.User(),
-		ID:      appID,
-		Path:    app.Path(),
-		Volumes: provider.ToLifecycleVolumes(app.Volume().List()),
+		AppType:  app.AppType(),
+		Type:     lifecycle.ActionUpdate,
+		Name:     app.Name(),
+		Lifetime: app.ImageSnapshot().Lifetime,
+		User:     app.User(),
+		ID:       appID,
+		Path:     app.Path(),
+		Volumes:  provider.ToLifecycleVolumes(app.Volume().List()),
 	}
 
 	m.actions = append(m.actions, action)
@@ -531,11 +558,12 @@ func (m *PodmanMonitor) lifecycleDispatch(appID string) (lifecycle.LifecycleHand
 	}
 
 	action := lifecycle.Action{
-		ID:      app.ID(),
-		Name:    app.Name(),
-		User:    app.User(),
-		AppType: app.AppType(),
-		Path:    app.Path(),
+		ID:       app.ID(),
+		Name:     app.Name(),
+		Lifetime: app.ImageSnapshot().Lifetime,
+		User:     app.User(),
+		AppType:  app.AppType(),
+		Path:     app.Path(),
 	}
 	return handler, action, app, nil
 }
@@ -678,7 +706,8 @@ func (m *PodmanMonitor) Status() ([]AppStatusResult, error) {
 		}
 		results = append(results, AppStatusResult{
 			ID:      app.ID(),
-			Status:  *appStatus,
+			Status:  *deepcopy.Copy(appStatus).(*v1beta1.DeviceApplicationStatus),
+			Images:  app.ImageSnapshot(),
 			Summary: appSummary,
 		})
 	}
@@ -723,6 +752,10 @@ func (m *PodmanMonitor) handleEvent(ctx context.Context, event client.PodmanEven
 	m.mu.Unlock()
 	if !ok {
 		m.log.Debugf("Application not found: %s", appID)
+		return
+	}
+	if event.StoreOwner != nil && *event.StoreOwner != app.User() {
+		m.log.Debugf("Ignoring event from another Podman user store for app %s", appID)
 		return
 	}
 	m.updateAppStatus(ctx, app, &event)
@@ -810,8 +843,10 @@ func (m *PodmanMonitor) updateApplicationStatus(
 	status StatusType,
 	restarts int,
 	podmanClient *client.Podman,
+	inspectData []client.PodmanInspect,
 ) {
-	image, hasImage := m.resolveWorkloadImage(ctx, app, event, podmanClient)
+	image, hasImage := m.resolveWorkloadImage(ctx, app, event, podmanClient, inspectData)
+	imageNotRequired := event.Image == "" && m.isRootfsInfraContainer(ctx, app, event, podmanClient, inspectData)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -825,6 +860,12 @@ func (m *PodmanMonitor) updateApplicationStatus(
 		container.Status = status
 		if hasImage {
 			container.Images = []WorkloadImage{image}
+		}
+		if imageNotRequired {
+			container.Images = nil
+		}
+		if event.ID != "" || hasImage {
+			container.ImageNotRequired = imageNotRequired
 		}
 		if event.ID != "" {
 			if event.ID != container.ID && !hasImage {
@@ -854,13 +895,56 @@ func (m *PodmanMonitor) updateApplicationStatus(
 	// add new container
 	m.log.Debugf("Adding container: %s to app %s", event.Name, app.Name())
 	app.AddWorkload(&Workload{
-		ID:          event.ID,
-		Images:      images,
-		Name:        event.Name,
-		ServiceName: event.Attributes[composeServiceLabel],
-		Status:      status,
-		Restarts:    restarts,
+		ID:               event.ID,
+		Images:           images,
+		ImageNotRequired: imageNotRequired,
+		Name:             event.Name,
+		ServiceName:      event.Attributes[composeServiceLabel],
+		Status:           status,
+		Restarts:         restarts,
 	})
+}
+
+// isRootfsInfraContainer distinguishes Podman's image-less pod infrastructure
+// from a workload whose image identity has not been collected yet.
+func (m *PodmanMonitor) isRootfsInfraContainer(
+	ctx context.Context,
+	app Application,
+	event *client.PodmanEvent,
+	podmanClient *client.Podman,
+	inspectData []client.PodmanInspect,
+) bool {
+	if event.ID == "" {
+		return false
+	}
+	if snapshot := event.ContainerInspectData; snapshot != nil && snapshot.ID == event.ID {
+		return snapshot.IsInfra && snapshot.Image == ""
+	}
+	m.mu.Lock()
+	workload, exists := app.Workload(event.Name)
+	known := exists && workload.ID == event.ID && workload.ImageNotRequired
+	m.mu.Unlock()
+	if known {
+		return true
+	}
+	if inspectData == nil {
+		if podmanClient == nil {
+			if m.clientFactory == nil {
+				return false
+			}
+			var err error
+			podmanClient, err = m.clientFactory(app.User())
+			if err != nil {
+				return false
+			}
+		}
+		var err error
+		inspectData, err = m.inspectContainer(ctx, event.ID, podmanClient)
+		if err != nil {
+			return false
+		}
+	}
+	return len(inspectData) == 1 && inspectData[0].IsInfra && inspectData[0].Image == ""
 }
 
 func (m *PodmanMonitor) resolveWorkloadImage(
@@ -868,19 +952,46 @@ func (m *PodmanMonitor) resolveWorkloadImage(
 	app Application,
 	event *client.PodmanEvent,
 	podmanClient *client.Podman,
+	inspectData []client.PodmanInspect,
 ) (WorkloadImage, bool) {
 	if event.Image == "" {
 		return WorkloadImage{}, false
 	}
 
 	image := WorkloadImage{Image: event.Image}
+	resolver := m.newLocalImageResolver(app.User(), podmanClient)
+
+	// Create events preserve the container's registry identity after --rm, without
+	// resolving the mutable image reference or requiring the container to survive.
+	if snapshot := event.ContainerInspectData; snapshot != nil && event.ID != "" && snapshot.ID == event.ID {
+		snapshotDigest := ""
+		if observed, err := digest.Parse(snapshot.ImageDigest); err == nil {
+			snapshotDigest = observed.String()
+		}
+		if client.IsImmutablePodmanImageID(snapshot.Image) {
+			if localDigest, ok := resolver.resolve(ctx, snapshot.Image); ok {
+				image.Digest = localDigest.String()
+				return image, true
+			}
+			if snapshotDigest != "" {
+				image.Digest = snapshotDigest
+				return image, true
+			}
+			if inspectData == nil {
+				inspectData = []client.PodmanInspect{{Image: snapshot.Image}}
+			}
+		} else if snapshotDigest != "" {
+			image.Digest = snapshotDigest
+			return image, true
+		}
+	}
 
 	// A container restart may resolve the same mutable tag to different content.
 	// Reuse a known digest only while both the container ID and image reference
 	// match. An empty digest is retried on a later event in case the image became
 	// available after the first lookup.
 	m.mu.Lock()
-	if workload, ok := app.Workload(event.Name); ok && workload.ID == event.ID {
+	if workload, ok := app.Workload(event.Name); ok && event.ID != "" && workload.ID == event.ID {
 		for _, previous := range workload.Images {
 			if previous.Image == event.Image && previous.Digest != "" {
 				m.mu.Unlock()
@@ -890,26 +1001,81 @@ func (m *PodmanMonitor) resolveWorkloadImage(
 	}
 	m.mu.Unlock()
 
-	if podmanClient == nil {
-		if m.clientFactory == nil {
-			m.log.Warnf("Cannot resolve digest for workload image %q: podman client factory is not configured", event.Image)
-			return image, true
-		}
-		var err error
-		podmanClient, err = m.clientFactory(app.User())
-		if err != nil {
-			m.log.Warnf("Failed to create podman client to resolve workload image %q: %v", event.Image, err)
-			return image, true
-		}
-	}
-
-	digest, err := podmanClient.ImageDigest(ctx, event.Image)
-	if err != nil {
-		m.log.Warnf("Failed to resolve digest for workload image %q: %v", event.Image, err)
+	podmanClient, ok := resolver.ensureClient(event.Image)
+	if !ok {
 		return image, true
 	}
-	image.Digest = digest
+
+	if event.ID == "" {
+		return image, true
+	}
+	if inspectData == nil {
+		var err error
+		inspectData, err = m.inspectContainer(ctx, event.ID, podmanClient)
+		if err != nil {
+			m.log.Warnf("Failed to inspect workload %q: %v", event.ID, err)
+			return image, true
+		}
+	}
+	if len(inspectData) == 1 && inspectData[0].Image != "" {
+		// Use the same image-inspect digest as prefetch, scoped to the immutable
+		// image used by this container. The event tag may already have moved,
+		// and container ImageDigest may retain a different index digest.
+		if localDigest, ok := resolver.resolve(ctx, inspectData[0].Image); ok {
+			image.Digest = localDigest.String()
+		}
+	}
 	return image, true
+}
+
+type localImageResolver struct {
+	clientFactory client.PodmanFactory
+	logger        *log.PrefixLogger
+	user          v1beta1.Username
+	client        *client.Podman
+}
+
+func (m *PodmanMonitor) newLocalImageResolver(user v1beta1.Username, client *client.Podman) *localImageResolver {
+	return &localImageResolver{
+		clientFactory: m.clientFactory,
+		logger:        m.log,
+		user:          user,
+		client:        client,
+	}
+}
+
+func (r *localImageResolver) ensureClient(image string) (*client.Podman, bool) {
+	if r.client != nil {
+		return r.client, true
+	}
+	if r.clientFactory == nil {
+		r.logger.Warnf("Cannot resolve digest for workload image %q: podman client factory is not configured", image)
+		return nil, false
+	}
+	client, err := r.clientFactory(r.user)
+	if err != nil {
+		r.logger.Warnf("Failed to create podman client to resolve workload image %q: %v", image, err)
+		return nil, false
+	}
+	r.client = client
+	return r.client, true
+}
+
+func (r *localImageResolver) resolve(ctx context.Context, image string) (digest.Digest, bool) {
+	client, ok := r.ensureClient(image)
+	if !ok {
+		return "", false
+	}
+	metadata, err := client.ImageMetadata(ctx, image)
+	if err != nil {
+		r.logger.Warnf("Failed to inspect workload image %q: %v", image, err)
+		return "", false
+	}
+	observed, err := digest.Parse(metadata.Digest)
+	if err != nil {
+		return "", false
+	}
+	return observed, true
 }
 
 func (m *PodmanMonitor) updateQuadletContainerStatus(ctx context.Context, app Application, event *client.PodmanEvent) {
@@ -952,7 +1118,7 @@ func (m *PodmanMonitor) updateQuadletContainerStatus(ctx context.Context, app Ap
 	if isFinishedStatus(status) && lo.FromPtrOr(event.ContainerExitCode, -1) == 0 {
 		status = StatusExited
 	}
-	m.updateApplicationStatus(ctx, app, event, status, restartCount, nil)
+	m.updateApplicationStatus(ctx, app, event, status, restartCount, nil, nil)
 }
 
 func (m *PodmanMonitor) updateComposeContainerStatus(ctx context.Context, app Application, event *client.PodmanEvent) {
@@ -1054,7 +1220,7 @@ func (m *PodmanMonitor) updateComposeContainerStatus(ctx context.Context, app Ap
 		return
 	}
 
-	m.updateApplicationStatus(ctx, app, event, status, restarts, client)
+	m.updateApplicationStatus(ctx, app, event, status, restarts, client, inspectData)
 }
 
 func (m *PodmanMonitor) getContainerRestarts(inspectData []client.PodmanInspect) (int, error) {
@@ -1144,28 +1310,49 @@ func (e *podmanEventWatcher) listenForEvents(ctx context.Context, stdoutPipe io.
 	// the pipe will be closed by calling cmd.Wait
 	defer e.log.Debugf("Done listening for podman events for user %s", e.username)
 
-	scanner := bufio.NewScanner(stdoutPipe)
-	for scanner.Scan() {
-		e.log.Debugf("Received podman event for user %s: %s", e.username, scanner.Text())
-		select {
-		case <-ctx.Done():
+	reader := bufio.NewReader(stdoutPipe)
+	var data []byte
+	oversized := false
+	for {
+		// Inspect snapshots can exceed Scanner's default limit. Read bounded
+		// fragments so oversized events can be discarded without stopping the stream.
+		fragment, err := reader.ReadSlice('\n')
+		if ctx.Err() != nil {
 			return
-		default:
-			e.handleEvent(ctx, scanner.Bytes(), events)
 		}
-	}
-	// scanner won't emit an io.EOF error if it encounters one
-	if err := scanner.Err(); err != nil {
-		e.log.Errorf("Error reading podman events: %v", err)
+		if !oversized {
+			if len(data)+len(fragment) > maxPodmanEventBytes {
+				oversized = true
+				data = nil
+				e.log.Warnf("Discarding Podman event larger than %d bytes", maxPodmanEventBytes)
+			} else {
+				data = append(data, fragment...)
+			}
+		}
+		if err == bufio.ErrBufferFull {
+			continue
+		}
+		if !oversized && len(data) > 0 {
+			e.handleEvent(ctx, data, events)
+		}
+		data = data[:0]
+		oversized = false
+		if err != nil {
+			if err != io.EOF {
+				e.log.Errorf("Error reading podman events: %v", err)
+			}
+			return
+		}
 	}
 }
 
 func (e *podmanEventWatcher) handleEvent(ctx context.Context, data []byte, events chan<- client.PodmanEvent) {
 	var event client.PodmanEvent
 	if err := json.Unmarshal(data, &event); err != nil {
-		e.log.Errorf("Failed to decode podman event: %s %v", string(data), err)
+		e.log.Errorf("Failed to decode podman event: %v", err)
 		return
 	}
+	event.StoreOwner = lo.ToPtr(e.username)
 	eventTime := time.Unix(0, event.TimeNano)
 	e.lastEventTime.Store(&eventTime)
 	e.log.Tracef("Received podman event: %q at %s", event.Type, eventTime)

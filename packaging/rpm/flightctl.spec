@@ -7,6 +7,9 @@
 %global selinuxtype targeted
 %define selinux_policyver 3.14.3-67
 
+# RHEL-compatible builds use the native Go FIPS module.
+%global fips_enabled 0%{?rhel}
+
 Name:           flightctl
 # Version and Release are automatically updated by Packit during build
 # Do not manually change these values - they will be overwritten
@@ -21,7 +24,11 @@ URL:            %{gourl}
 
 Source0:         1%{?dist}
 
-BuildRequires:  golang
+%if %{fips_enabled}
+BuildRequires:  (golang >= 1.27.3 with golang < 1.28)
+%else
+BuildRequires:  golang >= 1.27.3
+%endif
 BuildRequires:  make
 BuildRequires:  git
 BuildRequires:  openssl-devel
@@ -48,6 +55,7 @@ Summary: Flight Control management agent
 
 Requires: flightctl-selinux = %{version}
 Recommends: flightctl-greenboot
+Recommends: oci-delta
 Requires: jq
 Requires: sudo
 
@@ -288,8 +296,6 @@ fi
 
 %build
 
-%global fips_enabled 0%{?rhel}
-
 %if %{fips_enabled}
 %define disable_fips %{nil}
 %else
@@ -327,7 +333,7 @@ fi
     %make_build --directory packaging/selinux
 
 %if %{fips_enabled}
-    GOFLAGS='' GOBIN="$PWD/bin" go install github.com/flightctl/fips-validator@v0.0.0-20250930084220-ceca2caa6e48
+    GOFLAGS='' GOBIN="$PWD/bin" go install github.com/flightctl/fips-validator@v0.0.0-20261112194341-8ad0f0fbb0d1
 %endif
 
 
@@ -357,6 +363,8 @@ fi
     cp packaging/hooks.d/afterupdating/00-default.yaml %{buildroot}/usr/lib/flightctl/hooks.d/afterupdating
     cp packaging/systemd/flightctl-agent.service %{buildroot}/usr/lib/systemd/system
     echo "d /var/lib/flightctl 0755 root root -" > %{buildroot}/usr/lib/tmpfiles.d/flightctl.conf
+    # /home is /var/home on bootc images and a regular directory on RHEL.
+    echo "d /home/flightctl 0700 flightctl flightctl -" >> %{buildroot}/usr/lib/tmpfiles.d/flightctl.conf
     echo "# systemd-tmpfiles configuration for CentOS bootc buildinfo directories" > %{buildroot}/usr/lib/tmpfiles.d/centos-buildinfo.conf
     echo "d /var/roothome 0755 root root -" >> %{buildroot}/usr/lib/tmpfiles.d/centos-buildinfo.conf
     echo "d /var/roothome/buildinfo 0755 root root -" >> %{buildroot}/usr/lib/tmpfiles.d/centos-buildinfo.conf
@@ -455,53 +463,6 @@ fi
      mkdir -p %{buildroot}/var/lib/prometheus
      mkdir -p %{buildroot}/var/lib/grafana
 
-    # flightctl-catalog-collector sub-package steps
-    #
-    # The collector quadlet is installed directly rather than through
-    # "flightctl-standalone render quadlets": the collector is an optional
-    # add-on that is not part of flightctl.target and must stay installable
-    # without flightctl-services.
-    #
-    # The image reference still comes from the same %{images_config} that
-    # drives the services quadlets, so there is exactly one place that decides
-    # which registry and which dist suffix a build uses. Hardcoding it here
-    # would silently diverge from images.yaml the first time a downstream
-    # build repointed the registry. This is the same rule the pam-issuer
-    # image already follows.
-    #
-    # packaging/images/rhelN/images.yaml is deliberately not consulted
-    # here. Those files list only the RPM-only images the air-gap mirror tool
-    # needs and omit the service entries the render step above requires, so a
-    # downstream RHEL build repoints %{images_config} itself rather than
-    # splitting the collector onto a second source.
-    CATALOG_COLLECTOR_IMAGE=$(awk '
-        /^catalog-collector:[[:space:]]*$/ { in_entry = 1; next }
-        /^[^[:space:]#]/                   { in_entry = 0 }
-        in_entry && $1 == "image:"         { print $2; exit }
-    ' "%{images_config}")
-    if [ -z "${CATALOG_COLLECTOR_IMAGE}" ]; then
-        echo "ERROR: no catalog-collector image entry in %{images_config}" >&2
-        exit 1
-    fi
-
-    install -d -m 0755 %{buildroot}%{_sysconfdir}/flightctl/flightctl-catalog-collector
-    install -d -m 0755 %{buildroot}%{_datadir}/flightctl/flightctl-catalog-collector/examples
-    install -m 0644 deploy/podman/flightctl-catalog-collector/examples/config-vanilla.yaml \
-        %{buildroot}%{_datadir}/flightctl/flightctl-catalog-collector/examples/config-vanilla.yaml
-    install -m 0644 deploy/podman/flightctl-catalog-collector/examples/config-rhoai-to-flightctl.yaml \
-        %{buildroot}%{_datadir}/flightctl/flightctl-catalog-collector/examples/config-rhoai-to-flightctl.yaml
-    install -m 0644 deploy/podman/flightctl-catalog-collector/examples/vanilla-publish-8080.conf \
-        %{buildroot}%{_datadir}/flightctl/flightctl-catalog-collector/examples/vanilla-publish-8080.conf
-
-    install -d -m 0755 %{buildroot}%{_datadir}/containers/systemd
-    sed -e "s|@CATALOG_COLLECTOR_IMAGE@|${CATALOG_COLLECTOR_IMAGE}:${IMAGE_TAG}|" \
-        deploy/podman/flightctl-catalog-collector/flightctl-catalog-collector.container \
-        > %{buildroot}%{_datadir}/containers/systemd/flightctl-catalog-collector.container
-    chmod 0644 %{buildroot}%{_datadir}/containers/systemd/flightctl-catalog-collector.container
-    grep -q '@CATALOG_COLLECTOR_IMAGE@' \
-        %{buildroot}%{_datadir}/containers/systemd/flightctl-catalog-collector.container \
-        && { echo "ERROR: catalog collector image placeholder was not substituted" >&2; exit 1; } || :
-
 %check
     # Run the installed binary from the buildroot and capture its output
     out="$("%{buildroot}%{_bindir}/flightctl-agent" version)"
@@ -527,7 +488,7 @@ fi
     bin/fips-validator binary %{buildroot}%{_bindir}/flightctl-agent
     bin/fips-validator binary %{buildroot}%{_bindir}/flightctl-backup
     bin/fips-validator binary %{buildroot}%{_bindir}/flightctl-restore
-    GOLANG_FIPS=1 OPENSSL_FORCE_FIPS_MODE=1 LD_DEBUG=symbols bin/flightctl version |& grep OPENSSL
+    GODEBUG=fips140=on bin/flightctl version -o json | grep -q '"fipsMode": true'
 %endif
 
 %pre selinux
@@ -582,12 +543,21 @@ fi
     /usr/lib/systemd/system/flightctl-mask-bootc-timer.service
 
 %post agent
-# Ensure /var/lib/flightctl exists immediately for environments where systemd-tmpfiles succeeds or via fallback
+# Create the regular user before applying tmpfiles rules that assign ownership
+# to it. The user entry persists in bootc/composefs images even when its home
+# directory, which is backed by /var/home on bootc images, does not.
+id -u flightctl 2>/dev/null || useradd --create-home --user-group flightctl
+
+# Ensure the agent data and home directories exist immediately for environments
+# where systemd-tmpfiles succeeds or via fallback.
 # Try systemd-tmpfiles first, fall back to manual creation if it fails
 /usr/bin/systemd-tmpfiles --create /usr/lib/tmpfiles.d/flightctl.conf || {
     mkdir -p /var/lib/flightctl && \
     chown root:root /var/lib/flightctl && \
-    chmod 0755 /var/lib/flightctl
+    chmod 0755 /var/lib/flightctl && \
+    mkdir -p ~flightctl && \
+    chown flightctl:flightctl ~flightctl && \
+    chmod 0700 ~flightctl
 }
 
 # These files prevent tmpfiles.d from managing the /var/roothome/buildinfo directory
@@ -603,9 +573,6 @@ cp /usr/share/sosreport/flightctl.py $INSTALL_DIR
 chmod 0644 $INSTALL_DIR/flightctl.py
 rm -rf /usr/share/sosreport
 
-# We want a regular user to run applications with as there are several issues around system users
-# and running quadlet applications.
-id -u flightctl 2>/dev/null || useradd --create-home --user-group flightctl
 # This enables lingering for the user with a fallback when building in an env without an active systemd.
 loginctl enable-linger flightctl || (mkdir -p /var/lib/systemd/linger/ && touch /var/lib/systemd/linger/flightctl)
 mkdir -p ~flightctl/.config/{containers/systemd,systemd/user}

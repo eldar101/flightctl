@@ -42,12 +42,20 @@ const (
 )
 
 type copyDirOptions struct {
-	symlinkBehavior symlinkBehavior
-	rootDir         string
+	symlinkBehavior    symlinkBehavior
+	rootDir            string
+	directoryOwnership bool
 }
 
 // CopyDirOption is a functional option for CopyDir
 type CopyDirOption func(*copyDirOptions)
+
+// WithDirectoryOwnership applies the writer's configured UID and GID to copied directories.
+func WithDirectoryOwnership() CopyDirOption {
+	return func(opts *copyDirOptions) {
+		opts.directoryOwnership = true
+	}
+}
 
 // WithSkipSymlink skips symlinks during directory copy
 func WithSkipSymlink() CopyDirOption {
@@ -393,6 +401,11 @@ func (w *writer) copyDirWithVisited(src, dst string, opts *copyDirOptions, visit
 
 	if err := os.MkdirAll(dst, srcInfo.Mode()); err != nil {
 		return fmt.Errorf("failed to create destination directory: %w", err)
+	}
+	if opts.directoryOwnership {
+		if err := os.Chown(dst, w.uid, w.gid); err != nil {
+			return fmt.Errorf("setting directory ownership %w: %w", errors.WithElement(dst), err)
+		}
 	}
 
 	entries, err := os.ReadDir(src)
@@ -774,5 +787,40 @@ func UnpackTar(writer Writer, tarPath, destDir string) error {
 		}
 	}
 
+	return nil
+}
+
+func (w *writer) WriteFileDurable(name string, data []byte, dirMode, fileMode fs.FileMode, opts ...FileOption) error {
+	fullPath, err := filepath.Abs(filepath.Join(w.rootDir, name))
+	if err != nil {
+		return err
+	}
+	dir := filepath.Dir(fullPath)
+	fopts := &fileOptions{uid: w.uid, gid: w.gid}
+	for _, opt := range opts {
+		opt(fopts)
+	}
+	if err := writeFileAtomically(fullPath, data, dirMode, fileMode, fopts.uid, fopts.gid); err != nil {
+		return err
+	}
+	// A prior failed attempt may have created any ancestor without syncing its
+	// parent. Existing directory entries therefore also need syncing on retry.
+	for directory := dir; ; directory = filepath.Dir(directory) {
+		f, err := os.Open(directory)
+		if err != nil {
+			return err
+		}
+		syncErr := f.Sync()
+		closeErr := f.Close()
+		if syncErr != nil {
+			return fmt.Errorf("sync durable file directory: %w", syncErr)
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		if filepath.Dir(directory) == directory {
+			break
+		}
+	}
 	return nil
 }

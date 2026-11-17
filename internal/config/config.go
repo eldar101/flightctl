@@ -27,28 +27,30 @@ const (
 )
 
 type Config struct {
-	Database               *dbConfig                          `json:"database,omitempty"`
-	Service                *svcConfig                         `json:"service,omitempty"`
-	RemoteAccessService    *RemoteAccessServiceConfig         `json:"remoteAccessService,omitempty"`
-	ImageBuilderService    *ImageBuilderServiceConfig         `json:"imageBuilderService,omitempty"`
-	ImageBuilderWorker     *imageBuilderWorkerConfig          `json:"imageBuilderWorker,omitempty"`
-	Worker                 *workerConfig                      `json:"worker,omitempty"`
-	KV                     *kvConfig                          `json:"kv,omitempty"`
-	Alertmanager           *alertmanagerConfig                `json:"alertmanager,omitempty"`
-	Auth                   *authConfig                        `json:"auth,omitempty"`
-	Metrics                *metricsConfig                     `json:"metrics,omitempty"`
-	CA                     *ca.Config                         `json:"ca,omitempty"`
-	Tracing                *TracingConfig                     `json:"tracing,omitempty"`
-	Profiling              *ProfilingConfig                   `json:"profiling,omitempty"`
-	GitOps                 *gitOpsConfig                      `json:"gitOps,omitempty"`
-	CryptoPolicy           *CryptoPolicyConfig                `json:"cryptoPolicy,omitempty"`
-	Periodic               *periodicConfig                    `json:"periodic,omitempty"`
-	Organizations          *organizationsConfig               `json:"organizations,omitempty"`
-	TelemetryGateway       *telemetryGatewayConfig            `json:"telemetrygateway,omitempty"`
-	VulnerabilityReporting *VulnerabilityConfig               `json:"vulnerabilityReporting,omitempty"`
-	DeltaGeneration        *deltaconfig.DeltaGenerationConfig `json:"deltaGeneration,omitempty"`
-	DependenciesSync       *DependenciesSyncConfig            `json:"dependenciesSync,omitempty"`
-	Encryption             *EncryptionConfig                  `json:"encryption,omitempty"`
+	// FirmwareUpdaterCatalogFile is trusted administrator input; empty uses retained accepted state.
+	FirmwareUpdaterCatalogFile string                             `json:"firmwareUpdaterCatalogFile,omitempty"`
+	Database                   *dbConfig                          `json:"database,omitempty"`
+	Service                    *svcConfig                         `json:"service,omitempty"`
+	RemoteAccessService        *RemoteAccessServiceConfig         `json:"remoteAccessService,omitempty"`
+	ImageBuilderService        *ImageBuilderServiceConfig         `json:"imageBuilderService,omitempty"`
+	ImageBuilderWorker         *imageBuilderWorkerConfig          `json:"imageBuilderWorker,omitempty"`
+	Worker                     *workerConfig                      `json:"worker,omitempty"`
+	KV                         *kvConfig                          `json:"kv,omitempty"`
+	Alertmanager               *alertmanagerConfig                `json:"alertmanager,omitempty"`
+	Auth                       *authConfig                        `json:"auth,omitempty"`
+	Metrics                    *metricsConfig                     `json:"metrics,omitempty"`
+	CA                         *ca.Config                         `json:"ca,omitempty"`
+	Tracing                    *TracingConfig                     `json:"tracing,omitempty"`
+	Profiling                  *ProfilingConfig                   `json:"profiling,omitempty"`
+	GitOps                     *gitOpsConfig                      `json:"gitOps,omitempty"`
+	CryptoPolicy               *CryptoPolicyConfig                `json:"cryptoPolicy,omitempty"`
+	Periodic                   *periodicConfig                    `json:"periodic,omitempty"`
+	Organizations              *organizationsConfig               `json:"organizations,omitempty"`
+	TelemetryGateway           *telemetryGatewayConfig            `json:"telemetrygateway,omitempty"`
+	VulnerabilityReporting     *VulnerabilityConfig               `json:"vulnerabilityReporting,omitempty"`
+	DeltaGeneration            *deltaconfig.DeltaGenerationConfig `json:"deltaGeneration,omitempty"`
+	DependenciesSync           *DependenciesSyncConfig            `json:"dependenciesSync,omitempty"`
+	Encryption                 *EncryptionConfig                  `json:"encryption,omitempty"`
 }
 
 // CryptoPolicyConfig contains cryptographic policy configuration for all protocols.
@@ -1531,11 +1533,8 @@ func applyDeltaGenerationEnvVarOverrides(c *Config) {
 	if username == "" && password == "" {
 		return
 	}
-	if c.DeltaGeneration == nil {
-		c.DeltaGeneration = &deltaconfig.DeltaGenerationConfig{}
-	}
-	if c.DeltaGeneration.DefaultRepository == nil {
-		c.DeltaGeneration.DefaultRepository = &deltaconfig.DefaultRepositoryConfig{}
+	if c.DeltaGeneration == nil || c.DeltaGeneration.DefaultRepository == nil {
+		return
 	}
 	if username != "" {
 		c.DeltaGeneration.DefaultRepository.Username = username
@@ -1594,6 +1593,14 @@ func applyAuthDefaults(c *Config) error {
 	}
 
 	applyAuthProviderEnabledDefaults(c.Auth)
+	if c.Auth.OIDC != nil && c.Auth.OIDC.Prompt == nil {
+		prompt := api.DefaultAuthProviderPrompt
+		c.Auth.OIDC.Prompt = &prompt
+	}
+	if c.Auth.OAuth2 != nil && c.Auth.OAuth2.Prompt == nil {
+		prompt := api.DefaultAuthProviderPrompt
+		c.Auth.OAuth2.Prompt = &prompt
+	}
 	applyPAMOIDCIssuerDefaults(c)
 	applyOIDCClientDefaults(c)
 	applyOpenShiftDefaults(c)
@@ -1820,17 +1827,27 @@ func Validate(cfg *Config) error {
 		return err
 	}
 
-	// Validate OIDC and OAuth2 provider role assignments
-	if cfg.Auth != nil {
-		if cfg.Auth.OIDC != nil {
-			if err := validateAuthProviderRoleAssignment(cfg.Auth.OIDC.RoleAssignment, string(api.Oidc)); err != nil {
-				return err
-			}
+	return validateAuthProviders(cfg.Auth)
+}
+
+func validateAuthProviders(auth *authConfig) error {
+	if auth == nil {
+		return nil
+	}
+	if auth.OIDC != nil {
+		if err := api.ValidateAuthProviderPrompt(auth.OIDC.Prompt); err != nil {
+			return fmt.Errorf("auth.oidc.prompt: %w", err)
 		}
-		if cfg.Auth.OAuth2 != nil {
-			if err := validateAuthProviderRoleAssignment(cfg.Auth.OAuth2.RoleAssignment, string(api.Oauth2)); err != nil {
-				return err
-			}
+		if err := validateAuthProviderRoleAssignment(auth.OIDC.RoleAssignment, string(api.Oidc)); err != nil {
+			return err
+		}
+	}
+	if auth.OAuth2 != nil {
+		if err := api.ValidateAuthProviderPrompt(auth.OAuth2.Prompt); err != nil {
+			return fmt.Errorf("auth.oauth2.prompt: %w", err)
+		}
+		if err := validateAuthProviderRoleAssignment(auth.OAuth2.RoleAssignment, string(api.Oauth2)); err != nil {
+			return err
 		}
 	}
 

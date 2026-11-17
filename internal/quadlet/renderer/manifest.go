@@ -28,6 +28,11 @@ func servicesManifest(config *RendererConfig) []InstallAction {
 		{Action: ActionCopyFile, Source: "deploy/podman/flightctl-alert-exporter/flightctl-alert-exporter.container", Destination: filepath.Join(config.QuadletFilesOutputDir, "flightctl-alert-exporter.container"), Template: true, Mode: RegularFileMode},
 		{Action: ActionCopyDir, Source: "deploy/podman/flightctl-alert-exporter/flightctl-alert-exporter-config/", Destination: filepath.Join(config.ReadOnlyConfigOutputDir, "flightctl-alert-exporter/"), Template: false, Mode: RegularFileMode},
 
+		// Catalog Collector service
+		{Action: ActionCopyFile, Source: "deploy/podman/flightctl-catalog-collector/flightctl-catalog-collector.container", Destination: filepath.Join(config.QuadletFilesOutputDir, "flightctl-catalog-collector.container"), Template: true, Mode: RegularFileMode},
+		{Action: ActionCopyDir, Source: "deploy/podman/flightctl-catalog-collector/examples/", Destination: filepath.Join(config.ReadOnlyConfigOutputDir, "flightctl-catalog-collector", "examples"), Template: false, Mode: RegularFileMode},
+		{Action: ActionCreateEmptyDir, Destination: filepath.Join(config.WriteableConfigOutputDir, "flightctl-catalog-collector"), Mode: ExecutableFileMode},
+
 		// PAM Issuer service
 		{Action: ActionCopyFile, Source: "deploy/podman/flightctl-pam-issuer/flightctl-pam-issuer.container", Destination: filepath.Join(config.QuadletFilesOutputDir, "flightctl-pam-issuer.container"), Template: true, Mode: RegularFileMode},
 		{Action: ActionCopyFile, Source: "deploy/podman/flightctl-pam-issuer/flightctl-pam-issuer-etc.volume", Destination: filepath.Join(config.QuadletFilesOutputDir, "flightctl-pam-issuer-etc.volume"), Template: false, Mode: RegularFileMode},
@@ -97,7 +102,8 @@ func servicesManifest(config *RendererConfig) []InstallAction {
 		// Install Grafana provisioning files directly to /etc
 		{Action: ActionCopyFile, Source: "deploy/podman/flightctl-grafana/flightctl-grafana-config/grafana-datasources.yaml", Destination: filepath.Join(config.WriteableConfigOutputDir, "flightctl-grafana", "provisioning", "datasources", "grafana-datasources.yaml"), Template: false, Mode: RegularFileMode},
 		{Action: ActionCopyFile, Source: "deploy/podman/flightctl-grafana/flightctl-grafana-config/grafana-dashboards.yaml", Destination: filepath.Join(config.WriteableConfigOutputDir, "flightctl-grafana", "provisioning", "dashboards", "grafana-dashboards.yaml"), Template: false, Mode: RegularFileMode},
-		{Action: ActionCopyDir, Source: "contrib/grafana-dashboards/", Destination: filepath.Join(config.WriteableConfigOutputDir, "flightctl-grafana", "provisioning", "dashboards", "flightctl/"), Template: false, Mode: RegularFileMode},
+		{Action: ActionCopyFile, Source: "contrib/grafana-dashboards/flightctl-api-dashboard.json", Destination: filepath.Join(config.WriteableConfigOutputDir, "flightctl-grafana", "provisioning", "dashboards", "flightctl", "flightctl-api-dashboard.json"), Template: false, Mode: RegularFileMode},
+		{Action: ActionCopyFile, Source: "contrib/grafana-dashboards/flightctl-fleet-dashboard.json", Destination: filepath.Join(config.WriteableConfigOutputDir, "flightctl-grafana", "provisioning", "dashboards", "flightctl", "flightctl-fleet-dashboard.json"), Template: false, Mode: RegularFileMode},
 
 		// UserInfo Proxy service
 		{Action: ActionCopyFile, Source: "deploy/podman/flightctl-userinfo-proxy/flightctl-userinfo-proxy.container", Destination: filepath.Join(config.QuadletFilesOutputDir, "flightctl-userinfo-proxy.container"), Template: true, Mode: RegularFileMode},

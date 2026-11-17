@@ -6,6 +6,7 @@ package migration
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	deltagenerationstore "github.com/flightctl/flightctl/internal/delta_worker/store/deltageneration"
@@ -33,6 +34,7 @@ import (
 	resourcesyncstore "github.com/flightctl/flightctl/internal/store/resourcesync"
 	syncstatestore "github.com/flightctl/flightctl/internal/store/syncstate"
 	templateversionstore "github.com/flightctl/flightctl/internal/store/templateversion"
+	updatercatalogstore "github.com/flightctl/flightctl/internal/store/updatercatalog"
 	vulnerabilityfindingstore "github.com/flightctl/flightctl/internal/store/vulnerabilityfinding"
 	"github.com/sirupsen/logrus"
 	"gorm.io/gorm"
@@ -47,17 +49,20 @@ var ErrDryRunComplete = errors.New("dry-run complete")
 // true, the schema migration transaction is rolled back after validation and
 // the data backfill is skipped.
 // The provided db must be connected as a user with migration privileges.
-func Run(ctx context.Context, db *gorm.DB, log logrus.FieldLogger, dryRun bool) error {
-	return run(ctx, db, log, dryRun, "", false)
+func Run(ctx context.Context, db *gorm.DB, log logrus.FieldLogger, dryRun bool, enrollmentSignerName string) error {
+	return run(ctx, db, log, dryRun, enrollmentSignerName, "", false)
 }
 
 // RunWithInitialLabelSyncMappings runs migrations and attempts to seed the configured
 // mappings for organizations that already exist.
-func RunWithInitialLabelSyncMappings(ctx context.Context, db *gorm.DB, log logrus.FieldLogger, dryRun bool, filePath string) error {
-	return run(ctx, db, log, dryRun, filePath, true)
+func RunWithInitialLabelSyncMappings(ctx context.Context, db *gorm.DB, log logrus.FieldLogger, dryRun bool, filePath string, enrollmentSignerName string) error {
+	return run(ctx, db, log, dryRun, enrollmentSignerName, filePath, true)
 }
 
-func run(ctx context.Context, db *gorm.DB, log logrus.FieldLogger, dryRun bool, initialMappingsFilePath string, seedInitialMappings bool) error {
+func run(ctx context.Context, db *gorm.DB, log logrus.FieldLogger, dryRun bool, enrollmentSignerName string, initialMappingsFilePath string, seedInitialMappings bool) error {
+	if enrollmentSignerName == "" {
+		return fmt.Errorf("enrollment signer name is required")
+	}
 	ctx = store.WithBypassSpanCheck(ctx)
 
 	err := db.Transaction(func(tx *gorm.DB) error {
@@ -65,7 +70,7 @@ func run(ctx context.Context, db *gorm.DB, log logrus.FieldLogger, dryRun bool, 
 			"pkg":     "migration-store-tx",
 			"dry_run": dryRun,
 		})
-		if err := runMainStoreMigrations(ctx, tx, txLog); err != nil {
+		if err := runMainStoreMigrations(ctx, tx, txLog, enrollmentSignerName); err != nil {
 			return err
 		}
 
@@ -96,7 +101,7 @@ func run(ctx context.Context, db *gorm.DB, log logrus.FieldLogger, dryRun bool, 
 // runMainStoreMigrations runs schema migrations for every resource's own store, in the same
 // order the former monolithic DataStore.RunMigrations used, then applies the same
 // post-migration customizations (FK-constraint drop, default-catalog backfill).
-func runMainStoreMigrations(ctx context.Context, tx *gorm.DB, log logrus.FieldLogger) error {
+func runMainStoreMigrations(ctx context.Context, tx *gorm.DB, log logrus.FieldLogger, enrollmentSignerName string) error {
 	if err := tx.WithContext(ctx).AutoMigrate(&model.SchemaMigration{}); err != nil {
 		return err
 	}
@@ -104,10 +109,18 @@ func runMainStoreMigrations(ctx context.Context, tx *gorm.DB, log logrus.FieldLo
 	if err := devicestore.NewDeviceStore(tx, log).InitialMigration(ctx); err != nil {
 		return err
 	}
+	catalogStore, err := updatercatalogstore.NewStore(tx)
+	if err != nil {
+		return err
+	}
+	if err := catalogStore.InitialMigration(ctx); err != nil {
+		return err
+	}
+
 	if err := enrollmentrequeststore.NewEnrollmentRequestStore(tx, log).InitialMigration(ctx); err != nil {
 		return err
 	}
-	if err := certificatesigningrequeststore.NewCertificateSigningRequestStore(tx, log).InitialMigration(ctx); err != nil {
+	if err := certificatesigningrequeststore.NewCertificateSigningRequestStore(tx, log, enrollmentSignerName).InitialMigration(ctx); err != nil {
 		return err
 	}
 	if err := fleetstore.NewFleetStore(tx, log).InitialMigration(ctx); err != nil {
@@ -168,12 +181,12 @@ func runMainStoreMigrations(ctx context.Context, tx *gorm.DB, log logrus.FieldLo
 		return err
 	}
 
-	return customizeMigration(ctx, tx, log)
+	return customizeMigration(ctx, tx, log, enrollmentSignerName)
 }
 
 // customizeMigration applies one-off schema fixups that don't belong to any single resource's
 // own InitialMigration, ported verbatim from the former monolithic DataStore.customizeMigration.
-func customizeMigration(ctx context.Context, tx *gorm.DB, log logrus.FieldLogger) error {
+func customizeMigration(ctx context.Context, tx *gorm.DB, log logrus.FieldLogger, enrollmentSignerName string) error {
 	db := tx.WithContext(ctx)
 
 	if db.Migrator().HasConstraint("fleet_repos", "fk_fleet_repos_repository") {
@@ -191,6 +204,9 @@ func customizeMigration(ctx context.Context, tx *gorm.DB, log logrus.FieldLogger
 		return err
 	}
 	if err := normalizeAuthProviderURLs(ctx, tx); err != nil {
+		return err
+	}
+	if err := migrateCSRCertificateDigests(ctx, tx, enrollmentSignerName); err != nil {
 		return err
 	}
 	return migrateCatalogItemLabels(ctx, tx, log)

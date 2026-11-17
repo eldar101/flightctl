@@ -200,7 +200,7 @@ func TestEnsureScheduled(t *testing.T) {
 			},
 		},
 		{
-			name: "pull always policy with existing artifact returns ready",
+			name: "When an existing artifact specifies PullAlways it should reuse the cached artifact",
 			targets: OCIPullTargetsByUser{
 				"": []OCIPullTarget{
 					{
@@ -218,7 +218,7 @@ func TestEnsureScheduled(t *testing.T) {
 			},
 		},
 		{
-			name: "pull always policy with existing image returns ready",
+			name: "When an existing image specifies PullAlways it should reuse the cached image",
 			targets: OCIPullTargetsByUser{
 				"": []OCIPullTarget{
 					{
@@ -282,6 +282,93 @@ func TestEnsureScheduled(t *testing.T) {
 			manager.Cleanup()
 		})
 	}
+}
+
+// TestProcessTargetStopsAfterPullRetryLimit verifies that a client-side retry limit
+// is preserved as a non-retryable prefetch error.
+func TestProcessTargetStopsAfterPullRetryLimit(t *testing.T) {
+	const image = "quay.io/test/missing:latest"
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	exec := executer.NewMockExecuter(ctrl)
+	exec.EXPECT().ExecuteWithContext(
+		gomock.Any(), "podman", "pull", image,
+	).Return("", "Error: manifest unknown", 1)
+	// A failed retry must still clean up any partial image layers.
+	exec.EXPECT().ExecuteWithContext(
+		gomock.Any(), "podman", "info", "--format", "{{.Store.ImageCopyTmpDir}}",
+	).Return("", "", 0)
+
+	logger := log.NewPrefixLogger("test")
+	rw := fileio.NewReadWriter(fileio.NewReader(), fileio.NewWriter())
+	podman := client.NewPodman(logger, exec, rw, poll.Config{
+		BaseDelay: time.Nanosecond,
+		Factor:    1,
+		MaxSteps:  1,
+	})
+	target := imageRef{image: image, ociType: OCITypePodmanImage}
+	manager := &prefetchManager{
+		log: logger,
+		podmanFactory: func(v1beta1.Username) (*client.Podman, error) {
+			return podman, nil
+		},
+		pullTimeout: time.Second,
+		pollConfig: &poll.Config{
+			BaseDelay: time.Nanosecond,
+			Factor:    1,
+			MaxSteps:  3,
+		},
+		tasks: map[imageRef]*prefetchTask{
+			target: {ociType: OCITypePodmanImage},
+		},
+	}
+
+	manager.processTarget(context.Background(), target)
+
+	task := manager.tasks[target]
+	require.True(t, task.done)
+	require.ErrorIs(t, task.err, errors.ErrNoRetry)
+	require.ErrorIs(t, task.err, errors.ErrImageNotFound)
+	require.ErrorIs(t, task.err, poll.ErrMaxSteps)
+	require.Contains(t, task.err.Error(), "manifest unknown")
+	require.False(t, errors.IsRetryable(task.err))
+}
+
+// TestProcessTargetStopsAfterPrefetchRetryLimit verifies that the prefetch retry
+// limit allows the configured number of retries after the initial pull attempt.
+func TestProcessTargetStopsAfterPrefetchRetryLimit(t *testing.T) {
+	const image = "quay.io/test/missing:latest"
+
+	logger := log.NewPrefixLogger("test")
+	target := imageRef{image: image, ociType: OCITypePodmanImage}
+	factoryCalls := 0
+	manager := &prefetchManager{
+		log: logger,
+		podmanFactory: func(v1beta1.Username) (*client.Podman, error) {
+			factoryCalls++
+			return nil, errors.ErrNetwork
+		},
+		pullTimeout: time.Second,
+		pollConfig: &poll.Config{
+			BaseDelay: time.Nanosecond,
+			Factor:    1,
+			MaxSteps:  2,
+		},
+		tasks: map[imageRef]*prefetchTask{
+			target: {ociType: OCITypePodmanImage},
+		},
+	}
+
+	manager.processTarget(context.Background(), target)
+
+	task := manager.tasks[target]
+	// Each failed attempt invokes the factory once for the pull and once for cleanup.
+	require.Equal(t, 6, factoryCalls)
+	require.True(t, task.done)
+	require.ErrorIs(t, task.err, errors.ErrNoRetry)
+	require.False(t, errors.IsRetryable(task.err))
 }
 
 func TestIsReady(t *testing.T) {
@@ -357,7 +444,7 @@ func TestIsReady(t *testing.T) {
 			for _, image := range tt.scheduledImages {
 				state := tt.imageStates[image]
 				manager.mu.Lock()
-				manager.tasks[imageRef{image: image}] = &prefetchTask{
+				manager.tasks[imageRef{image: image, ociType: OCITypePodmanImage}] = &prefetchTask{
 					ociType: OCITypePodmanImage,
 					done:    state.done,
 					err:     state.err,
@@ -367,7 +454,7 @@ func TestIsReady(t *testing.T) {
 
 			// Check if target is ready
 			manager.mu.Lock()
-			task, ok := manager.tasks[imageRef{image: tt.imageToCheck}]
+			task, ok := manager.tasks[imageRef{image: tt.imageToCheck, ociType: OCITypePodmanImage}]
 			ready := ok && task.err == nil && task.done
 			manager.mu.Unlock()
 
@@ -722,7 +809,7 @@ func TestBeforeUpdate(t *testing.T) {
 			},
 		},
 		{
-			name: "pull always policy with existing artifact",
+			name: "When an existing artifact specifies PullAlways it should reuse the cached artifact",
 			collectors: []func() (*OCICollection, error){
 				func() (*OCICollection, error) {
 					return &OCICollection{Targets: OCIPullTargetsByUser{
@@ -739,11 +826,11 @@ func TestBeforeUpdate(t *testing.T) {
 			setupMocks: func(mockExec *executer.MockExecuter) {
 				mockExec.EXPECT().ExecuteWithContext(
 					gomock.Any(), "podman", []string{"artifact", "inspect", "quay.io/test/always-artifact:latest"},
-				).Return("", "", 0) // artifact exists, but PullAlways means we still need to pull
+				).Return("", "", 0) // artifact exists
 			},
 		},
 		{
-			name: "pull always policy with existing image",
+			name: "When an existing image specifies PullAlways it should reuse the cached image",
 			collectors: []func() (*OCICollection, error){
 				func() (*OCICollection, error) {
 					return &OCICollection{Targets: OCIPullTargetsByUser{
@@ -760,7 +847,7 @@ func TestBeforeUpdate(t *testing.T) {
 			setupMocks: func(mockExec *executer.MockExecuter) {
 				mockExec.EXPECT().ExecuteWithContext(
 					gomock.Any(), "podman", []string{"image", "exists", testImageV1},
-				).Return("", "", 0) // image exists, but PullAlways means we still need to pull
+				).Return("", "", 0) // image exists
 			},
 		},
 	}
@@ -1007,7 +1094,12 @@ func TestPullSecretCleanup(t *testing.T) {
 	require.ErrorIs(err, errors.ErrPrefetchNotReady)
 
 	// simulate successful pull completion
-	manager.setResult(imageRef{image: "registry.example.com/app:latest"}, nil)
+	target := imageRef{image: "registry.example.com/app:latest", ociType: OCITypePodmanImage}
+	manager.mu.Lock()
+	task := manager.tasks[target]
+	manager.mu.Unlock()
+	require.NotNil(task)
+	manager.setResult(target, nil, task)
 
 	// verify the manager is now ready
 	require.True(manager.IsReady(ctx))
@@ -1216,7 +1308,7 @@ func TestCleanupPartialLayers(t *testing.T) {
 
 			// setup active pulls if needed
 			if tt.activePulls {
-				pm.tasks[imageRef{image: "test-image"}] = &prefetchTask{
+				pm.tasks[imageRef{image: "test-image", ociType: OCITypePodmanImage}] = &prefetchTask{
 					cancelFn: func() {},
 					done:     false,
 				}
@@ -1273,19 +1365,20 @@ func TestSetResultAfterCleanup(t *testing.T) {
 
 	pm := NewPrefetchManager(logger, podmanFactory, skopeoFactory, cliClients, readWriter, pullTimeout, mockResourceManager, poll.Config{})
 
-	testImage := imageRef{image: "quay.io/test/image:latest"}
+	testImage := imageRef{image: "quay.io/test/image:latest", ociType: OCITypePodmanImage}
 	pm.tasks[testImage] = &prefetchTask{
 		ociType: OCITypePodmanImage,
 		done:    false,
 	}
+	task := pm.tasks[testImage]
 
 	pm.Cleanup()
 
 	require.Empty(pm.tasks)
-	pm.setResult(testImage, nil)
+	pm.setResult(testImage, nil, task)
 	// ensure still empty
 	require.Empty(pm.tasks)
-	pm.setResult(testImage, fmt.Errorf("test error"))
+	pm.setResult(testImage, fmt.Errorf("test error"), task)
 	// ensure still empty
 	require.Empty(pm.tasks)
 }
@@ -1302,9 +1395,9 @@ func TestSelectiveCleanup(t *testing.T) {
 	}
 
 	initialImages := []imageRef{
-		{image: "registry.example.com/app:v1"},
-		{image: "registry.example.com/sidecar:v1"},
-		{image: "registry.example.com/database:v1"},
+		{image: "registry.example.com/app:v1", ociType: OCITypePodmanImage},
+		{image: "registry.example.com/sidecar:v1", ociType: OCITypePodmanImage},
+		{image: "registry.example.com/database:v1", ociType: OCITypePodmanImage},
 	}
 	for _, ref := range initialImages {
 		manager.tasks[ref] = &prefetchTask{
@@ -1321,7 +1414,7 @@ func TestSelectiveCleanup(t *testing.T) {
 
 	newRefs := make(map[imageRef]struct{}, len(newTargets))
 	for _, target := range newTargets {
-		newRefs[imageRef{image: target.Reference}] = struct{}{}
+		newRefs[imageRef{image: target.Reference, ociType: target.Type}] = struct{}{}
 	}
 
 	manager.mu.Lock()
@@ -1329,18 +1422,18 @@ func TestSelectiveCleanup(t *testing.T) {
 	manager.mu.Unlock()
 
 	// app and sidecar tasks should still exist
-	_, appExists := manager.tasks[imageRef{image: "registry.example.com/app:v1"}]
+	_, appExists := manager.tasks[imageRef{image: "registry.example.com/app:v1", ociType: OCITypePodmanImage}]
 	require.True(t, appExists, "app:v1 task should be preserved")
 
-	_, sidecarExists := manager.tasks[imageRef{image: "registry.example.com/sidecar:v1"}]
+	_, sidecarExists := manager.tasks[imageRef{image: "registry.example.com/sidecar:v1", ociType: OCITypePodmanImage}]
 	require.True(t, sidecarExists, "sidecar:v1 task should be preserved")
 
 	// database should be removed
-	_, databaseExists := manager.tasks[imageRef{image: "registry.example.com/database:v1"}]
+	_, databaseExists := manager.tasks[imageRef{image: "registry.example.com/database:v1", ociType: OCITypePodmanImage}]
 	require.False(t, databaseExists, "database:v1 task should be removed")
 
 	// cache task should NOT exist yet
-	_, cacheExists := manager.tasks[imageRef{image: "registry.example.com/cache:v1"}]
+	_, cacheExists := manager.tasks[imageRef{image: "registry.example.com/cache:v1", ociType: OCITypePodmanImage}]
 	require.False(t, cacheExists, "cache:v1 task should not exist (not scheduled)")
 
 	require.Equal(t, 2, len(manager.tasks), "should have exactly 2 tasks remaining")
@@ -1407,7 +1500,7 @@ func TestTargetChangeCleanup(t *testing.T) {
 
 			if len(tt.initialTargets) > 0 {
 				for _, ref := range tt.initialTargets {
-					manager.tasks[imageRef{image: ref}] = &prefetchTask{done: false}
+					manager.tasks[imageRef{image: ref, ociType: OCITypePodmanImage}] = &prefetchTask{done: false}
 				}
 			}
 
@@ -1424,7 +1517,7 @@ func TestTargetChangeCleanup(t *testing.T) {
 
 			newRefs := make(map[imageRef]struct{}, len(newTargets))
 			for _, target := range newTargets {
-				newRefs[imageRef{image: target.Reference}] = struct{}{}
+				newRefs[imageRef{image: target.Reference, ociType: target.Type}] = struct{}{}
 			}
 
 			manager.mu.Lock()
@@ -1443,7 +1536,7 @@ func TestTargetChangeCleanup(t *testing.T) {
 				// ensure only stale tasks were removed
 				for _, ref := range tt.newTargets {
 					if slices.Contains(tt.initialTargets, ref) {
-						_, exists := manager.tasks[imageRef{image: ref}]
+						_, exists := manager.tasks[imageRef{image: ref, ociType: OCITypePodmanImage}]
 						require.True(exists, "existing task for %s should be preserved", ref)
 					}
 				}
@@ -1451,7 +1544,7 @@ func TestTargetChangeCleanup(t *testing.T) {
 				// tasks for removed targets should be gone
 				for _, ref := range tt.initialTargets {
 					if !slices.Contains(tt.newTargets, ref) {
-						_, exists := manager.tasks[imageRef{image: ref}]
+						_, exists := manager.tasks[imageRef{image: ref, ociType: OCITypePodmanImage}]
 						require.False(exists, "stale task for %s should be removed", ref)
 					}
 				}
@@ -1489,7 +1582,7 @@ func BenchmarkPrefetchTargetChange(b *testing.B) {
 
 				for j := 0; j < bm.initialCount; j++ {
 					ref := fmt.Sprintf("registry.example.com/image-%d:v1", j)
-					manager.tasks[imageRef{image: ref}] = &prefetchTask{
+					manager.tasks[imageRef{image: ref, ociType: OCITypePodmanImage}] = &prefetchTask{
 						done:     false,
 						cancelFn: func() {},
 					}
@@ -1514,7 +1607,7 @@ func BenchmarkPrefetchTargetChange(b *testing.B) {
 				manager.mu.Lock()
 				newRefs := make(map[imageRef]struct{}, len(allTargets))
 				for _, target := range allTargets {
-					newRefs[imageRef{image: target.Reference}] = struct{}{}
+					newRefs[imageRef{image: target.Reference, ociType: target.Type}] = struct{}{}
 				}
 				if manager.isTargetsChanged(newRefs) {
 					manager.cleanupStaleTasks(newRefs)

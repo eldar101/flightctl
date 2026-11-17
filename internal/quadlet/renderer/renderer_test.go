@@ -3,11 +3,47 @@ package renderer
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/flightctl/flightctl/pkg/log"
 	"github.com/stretchr/testify/require"
 )
+
+func TestServicesManifestOnlyInstallsGrafanaDashboardJSON(t *testing.T) {
+	config := createTestConfig(t)
+	expected := map[string]string{
+		"contrib/grafana-dashboards/flightctl-api-dashboard.json":   filepath.Join(config.WriteableConfigOutputDir, "flightctl-grafana", "provisioning", "dashboards", "flightctl", "flightctl-api-dashboard.json"),
+		"contrib/grafana-dashboards/flightctl-fleet-dashboard.json": filepath.Join(config.WriteableConfigOutputDir, "flightctl-grafana", "provisioning", "dashboards", "flightctl", "flightctl-fleet-dashboard.json"),
+	}
+
+	for _, action := range servicesManifest(config) {
+		if !strings.HasPrefix(action.Source, "contrib/grafana-dashboards/") {
+			continue
+		}
+
+		destination, ok := expected[action.Source]
+		require.True(t, ok, "unexpected Grafana dashboard source: %s", action.Source)
+		require.Equal(t, ActionCopyFile, action.Action, "unexpected action for %s", action.Source)
+		require.Equal(t, destination, action.Destination)
+		require.False(t, action.Template)
+		require.Equal(t, RegularFileMode, action.Mode)
+		delete(expected, action.Source)
+	}
+
+	require.Empty(t, expected)
+}
+
+func TestCatalogCollectorTagOverride(t *testing.T) {
+	config := &RendererConfig{
+		CatalogCollector:             ImageConfig{Tag: "latest"},
+		FlightctlServicesTagOverride: "1.2.3",
+	}
+
+	config.ApplyFlightctlServicesTagOverride(log.NewPrefixLogger("test"))
+
+	require.Equal(t, "1.2.3", config.CatalogCollector.Tag)
+}
 
 // Helper function to create a test config with temporary directories
 func createTestConfig(t *testing.T) *RendererConfig {

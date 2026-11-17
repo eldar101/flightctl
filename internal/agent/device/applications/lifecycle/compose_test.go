@@ -1,18 +1,24 @@
 package lifecycle
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"testing"
 
 	"github.com/flightctl/flightctl/api/core/v1beta1"
 	api "github.com/flightctl/flightctl/api/core/v1beta1"
 	"github.com/flightctl/flightctl/internal/agent/client"
+	"github.com/flightctl/flightctl/internal/agent/device/deltastatus"
+	"github.com/flightctl/flightctl/internal/agent/device/dependency"
 	"github.com/flightctl/flightctl/internal/agent/device/fileio"
 	"github.com/flightctl/flightctl/pkg/executer"
 	"github.com/flightctl/flightctl/pkg/log"
 	testutil "github.com/flightctl/flightctl/test/util"
+	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 )
@@ -51,6 +57,115 @@ func TestNewComposeID(t *testing.T) {
 			require.Equal(tc.expected, result)
 		})
 	}
+}
+
+func TestArtifactVolumeRecordingPreservesOwnerOCITypeAndIncarnation(t *testing.T) {
+	const (
+		application = "app"
+		volumeID    = "app-data"
+		createdAt   = "2026-10-12T12:00:00Z"
+		reference   = "quay.io/acme/data-bundle:v1"
+		digestValue = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	)
+
+	root := t.TempDir()
+	rw := fileio.NewReadWriter(
+		fileio.NewReader(fileio.WithReaderRootDir(root)),
+		fileio.NewWriter(fileio.WithWriterRootDir(root)),
+	)
+	logger := log.NewPrefixLogger("test")
+	store := deltastatus.New(rw, "/var/lib/flightctl", logger)
+	require.NoError(t, store.ReconcileApplicationSpecs(map[string]string{application: "spec"}))
+	lifetime := store.ApplicationLifetime(application)
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	mockExec := executer.NewMockExecuter(ctrl)
+	mockExec.EXPECT().ExecuteWithContext(gomock.Any(), "podman", "volume", "inspect", volumeID, "--format", "{{json .}}").Return(
+		fmt.Sprintf(`{"Name":%q,"Driver":"local","CreatedAt":%q,"Labels":{},"Options":{}}`, volumeID, createdAt), "", 0,
+	)
+	podman := client.NewPodman(logger, mockExec, rw, testutil.NewPollConfig())
+	action := Action{Name: application, Lifetime: lifetime, User: "alice"}
+	volume := Volume{ID: volumeID, Reference: reference, OCIType: string(dependency.OCITypePodmanArtifact)}
+
+	recordArtifactVolumeImage(context.Background(), logger, store, action, volume, podman, digestValue)
+	image, found := store.ApplicationVolumeImage(application, lifetime, volumeID, createdAt)
+	require.True(t, found)
+	require.Equal(t, deltastatus.ApplicationImage{
+		Image: reference, Owner: "alice", OCIType: string(dependency.OCITypePodmanArtifact), Digest: digestValue,
+	}, image)
+	_, found = store.ApplicationVolumeImage(application, lifetime, volumeID, "another-volume-incarnation")
+	require.False(t, found)
+	require.NoError(t, store.RemoveApplication(application))
+	newLifetime, err := store.EnsureApplicationLifetime(application)
+	require.NoError(t, err)
+	_, found = store.ApplicationVolumeImage(application, newLifetime, volumeID, createdAt)
+	require.False(t, found)
+}
+
+func TestArtifactVolumeRecordingWithInvalidInspectionWithholdsIdentity(t *testing.T) {
+	root := t.TempDir()
+	rw := fileio.NewReadWriter(fileio.NewReader(fileio.WithReaderRootDir(root)), fileio.NewWriter(fileio.WithWriterRootDir(root)))
+	logger := log.NewPrefixLogger("test")
+	store := deltastatus.New(rw, "/var/lib/flightctl", logger)
+	require.NoError(t, store.ReconcileApplicationSpecs(map[string]string{"app": "spec"}))
+	lifetime := store.ApplicationLifetime("app")
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	mockExec := executer.NewMockExecuter(ctrl)
+	mockExec.EXPECT().ExecuteWithContext(gomock.Any(), "podman", "volume", "inspect", "app-data", "--format", "{{json .}}").Return("null", "", 0)
+	podman := client.NewPodman(logger, mockExec, rw, testutil.NewPollConfig())
+	action := Action{Name: "app", Lifetime: lifetime, User: "alice"}
+	volume := Volume{ID: "app-data", Reference: "quay.io/acme/data:v1", OCIType: string(dependency.OCITypePodmanArtifact)}
+
+	recordArtifactVolumeImage(context.Background(), logger, store, action, volume, podman, "sha256:artifact")
+	_, found := store.ApplicationVolumeImage("app", lifetime, volume.ID, "2026-10-12T12:00:00Z")
+	require.False(t, found)
+}
+
+func TestWhenComposeAddsArtifactVolumeWithoutLifetimeItShouldNotWarnAboutMissingDigest(t *testing.T) {
+	root := t.TempDir()
+	rw := fileio.NewReadWriter(
+		fileio.NewReader(fileio.WithReaderRootDir(root)),
+		fileio.NewWriter(fileio.WithWriterRootDir(root)),
+	)
+	appPath := "app"
+	require.NoError(t, os.MkdirAll(filepath.Join(root, appPath), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(root, appPath, "docker-compose.yaml"), []byte("services: {}\n"), 0o600))
+
+	logger := log.NewPrefixLogger("test")
+	logger.SetLevel(logrus.WarnLevel)
+	var logs bytes.Buffer
+	logger.SetOutput(&logs)
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	mockExec := executer.NewMockExecuter(ctrl)
+	mockExec.EXPECT().CommandContext(gomock.Any(), "podman", gomock.Any()).Return(exec.Command("podman")).AnyTimes()
+	mockExec.EXPECT().ExecuteWithContext(gomock.Any(), "podman", "volume", "exists", "data").Return("", "", 1)
+	mockExec.EXPECT().ExecuteWithContext(gomock.Any(), "podman", "volume", "create", "data", "--label", client.ComposeDockerProjectLabelKey+"=app-id").Return("data", "", 0)
+	mockExec.EXPECT().ExecuteWithContext(gomock.Any(), "podman", "volume", "inspect", "data", "--format", "{{.Mountpoint}}").Return("/volume-data", "", 0)
+	mockExec.EXPECT().ExecuteWithContext(gomock.Any(), "podman", "--version").Return("podman version 5.5.0", "", 0)
+	mockExec.EXPECT().ExecuteWithContext(gomock.Any(), "podman", "artifact", "extract", "artifact:seed", "/volume-data").Return("", "", 0)
+	mockExec.EXPECT().ExecuteWithContextFromDir(
+		gomock.Any(), appPath, "podman",
+		[]string{"compose", "-p", "app-id", "-f", "docker-compose.yaml", "up", "-d", "--no-recreate"},
+		gomock.Any(),
+	).Return("", "", 0)
+
+	compose := NewCompose(logger, func(v1beta1.Username) (fileio.ReadWriter, error) { return rw, nil }, func(v1beta1.Username) (*client.Podman, error) {
+		return client.NewPodman(logger, mockExec, rw, testutil.NewPollConfig()), nil
+	})
+	err := compose.Execute(context.Background(), Actions{{
+		Type: ActionAdd,
+		ID:   "app-id",
+		Name: "app",
+		Path: appPath,
+		Volumes: []Volume{{
+			ID: "data", Reference: "artifact:seed", OCIType: string(dependency.OCITypePodmanArtifact),
+		}},
+	}})
+	require.NoError(t, err)
+	require.NotContains(t, logs.String(), "Unable to pin artifact identity")
 }
 
 func TestComposeRemoveImageBackedVolumes(t *testing.T) {
@@ -208,7 +323,8 @@ func TestComposeEnsurePodmanVolumeRetainReseeds(t *testing.T) {
 
 	gomock.InOrder(
 		mockExec.EXPECT().ExecuteWithContext(gomock.Any(), "podman", "volume", "exists", "vol1").Return("", "", 0),
-		mockExec.EXPECT().ExecuteWithContext(gomock.Any(), "podman", newMatcher("volume", "inspect", "vol1")).Return(mountPath, "", 0),
+		mockExec.EXPECT().ExecuteWithContext(gomock.Any(), "podman", "volume", "inspect", "vol1", "--format", "{{json .}}").Return(`{"Name":"vol1","Driver":"local","CreatedAt":"2026-10-12T00:00:00Z"}`, "", 0),
+		mockExec.EXPECT().ExecuteWithContext(gomock.Any(), "podman", "volume", "inspect", "vol1", "--format", "{{.Mountpoint}}").Return(mountPath, "", 0),
 		mockWriter.EXPECT().RemoveContents(mountPath).Return(nil),
 		mockExec.EXPECT().ExecuteWithContext(gomock.Any(), "podman", newMatcher("--version")).Return("podman version 5.5", "", 0),
 		mockExec.EXPECT().ExecuteWithContext(gomock.Any(), "podman", newMatcher("artifact", "extract", "artifact:seed")).Return("", "", 0),
@@ -216,9 +332,11 @@ func TestComposeEnsurePodmanVolumeRetainReseeds(t *testing.T) {
 
 	err := compose.ensurePodmanVolume(
 		context.Background(),
+		&Action{Name: "app", ID: "app", User: api.RootUsername},
 		Volume{
 			ID:            "vol1",
 			Reference:     "artifact:seed",
+			OCIType:       "PodmanArtifact",
 			ReclaimPolicy: api.Retain,
 		},
 		nil,
@@ -277,6 +395,7 @@ func TestCompose_LifecycleHandler(t *testing.T) {
 			setupMocks: func(mockExec *executer.MockExecuter, _ *fileio.MockReadWriter) {
 				mockExec.EXPECT().ExecuteWithContextFromDir(
 					gomock.Any(), testPath, "podman", gomock.Any(),
+					gomock.Any(),
 				).Return("", "", 0)
 			},
 		},
@@ -294,6 +413,7 @@ func TestCompose_LifecycleHandler(t *testing.T) {
 				// Start (UpFromWorkDir)
 				mockExec.EXPECT().ExecuteWithContextFromDir(
 					gomock.Any(), testPath, "podman", gomock.Any(),
+					gomock.Any(),
 				).Return("", "", 0)
 			},
 		},
@@ -319,6 +439,7 @@ func TestCompose_LifecycleHandler(t *testing.T) {
 			defer ctrl.Finish()
 
 			mockExec := executer.NewMockExecuter(ctrl)
+			mockExec.EXPECT().CommandContext(gomock.Any(), "podman", gomock.Any()).Return(exec.Command("podman")).AnyTimes()
 			mockRW := fileio.NewMockReadWriter(ctrl)
 			tc.setupMocks(mockExec, mockRW)
 

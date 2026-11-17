@@ -55,7 +55,7 @@ curl -H "Flightctl-API-Version: v1beta1" \
 
 | Version | Resources | Status | Support Guarantee |
 |---------|-----------|--------|-------------------|
-| v1beta1 | Device, Fleet, Repository, EnrollmentRequest, TemplateVersion, ResourceSync, CertificateSigningRequest, Event, AuthProvider, AuthConfig, Organization | Current | Supported throughout the 1.x.x major version |
+| v1beta1 | Device, Fleet, Repository, EnrollmentRequest, TemplateVersion, ResourceSync, CertificateSigningRequest, Event, AuthProvider, AuthConfig, Organization, LabelSyncMapping | Current | Supported throughout the 1.x.x major version |
 | v1alpha1 | ImageBuild, ImageExport | Alpha | No breaking changes anticipated, but may evolve as the feature matures |
 
 ## Repositories
@@ -88,6 +88,12 @@ When managing a device as part of a Fleet, ensure the device object has appropri
 ## Fleets
 
 As mentioned, a fleet is a group of devices. A fleet’s definition has two main parts. The first is the `spec.selector` property, which defines how to select devices for this fleet according to their labels. The second is the `spec.template` property, which contains the configuration to be rolled out to each device.  This configuration is identical to the device configuration described above.
+
+## LabelSyncMappings
+
+A `LabelSyncMapping` is an organization-scoped resource that evaluates a CEL expression against device metadata, spec, or status and writes the result to device labels. Mappings can produce one scalar label or a map of labels. Manage mappings with the CLI or through the REST API endpoints `/api/v1/labelsyncmappings` and `/api/v1/labelsyncmappings/{name}`.
+
+For mapping examples, deployment defaults, ownership behavior, and propagation status, see [Managing dynamic label mappings](../using/managing-dynamic-mappings.md).
 
 ## TemplateVersions
 
@@ -167,3 +173,43 @@ erDiagram
     ImageBuild}o..|| Repository : "destination (oci)"
     ImageExport}o..|| ImageBuild : "source (required)"
 ```
+
+## Firmware intent and observations
+
+Devices accept optional `spec.firmware`; fleets use `spec.template.spec.firmware`.
+The firmware contract declares a hardware profile, an approved updater release and its
+configuration, component version constraints, artifact digests, required overlays, and a
+nonnegative `retryGeneration`. Version ordering belongs to the updater, not the API server.
+
+Firmware delivery is not enabled by this API extension. The service currently has no
+production source of approved updater descriptors. Requests needing concrete release
+authorization are rejected. Fleet templates whose updater identity uses template parameters can be
+stored, but descriptor-dependent checks remain deferred and rollout is held.
+
+Fixed firmware objects reject unknown fields. Updater configuration and backend
+observation data use the closed schemas of their identified releases. Artifact and
+signature repositories must belong to the same organization. Repository dependencies
+include both configuration and firmware references so that repository changes notify
+referencing resources.
+
+A PUT replacement that omits existing firmware is rejected with HTTP 400. Include the
+firmware in the replacement, or deliberately withdraw management using JSON Patch with
+`remove` at `/spec/firmware` for a device or `/spec/template/spec/firmware` for a fleet.
+PUT requests for resources without managed firmware retain their normal behavior.
+Withdrawal does not restore installed firmware or remove boot artifacts. Status writes that
+omit firmware preserve it, and writes cannot erase or change the identity of an outstanding attempt. Progress of that attempt is allowed.
+A terminal attempt cannot return to an active phase with the same identity. A new retry
+uses a new attempt identity and retry generation.
+
+`status.firmware` distinguishes selected artifacts from observed component state and
+includes support, attempt identity, phase, observation time, boot identity, errors, and
+recovery guidance. Observations use their own retained schema identity, including after
+an updater release loses authorization. `ResourceLimitExceeded` errors must name an
+`exceededBudget` key authorized by the pinned release or the component observation.
+
+Until firmware rendering is integrated, devices with desired firmware or an outstanding
+attempt retain their spec and rendered output. Their `SpecValid` condition is `Unknown`
+with reason `FirmwareUnsupported`; they cannot count as successfully rolled out. Fleets
+with firmware templates report `FleetValid=False` with reason
+`FirmwareRenderingUnsupported`, and no template version is created. Devices without
+firmware retain their existing behavior.

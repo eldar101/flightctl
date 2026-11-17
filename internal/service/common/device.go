@@ -3,6 +3,7 @@ package common
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
@@ -346,6 +347,10 @@ func KeepDBDeviceStatus(device, dbDevice *domain.Device) {
 	if dbDevice.Status.EnrollmentHooks != nil {
 		device.Status.EnrollmentHooks = dbDevice.Status.EnrollmentHooks
 	}
+
+	// Preserve the server-owned enrollment credential projection, including its
+	// absence for devices that predate the projection; the agent never reports it.
+	device.Status.EnrollmentCredential = dbDevice.Status.EnrollmentCredential
 }
 
 func ComputeDeviceStatusChanges(ctx context.Context, oldDevice, newDevice *domain.Device, orgId uuid.UUID) ResourceUpdates {
@@ -353,6 +358,16 @@ func ComputeDeviceStatusChanges(ctx context.Context, oldDevice, newDevice *domai
 
 	// Don't generate status change events during device creation (when oldDevice is nil)
 	if oldDevice == nil {
+		return resourceUpdates
+	}
+
+	if !deviceStatusesEqual(oldDevice.Status, newDevice.Status) {
+		resourceUpdates = append(resourceUpdates, ResourceUpdate{
+			Reason:  domain.EventReasonDeviceLabelReconciliationRequested,
+			Details: "Device label reconciliation was requested.",
+		})
+	}
+	if newDevice.Status == nil {
 		return resourceUpdates
 	}
 
@@ -446,6 +461,16 @@ func ComputeDeviceStatusChanges(ctx context.Context, oldDevice, newDevice *domai
 	}
 
 	return resourceUpdates
+}
+
+func deviceStatusesEqual(oldStatus, newStatus *domain.DeviceStatus) bool {
+	if oldStatus == nil || newStatus == nil {
+		return oldStatus == newStatus
+	}
+	oldCopy, newCopy := *oldStatus, *newStatus
+	// LastSeen is a liveness signal excluded from the JSON exposed to CEL.
+	oldCopy.LastSeen, newCopy.LastSeen = nil, nil
+	return reflect.DeepEqual(oldCopy, newCopy)
 }
 
 func hasStatusChanged[T comparable](oldDevice *domain.Device, newDevice *domain.Device, defaultValue T, getter func(*domain.Device) T) bool {

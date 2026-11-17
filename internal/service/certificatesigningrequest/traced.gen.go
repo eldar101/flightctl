@@ -10,6 +10,7 @@ import (
 
 	"github.com/flightctl/flightctl/internal/domain"
 	"github.com/flightctl/flightctl/internal/instrumentation/tracing"
+	"github.com/flightctl/flightctl/internal/store/selector"
 	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -68,10 +69,18 @@ func (_d *TracedService) GetCertificateSigningRequest(ctx context.Context, orgId
 	return cp1, s1
 }
 
-func (_d *TracedService) ListCertificateSigningRequests(ctx context.Context, orgId uuid.UUID, params domain.ListCertificateSigningRequestsParams) (cp1 *domain.CertificateSigningRequestList, s1 domain.Status) {
+func (_d *TracedService) ListCertificateSigningRequests(ctx context.Context, orgId uuid.UUID, params domain.ListCertificateSigningRequestsParams, opts ...selector.FieldSelectorOption) (cp1 *domain.CertificateSigningRequestList, s1 domain.Status) {
 	ctx, span := startSpan(ctx, "ListCertificateSigningRequests")
 
-	cp1, s1 = _d.inner.ListCertificateSigningRequests(ctx, orgId, params)
+	cp1, s1 = _d.inner.ListCertificateSigningRequests(ctx, orgId, params, opts...)
+	endSpan(span, s1)
+	return cp1, s1
+}
+
+func (_d *TracedService) MarkEnrollmentCredentialFlaggingCompleted(ctx context.Context, orgId uuid.UUID, name string) (cp1 *domain.CertificateSigningRequest, s1 domain.Status) {
+	ctx, span := startSpan(ctx, "MarkEnrollmentCredentialFlaggingCompleted")
+
+	cp1, s1 = _d.inner.MarkEnrollmentCredentialFlaggingCompleted(ctx, orgId, name)
 	endSpan(span, s1)
 	return cp1, s1
 }
@@ -88,6 +97,14 @@ func (_d *TracedService) ReplaceCertificateSigningRequest(ctx context.Context, o
 	ctx, span := startSpan(ctx, "ReplaceCertificateSigningRequest")
 
 	cp1, s1 = _d.inner.ReplaceCertificateSigningRequest(ctx, orgId, name, csr)
+	endSpan(span, s1)
+	return cp1, s1
+}
+
+func (_d *TracedService) RevokeCertificateSigningRequest(ctx context.Context, orgId uuid.UUID, name string, request domain.EnrollmentCertificateRevocationRequest) (cp1 *domain.CertificateSigningRequest, s1 domain.Status) {
+	ctx, span := startSpan(ctx, "RevokeCertificateSigningRequest")
+
+	cp1, s1 = _d.inner.RevokeCertificateSigningRequest(ctx, orgId, name, request)
 	endSpan(span, s1)
 	return cp1, s1
 }

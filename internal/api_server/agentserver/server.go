@@ -21,6 +21,7 @@ import (
 	"github.com/flightctl/flightctl/internal/crypto"
 	"github.com/flightctl/flightctl/internal/healthchecker"
 	"github.com/flightctl/flightctl/internal/kvstore"
+	"github.com/flightctl/flightctl/internal/rendered"
 	"github.com/flightctl/flightctl/internal/service"
 	catalogservice "github.com/flightctl/flightctl/internal/service/catalog"
 	certificatesigningrequestservice "github.com/flightctl/flightctl/internal/service/certificatesigningrequest"
@@ -31,6 +32,7 @@ import (
 	labelsyncmappingservice "github.com/flightctl/flightctl/internal/service/labelsyncmapping"
 	organizationservice "github.com/flightctl/flightctl/internal/service/organization"
 	"github.com/flightctl/flightctl/internal/service/tpmcsr"
+	updatercatalogservice "github.com/flightctl/flightctl/internal/service/updatercatalog"
 	catalogstore "github.com/flightctl/flightctl/internal/store/catalog"
 	certificatesigningrequeststore "github.com/flightctl/flightctl/internal/store/certificatesigningrequest"
 	devicestore "github.com/flightctl/flightctl/internal/store/device"
@@ -62,6 +64,7 @@ type AgentServer struct {
 	queuesProvider           queues.Provider
 	tlsConfig                *tls.Config
 	agentGrpcServer          *AgentGrpcServer
+	policyHub                *rendered.FirmwarePolicyHub
 	deviceSvc                deviceservice.Service
 	enrollmentRequestSvc     enrollmentrequestservice.Service
 	csrSvc                   certificatesigningrequestservice.Service
@@ -110,7 +113,7 @@ func (s *AgentServer) init(ctx context.Context) error {
 	deviceStore := devicestore.NewDeviceStore(s.db, s.log.WithField("pkg", "device-store"))
 	fleetStore := fleetstore.NewFleetStore(s.db, s.log.WithField("pkg", "fleet-store"))
 	enrollmentRequestStore := enrollmentrequeststore.NewEnrollmentRequestStore(s.db, s.log.WithField("pkg", "enrollmentrequest-store"))
-	csrStore := certificatesigningrequeststore.NewCertificateSigningRequestStore(s.db, s.log.WithField("pkg", "csr-store"))
+	csrStore := certificatesigningrequeststore.NewCertificateSigningRequestStore(s.db, s.log.WithField("pkg", "csr-store"), s.cfg.CA.DeviceEnrollmentSignerName)
 	eventStore := eventstore.NewEventStore(s.db, s.log.WithField("pkg", "event-store"))
 	catalogStore := catalogstore.NewCatalogStore(s.db, s.log.WithField("pkg", "catalog-store"))
 	organizationStore := organizationstore.NewOrganizationStore(s.db)
@@ -119,11 +122,20 @@ func (s *AgentServer) init(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	labelSyncPublisher, err := worker_client.LabelSyncQueuePublisher(ctx, s.queuesProvider)
+	if err != nil {
+		return err
+	}
 	s.kvStore, err = kvstore.NewKVStore(ctx, s.log, s.cfg.KV.Hostname, s.cfg.KV.Port, s.cfg.KV.Password)
 	if err != nil {
 		return err
 	}
-	workerClient := worker_client.NewWorkerClient(publisher, s.log)
+	workerClient := worker_client.NewWorkerClient(publisher, s.log, worker_client.WithLabelSyncPublisher(labelSyncPublisher))
+
+	updaterProvider, err := updatercatalogservice.Bootstrap(ctx, s.db, s.cfg.FirmwareUpdaterCatalogFile)
+	if err != nil {
+		return fmt.Errorf("initialize approved updater catalog: %w", err)
+	}
 
 	eventsSvc := events.NewServiceHandler(eventStore, workerClient, s.log)
 	labelSyncMappingStore := labelsyncmappingstore.NewStore(s.db, s.log.WithField("pkg", "labelsyncmapping-store"))
@@ -132,17 +144,25 @@ func (s *AgentServer) init(ctx context.Context) error {
 		return fmt.Errorf("failed initializing LabelSyncMapping service: %w", err)
 	}
 
+	s.policyHub, err = rendered.NewFirmwarePolicyHub(ctx, s.queuesProvider)
+	if err != nil {
+		return fmt.Errorf("initialize firmware policy notifications: %w", err)
+	}
+
 	s.deviceSvc = deviceservice.WrapWithTracing(
-		deviceservice.NewDeviceServiceHandler(deviceStore, nil, fleetStore, eventsSvc, s.kvStore, s.cfg.Service.AgentEndpointAddress, s.log))
+		deviceservice.NewDeviceServiceHandler(deviceStore, nil, fleetStore, eventsSvc, s.kvStore, s.cfg.Service.AgentEndpointAddress, s.log, deviceservice.WithApprovedDescriptorProvider(updaterProvider), deviceservice.WithFirmwarePolicy(updaterProvider, s.policyHub, 0)))
 	healthchecker.HealthChecks.Initialize(ctx, s.deviceSvc, s.log)
 	ehPolicyStore := enrollmenthookpolicystore.NewStore(s.db, s.log.WithField("pkg", "enrollmenthookpolicy-store"))
 	ehPolicySvc := enrollmenthookpolicyservice.WrapWithTracing(
 		enrollmenthookpolicyservice.NewServiceHandler(ehPolicyStore, eventsSvc, s.log))
 	notifySecretsStore := enrollmenthooknotifysecretsstore.NewStore(s.db, s.log.WithField("pkg", "enrollmenthooknotifysecrets-store"))
-	s.enrollmentRequestSvc = enrollmentrequestservice.WrapWithTracing(
-		enrollmentrequestservice.NewServiceHandler(enrollmentRequestStore, deviceStore, csrStore, s.ca, s.kvStore, eventsSvc, s.log, s.cfg.Service.TPMCAPaths, s.cfg.Service.AgentEndpointAddress, s.cfg.Service.BaseUIUrl, ehPolicySvc, notifySecretsStore))
+
+	var tpmVerifier tpmcsr.Verifier
 	s.csrSvc = certificatesigningrequestservice.WrapWithTracing(
-		certificatesigningrequestservice.NewServiceHandler(csrStore, tpmcsr.NewVerifier(s.enrollmentRequestSvc), s.ca, eventsSvc, s.log, s.cfg.Service.AgentEndpointAddress, s.cfg.Service.BaseUIUrl))
+		certificatesigningrequestservice.NewServiceHandler(csrStore, &tpmVerifier, s.ca, eventsSvc, s.log, s.cfg.Service.AgentEndpointAddress, s.cfg.Service.BaseUIUrl))
+	s.enrollmentRequestSvc = enrollmentrequestservice.WrapWithTracing(
+		enrollmentrequestservice.NewServiceHandler(enrollmentRequestStore, deviceStore, s.csrSvc, s.ca, s.kvStore, eventsSvc, s.log, s.cfg.Service.TPMCAPaths, s.cfg.Service.AgentEndpointAddress, s.cfg.Service.BaseUIUrl, ehPolicySvc, notifySecretsStore))
+	tpmVerifier = *tpmcsr.NewVerifier(s.enrollmentRequestSvc)
 	s.catalogSvc = catalogservice.WrapWithTracing(
 		catalogservice.NewServiceHandler(catalogStore, deviceStore, fleetStore, eventsSvc, s.log))
 	s.organizationSvc = organizationservice.WrapWithTracing(
@@ -157,12 +177,31 @@ func (s *AgentServer) init(ctx context.Context) error {
 		return fmt.Errorf("creating organization provisioner: %w", err)
 	}
 
-	s.agentGrpcServer = NewAgentGrpcServer(s.log, s.cfg, s.ca, s.enrollmentRequestSvc, s.deviceSvc)
+	statusCache, err := fcmiddleware.NewRedisEnrollmentCSRStatusCache(s.kvStore, fcmiddleware.DefaultEnrollmentCSRStatusCacheTTL)
+	if err != nil {
+		return err
+	}
+	s.enrollmentAuthMiddleware, err = fcmiddleware.NewEnrollmentAuthMiddleware(
+		s.ca,
+		s.csrSvc,
+		statusCache,
+		s.log,
+	)
+	if err != nil {
+		return err
+	}
+	s.agentGrpcServer, err = NewAgentGrpcServer(s.log, s.cfg, s.ca, s.enrollmentRequestSvc, s.deviceSvc, s.enrollmentAuthMiddleware)
+	if err != nil {
+		return err
+	}
 	return nil
 }
 
 // Stop cleans up all resources
 func (s *AgentServer) Stop() {
+	if s.policyHub != nil {
+		s.policyHub.Close()
+	}
 	if s.agentGrpcServer != nil {
 		s.agentGrpcServer.Close()
 	}
@@ -279,10 +318,6 @@ func (s *AgentServer) prepareHTTPHandler(ctx context.Context) (http.Handler, err
 	// Create agent authentication middleware for device operations
 	s.agentAuthMiddleware = fcmiddleware.NewAgentAuthMiddleware(s.ca, s.log)
 	go s.agentAuthMiddleware.Start()
-
-	// Create enrollment authentication middleware for enrollment/bootstrap operations
-	s.enrollmentAuthMiddleware = fcmiddleware.NewEnrollmentAuthMiddleware(s.ca, s.log)
-	go s.enrollmentAuthMiddleware.Start()
 
 	// Create identity mapping middleware (handles both user and agent identities)
 	s.identityMapper = service.NewIdentityMapper(s.organizationSvc, s.orgProvisioner, s.log)
@@ -405,7 +440,11 @@ func (s *AgentServer) prepareHTTPHandler(ctx context.Context) (http.Handler, err
 		r.Mount("/", negotiatedRouter)
 	})
 
-	return otelhttp.NewHandler(router, "agent-http-server"), nil
+	if err := s.enrollmentAuthMiddleware.Start(ctx); err != nil {
+		return nil, err
+	}
+
+	return otelhttp.NewHandler(router, "agent-http-server", otelhttp.WithServerName(s.cfg.Service.AgentEndpointAddress)), nil
 }
 
 // grpcMuxHandlerFunc dispatches requests to the gRPC server or the HTTP handler based on the request headers

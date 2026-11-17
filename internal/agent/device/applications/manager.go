@@ -12,6 +12,7 @@ import (
 	"github.com/flightctl/flightctl/internal/agent/client"
 	appconsole "github.com/flightctl/flightctl/internal/agent/device/applications/console"
 	"github.com/flightctl/flightctl/internal/agent/device/applications/provider"
+	"github.com/flightctl/flightctl/internal/agent/device/deltastatus"
 	"github.com/flightctl/flightctl/internal/agent/device/dependency"
 	"github.com/flightctl/flightctl/internal/agent/device/errors"
 	"github.com/flightctl/flightctl/internal/agent/device/fileio"
@@ -20,17 +21,15 @@ import (
 	"github.com/flightctl/flightctl/internal/agent/device/systemd"
 	"github.com/flightctl/flightctl/internal/agent/device/systeminfo"
 	"github.com/flightctl/flightctl/internal/agent/shutdown"
+	"github.com/flightctl/flightctl/internal/appspec"
 	"github.com/flightctl/flightctl/pkg/log"
+	"github.com/opencontainers/go-digest"
 )
 
 var _ Manager = (*manager)(nil)
 
-type volumeImageKey struct {
-	user      v1beta1.Username
-	reference string
-}
-
 type manager struct {
+	deltaStatusStore   *deltastatus.Store
 	podmanMonitor      *PodmanMonitor
 	kubernetesMonitor  *KubernetesMonitor
 	clients            client.CLIClients
@@ -49,11 +48,10 @@ type manager struct {
 	// cache of temporary extracted app data
 	appDataCache map[string]*provider.AppData
 
-	// Volume digests are reused until the next update; an empty entry marks a confirmed artifact.
-	volumeImageDigestsMu         sync.Mutex
-	volumeImageDigests           map[volumeImageKey]string
-	volumeImageDigestsGeneration uint64
-	volumeImagesChanging         bool
+	// verified image-volume identities avoid repeating an image inspect while
+	// the same application lifetime and volume incarnation remain installed.
+	imageVolumeObservationsMu sync.Mutex
+	imageVolumeObservations   map[imageVolumeObservationKey]cachedImageVolumeObservation
 
 	// appConsole is created by WithConsole and owned by this manager.
 	// executor/dialFn live on PodmanMonitor (VM/serial-console specific).
@@ -68,12 +66,13 @@ func NewManager(
 	systemInfo systeminfo.Manager,
 	systemdFactory systemd.ManagerFactory,
 	pullConfigResolver dependency.PullConfigResolver,
+	opts ...ManagerOption,
 ) *manager {
 	bootTime := systemInfo.BootTime()
-	return &manager{
+	kubernetesMonitor := NewKubernetesMonitor(log, clients, rwFactory, pullConfigResolver)
+	manager := &manager{
 		rwFactory:          rwFactory,
-		podmanMonitor:      NewPodmanMonitor(log, podmanFactory, systemdFactory, bootTime, rwFactory),
-		kubernetesMonitor:  NewKubernetesMonitor(log, clients, rwFactory),
+		kubernetesMonitor:  kubernetesMonitor,
 		podmanFactory:      podmanFactory,
 		clients:            clients,
 		pullConfigResolver: pullConfigResolver,
@@ -82,6 +81,23 @@ func NewManager(
 		ociTargetCache:     provider.NewOCITargetCache(),
 		appDataCache:       provider.NewAppDataCache(),
 	}
+	for _, opt := range opts {
+		opt(manager)
+	}
+	manager.podmanMonitor = NewPodmanMonitor(log, podmanFactory, systemdFactory, bootTime, rwFactory, WithPodmanMonitorDeltaStatusStore(manager.deltaStatusStore))
+	return manager
+}
+
+// ManagerOption configures optional application reporting state.
+type ManagerOption func(*manager)
+
+func WithDeltaStatusStore(store *deltastatus.Store) ManagerOption {
+	return func(m *manager) { m.deltaStatusStore = store }
+}
+
+// WithAppDataCache shares prepared parent contents with the application controller.
+func WithAppDataCache(cache map[string]*provider.AppData) ManagerOption {
+	return func(m *manager) { m.appDataCache = cache }
 }
 
 func isDeferrableAppError(osUpdatePending bool, err error) bool {
@@ -99,26 +115,99 @@ func (m *manager) validateProviderDeps(ctx context.Context, p provider.Provider)
 }
 
 func (m *manager) newAppFromProvider(p provider.Provider) Application {
-	return NewApplication(p)
+	spec := p.Spec()
+	app := NewApplication(p)
+	if spec.AppType == v1beta1.AppTypeHelm {
+		app = NewHelmApplication(p)
+	}
+	// Capture expected images from the installed provider, not a future desired spec.
+	app.imageCollectionComplete = spec.AppType == v1beta1.AppTypeContainer
+	// Charts and Compose or Quadlet bundles are package references; their
+	// workload images are tracked separately by the OCI cache.
+	if spec.AppType != v1beta1.AppTypeHelm && spec.AppType != v1beta1.AppTypeCompose && spec.AppType != v1beta1.AppTypeQuadlet && spec.Image != "" {
+		app.requiredImages = append(app.requiredImages, spec.Image)
+	}
+	if m.ociTargetCache != nil {
+		if entry, found := m.ociTargetCache.Get(p.ID()); found {
+			app.imageCollectionComplete = true
+			// Rendered Helm targets can belong to suspended or scaled-to-zero
+			// controllers. Pod events supply the expected container images for
+			// workloads that exist; preparation alone does not make an image
+			// part of the observed runtime snapshot.
+			if spec.AppType != v1beta1.AppTypeHelm {
+				for _, target := range entry.Children {
+					app.requiredImages = append(app.requiredImages, target.Reference)
+				}
+			}
+		}
+	}
+	if spec.AppType == v1beta1.AppTypeCompose && spec.Image == "" {
+		images, complete := inlineComposeWorkloadImages(spec.ComposeApp)
+		app.requiredImages = append(app.requiredImages, images...)
+		app.imageCollectionComplete = complete
+	}
+	if spec.AppType == v1beta1.AppTypeQuadlet && spec.Image == "" {
+		images, complete := inlineQuadletImageReferences(spec.QuadletApp)
+		app.requiredImages = append(app.requiredImages, images...)
+		app.imageCollectionComplete = complete
+	}
+	return app
 }
 
-func (m *manager) populateCachedParentImageDigest(p provider.Provider) {
-	spec := p.Spec()
-	if m.ociTargetCache == nil || spec.Image == "" {
+func inlineComposeWorkloadImages(composeApp *v1beta1.ComposeApplication) ([]string, bool) {
+	if composeApp == nil {
+		return nil, false
+	}
+	inline, err := composeApp.AsInlineApplicationProviderSpec()
+	if err != nil {
+		return nil, false
+	}
+	composeSpec, err := appspec.ParseComposeFromSpec(inline.Inline)
+	if err != nil {
+		return nil, false
+	}
+	images := make([]string, 0, len(composeSpec.Services))
+	for _, service := range composeSpec.Services {
+		if service.Image != "" {
+			images = append(images, service.Image)
+		}
+	}
+	return images, true
+}
+
+func inlineQuadletImageReferences(quadletApp *v1beta1.QuadletApplication) ([]string, bool) {
+	if quadletApp == nil {
+		return nil, false
+	}
+	inline, err := quadletApp.AsInlineApplicationProviderSpec()
+	if err != nil {
+		return nil, false
+	}
+	images, err := appspec.ParseQuadletImageReferencesFromSpec(inline.Inline)
+	if err != nil {
+		return nil, false
+	}
+	return images, true
+}
+
+func (m *manager) attachApplicationLifetime(p provider.Provider) {
+	if m.deltaStatusStore == nil || p == nil || p.Spec() == nil {
 		return
 	}
-
-	entry, found := m.ociTargetCache.Get(p.ID())
-	if found && entry.Parent.Reference == spec.Image && entry.Parent.Digest != "" {
-		spec.ImageDigest = entry.Parent.Digest
+	p.Spec().Lifetime = ""
+	lifetime, err := m.deltaStatusStore.EnsureApplicationLifetime(p.Spec().Name)
+	if err != nil {
+		m.log.Warnf("Cannot persist application lifetime for %s; delta evidence will be withheld: %v", p.Spec().Name, err)
+		return
 	}
+	p.Spec().Lifetime = lifetime
 }
 
 func (m *manager) Ensure(ctx context.Context, provider provider.Provider) error {
+	m.attachApplicationLifetime(provider)
 	if err := m.validateProviderDeps(ctx, provider); err != nil {
 		return err
 	}
-	m.populateCachedParentImageDigest(provider)
 	appType := provider.Spec().AppType
 	switch appType {
 	case v1beta1.AppTypeCompose, v1beta1.AppTypeQuadlet, v1beta1.AppTypeContainer:
@@ -130,9 +219,8 @@ func (m *manager) Ensure(ctx context.Context, provider provider.Provider) error 
 			)
 			return nil
 		}
-		m.invalidateVolumeImageDigests()
 		if err := provider.Install(ctx); err != nil {
-			return fmt.Errorf("%w: %w", errors.ErrInstallingApplication, err)
+			return fmt.Errorf("%w %w: %w", errors.ErrInstallingApplication, errors.WithElement(provider.Name()), err)
 		}
 		return m.podmanMonitor.Ensure(ctx, m.newAppFromProvider(provider))
 	case v1beta1.AppTypeHelm:
@@ -144,20 +232,27 @@ func (m *manager) Ensure(ctx context.Context, provider provider.Provider) error 
 			)
 			return nil
 		}
-		m.invalidateVolumeImageDigests()
 		if err := provider.Install(ctx); err != nil {
-			return fmt.Errorf("%w: %w", errors.ErrInstallingApplication, err)
+			return fmt.Errorf("%w %w: %w", errors.ErrInstallingApplication, errors.WithElement(provider.Name()), err)
 		}
-		return m.kubernetesMonitor.Ensure(NewHelmApplication(provider))
+		return m.kubernetesMonitor.Ensure(m.newAppFromProvider(provider))
 	default:
 		return fmt.Errorf("%w: %s", errors.ErrUnsupportedAppType, appType)
 	}
 }
 
 func (m *manager) Remove(ctx context.Context, provider provider.Provider) error {
-	m.invalidateVolumeImageDigests()
+	if m.deltaStatusStore != nil {
+		provider.Spec().Lifetime = m.deltaStatusStore.ApplicationLifetime(provider.Spec().Name)
+	}
 	if err := provider.Remove(ctx); err != nil {
-		return fmt.Errorf("%w: %w", errors.ErrRemovingApplication, err)
+		return fmt.Errorf("%w %w: %w", errors.ErrRemovingApplication, errors.WithElement(provider.Name()), err)
+	}
+	m.clearImageVolumeObservations(provider.Spec().ID)
+	if m.deltaStatusStore != nil {
+		if err := m.deltaStatusStore.RemoveApplication(provider.Spec().Name); err != nil {
+			m.log.Warnf("Failed to remove application delta state for %s: %v", provider.Spec().Name, err)
+		}
 	}
 
 	// If dependencies are missing (e.g., kubernetes unavailable for helm apps),
@@ -180,30 +275,29 @@ func (m *manager) Remove(ctx context.Context, provider provider.Provider) error 
 }
 
 func (m *manager) Update(ctx context.Context, provider provider.Provider) error {
+	m.attachApplicationLifetime(provider)
 	if err := m.validateProviderDeps(ctx, provider); err != nil {
 		return err
 	}
-	m.populateCachedParentImageDigest(provider)
 	appType := provider.Spec().AppType
 	switch appType {
 	case v1beta1.AppTypeCompose, v1beta1.AppTypeQuadlet, v1beta1.AppTypeContainer:
-		m.invalidateVolumeImageDigests()
 		if err := provider.Remove(ctx); err != nil {
 			return fmt.Errorf("%w: %w", errors.ErrRemovingApplication, err)
 		}
+		m.clearImageVolumeObservations(provider.Spec().ID)
 		if err := provider.Install(ctx); err != nil {
 			return fmt.Errorf("%w: %w", errors.ErrInstallingApplication, err)
 		}
 		return m.podmanMonitor.QueueUpdate(m.newAppFromProvider(provider))
 	case v1beta1.AppTypeHelm:
-		m.invalidateVolumeImageDigests()
 		if err := provider.Remove(ctx); err != nil {
 			return fmt.Errorf("%w: %w", errors.ErrRemovingApplication, err)
 		}
 		if err := provider.Install(ctx); err != nil {
 			return fmt.Errorf("%w: %w", errors.ErrInstallingApplication, err)
 		}
-		return m.kubernetesMonitor.Update(NewHelmApplication(provider))
+		return m.kubernetesMonitor.Update(m.newAppFromProvider(provider))
 	default:
 		return fmt.Errorf("%w: %s", errors.ErrUnsupportedAppType, appType)
 	}
@@ -251,8 +345,6 @@ func (m *manager) verifyProviders(ctx context.Context, providers []provider.Prov
 
 func (m *manager) AfterUpdate(ctx context.Context) error {
 	defer m.clearAppDataCache()
-	complete := false
-	defer func() { m.finishVolumeImageUpdates(complete) }()
 
 	if err := m.podmanMonitor.ExecuteActions(ctx); err != nil {
 		return fmt.Errorf("error executing podman actions: %w", err)
@@ -262,28 +354,7 @@ func (m *manager) AfterUpdate(ctx context.Context) error {
 		return fmt.Errorf("error executing kubernetes actions: %w", err)
 	}
 
-	complete = true
 	return nil
-}
-
-func (m *manager) invalidateVolumeImageDigests() {
-	m.volumeImageDigestsMu.Lock()
-	defer m.volumeImageDigestsMu.Unlock()
-	m.volumeImageDigests = nil
-	m.volumeImageDigestsGeneration++
-	m.volumeImagesChanging = true
-}
-
-func (m *manager) finishVolumeImageUpdates(complete bool) {
-	m.volumeImageDigestsMu.Lock()
-	defer m.volumeImageDigestsMu.Unlock()
-	if m.volumeImagesChanging {
-		m.volumeImageDigests = nil
-		m.volumeImageDigestsGeneration++
-		// A failed runtime may leave actions queued in the other monitor.
-		// Keep invalidating until the whole batch completes successfully.
-		m.volumeImagesChanging = !complete
-	}
 }
 
 func (m *manager) clearAppDataCache() {
@@ -292,7 +363,7 @@ func (m *manager) clearAppDataCache() {
 			m.log.Warnf("Failed to cleanup extraction for app %s: %v", name, err)
 		}
 	}
-	m.appDataCache = provider.NewAppDataCache()
+	clear(m.appDataCache)
 }
 
 func (m *manager) Status(ctx context.Context, status *v1beta1.DeviceStatus, opts ...status.CollectorOpt) error {
@@ -310,184 +381,264 @@ func (m *manager) Status(ctx context.Context, status *v1beta1.DeviceStatus, opts
 	}
 	allResults = append(allResults, k8sResults...)
 
-	m.addVolumeImageDigests(ctx, allResults)
-	addCachedParentImageDigests(allResults, m.ociTargetCache)
+	m.addVolumeImageObservations(ctx, allResults)
 
+	for i := range allResults {
+		result := &allResults[i]
+		result.Status.LastDelta = nil
+		complete := result.Images.Complete
+		parentReference := ""
+		if (result.Status.AppType == v1beta1.AppTypeHelm || result.Status.AppType == v1beta1.AppTypeCompose || result.Status.AppType == v1beta1.AppTypeQuadlet) && m.ociTargetCache != nil {
+			if target, found := m.ociTargetCache.Get(result.ID); found {
+				parentReference = target.Parent.Reference
+			}
+		}
+		if result.Status.ImageDigests != nil {
+			for _, reported := range *result.Status.ImageDigests {
+				found := false
+				isWorkloadImage := false
+				for _, image := range result.Images.Images {
+					if image.Image == reported.Image {
+						isWorkloadImage = true
+						if image.Digest == reported.Digest {
+							found = true
+							break
+						}
+					}
+				}
+				// Charts and Compose or Quadlet bundles are parent references, not workloads.
+				isApplicationParent := !isWorkloadImage && parentReference != "" && reported.Image == parentReference
+				if !found && !isApplicationParent {
+					complete = false
+				}
+			}
+		}
+		for _, image := range result.Images.Images {
+			found := false
+			if result.Status.ImageDigests != nil {
+				for _, reported := range *result.Status.ImageDigests {
+					if image.Image == reported.Image && image.Digest == reported.Digest {
+						found = true
+						break
+					}
+				}
+			}
+			if !found {
+				complete = false
+			}
+		}
+		if m.deltaStatusStore != nil {
+			// The lifetime was captured with the monitor snapshot before volume
+			// inspection. The Store rejects it if removal/recreation happened while
+			// those independent observations were being gathered.
+			result.Status.LastDelta = m.deltaStatusStore.ObservedApplicationResultForLifetime(result.Status.Name, result.Images.Lifetime, result.Images.Images, complete)
+		}
+	}
 	statuses, summary := aggregateAppStatuses(allResults)
 	status.ApplicationsSummary = summary
 	status.Applications = statuses
 	return nil
 }
 
-// addVolumeImageDigests adds digests for image-backed application volumes to
-// the application status. Volume status carries the image reference, while
-// ImageDigests is what the control plane uses to find the source image for a
-// delta.
-func (m *manager) addVolumeImageDigests(ctx context.Context, results []AppStatusResult) {
-	m.volumeImageDigestsMu.Lock()
-	generation := m.volumeImageDigestsGeneration
-	volumeImageDigests := maps.Clone(m.volumeImageDigests)
-	m.volumeImageDigestsMu.Unlock()
-	if volumeImageDigests == nil {
-		volumeImageDigests = make(map[volumeImageKey]string)
-	}
-
+// addVolumeImageObservations collects only identities attached to the actual
+// installed volume. It never resolves the current mutable image reference as a
+// substitute for the content held by that volume.
+func (m *manager) addVolumeImageObservations(ctx context.Context, results []AppStatusResult) {
 	podmanClients := make(map[v1beta1.Username]*client.Podman)
-	inspectedDigests := make(map[volumeImageKey]string)
-	activeImages := make(map[volumeImageKey]struct{})
-
+	clientErrors := make(map[v1beta1.Username]error)
 	for i := range results {
-		application := &results[i].Status
-		if application.Volumes == nil || len(*application.Volumes) == 0 {
-			continue
-		}
-
-		var digests []v1beta1.ApplicationImageDigest
-		if application.ImageDigests != nil {
-			digests = append(digests, (*application.ImageDigests)...)
-		}
-		seen := make(map[string]struct{}, len(digests)+len(*application.Volumes))
-		for _, digest := range digests {
-			seen[digest.Image+"\x00"+digest.Digest] = struct{}{}
-		}
-
-		for _, volume := range *application.Volumes {
-			if volume.Reference == "" {
+		result := &results[i]
+		for _, expected := range result.Images.Volumes {
+			if expected.ID == "" || expected.Reference == "" || expected.OCIType == "" || !expected.Available {
+				result.Images.Complete = false
 				continue
 			}
-
-			key := volumeImageKey{user: application.RunAs, reference: volume.Reference}
-			activeImages[key] = struct{}{}
-			digest, inspected := volumeImageDigests[key]
-			if !inspected {
-				digest, inspected = inspectedDigests[key]
+			var artifactBinding deltastatus.ApplicationVolumeBinding
+			if expected.OCIType == string(dependency.OCITypePodmanArtifact) {
+				if m.deltaStatusStore == nil {
+					result.Images.Complete = false
+					continue
+				}
+				var ok bool
+				artifactBinding, ok = m.deltaStatusStore.ApplicationVolumeBinding(result.Status.Name, result.Images.Lifetime, expected.ID)
+				if !ok {
+					result.Images.Complete = false
+					continue
+				}
 			}
-			if !inspected {
+			owner := result.Status.RunAs.WithDefault(v1beta1.RootUsername)
+			podman, found := podmanClients[owner]
+			if !found {
 				var err error
-				podman, found := podmanClients[key.user]
-				if !found {
-					if m.podmanFactory == nil {
-						err = fmt.Errorf("podman factory is not configured")
-					} else {
-						podman, err = m.podmanFactory(key.user)
-					}
-					if err == nil && podman == nil {
-						err = fmt.Errorf("podman factory returned nil client")
-					}
-					if err != nil {
-						podmanClients[key.user] = nil
-						m.log.Debugf("could not inspect application volume image %q for digest: %v", key.reference, err)
-						continue
-					}
-					podmanClients[key.user] = podman
-				}
-				if podman == nil {
-					continue
-				}
-
-				digest, err = podman.ImageDigest(ctx, key.reference)
-				inspectedDigests[key] = digest
-				if err != nil {
-					if podman.ArtifactExists(ctx, key.reference) {
-						volumeImageDigests[key] = ""
-						continue
-					}
-					m.log.Debugf("could not inspect application volume image %q for digest: %v", key.reference, err)
-					continue
-				}
-				if digest != "" {
-					volumeImageDigests[key] = digest
-				}
+				podman, err = m.volumePodmanClient(owner)
+				podmanClients[owner] = podman
+				clientErrors[owner] = err
 			}
-			if digest == "" {
+			if clientErrors[owner] != nil || podman == nil {
+				result.Images.Complete = false
+				m.log.Debugf("could not inspect application volume %q: %v", expected.ID, clientErrors[owner])
+				continue
+			}
+			inspection, err := podman.InspectVolume(ctx, expected.ID)
+			if err != nil || inspection == nil || inspection.Name != expected.ID {
+				result.Images.Complete = false
+				m.log.Debugf("could not inspect application volume %q: %v", expected.ID, err)
 				continue
 			}
 
-			dedupeKey := key.reference + "\x00" + digest
-			if _, found := seen[dedupeKey]; found {
+			var image deltastatus.ApplicationImage
+			switch expected.OCIType {
+			case string(dependency.OCITypePodmanArtifact):
+				if inspection.Driver != "local" || inspection.CreatedAt != artifactBinding.CreatedAt {
+					result.Images.Complete = false
+					continue
+				}
+				var ok bool
+				currentBinding, ok := m.deltaStatusStore.ApplicationVolumeBinding(result.Status.Name, result.Images.Lifetime, expected.ID)
+				if !ok || currentBinding != artifactBinding {
+					result.Images.Complete = false
+					continue
+				}
+				image = artifactBinding.Image
+			case string(dependency.OCITypePodmanImage):
+				image, found = m.cachedImageVolumeObservation(inspection, result.Images.ID, result.Images.Lifetime, expected.ID, owner)
+				if found {
+					break
+				}
+				var ok bool
+				image, ok = podmanImageVolumeObservation(ctx, podman, inspection, result.Images.ID, result.Images.Lifetime, owner)
+				if !ok {
+					result.Images.Complete = false
+					continue
+				}
+				if inspection.CreatedAt != "" {
+					m.imageVolumeObservationsMu.Lock()
+					if m.imageVolumeObservations == nil {
+						m.imageVolumeObservations = make(map[imageVolumeObservationKey]cachedImageVolumeObservation)
+					}
+					m.imageVolumeObservations[imageVolumeObservationKey{applicationID: result.Images.ID, volumeID: expected.ID, owner: owner}] = cachedImageVolumeObservation{
+						lifetime: result.Images.Lifetime, createdAt: inspection.CreatedAt,
+						imageID: inspection.Options["image"], image: image,
+					}
+					m.imageVolumeObservationsMu.Unlock()
+				}
+			default:
+				result.Images.Complete = false
 				continue
 			}
-			seen[dedupeKey] = struct{}{}
-			digests = append(digests, v1beta1.ApplicationImageDigest{
-				Image:  key.reference,
-				Digest: digest,
-			})
-		}
-
-		if len(digests) == 0 {
-			continue
-		}
-		sort.Slice(digests, func(i, j int) bool {
-			if digests[i].Image != digests[j].Image {
-				return digests[i].Image < digests[j].Image
+			if image.Image != expected.Reference || image.Owner != string(owner) || image.OCIType != expected.OCIType || image.Digest == "" {
+				result.Images.Complete = false
+				continue
 			}
-			return digests[i].Digest < digests[j].Digest
-		})
-		application.ImageDigests = &digests
-	}
-	for key := range volumeImageDigests {
-		if _, active := activeImages[key]; !active {
-			delete(volumeImageDigests, key)
+			result.Images.Images = append(result.Images.Images, image)
+			addStatusImageDigest(&result.Status, image.Image, image.Digest)
 		}
-	}
-
-	m.volumeImageDigestsMu.Lock()
-	defer m.volumeImageDigestsMu.Unlock()
-	// An update may have invalidated the cache while Podman inspection was running.
-	if generation == m.volumeImageDigestsGeneration {
-		m.volumeImageDigests = volumeImageDigests
 	}
 }
 
-// addCachedParentImageDigests merges parent digests resolved by OCI collection
-// into monitor status. Collection uses temporary providers, so their resolved
-// digests must be joined to the live application snapshot by ID.
-func addCachedParentImageDigests(results []AppStatusResult, cache *provider.OCITargetCache) {
-	if cache == nil {
-		return
+func (m *manager) volumePodmanClient(owner v1beta1.Username) (*client.Podman, error) {
+	if m.podmanFactory == nil {
+		return nil, fmt.Errorf("podman factory is not configured")
 	}
-
-	for i := range results {
-		entry, found := cache.Get(results[i].ID)
-		if !found || entry.Parent.Reference == "" || entry.Parent.Digest == "" {
-			continue
-		}
-
-		var digests []v1beta1.ApplicationImageDigest
-		if results[i].Status.ImageDigests != nil {
-			digests = append(digests, (*results[i].Status.ImageDigests)...)
-		}
-
-		parentDigestFound := false
-		for j := range digests {
-			if digests[j].Image != entry.Parent.Reference {
-				continue
-			}
-			if digests[j].Digest == entry.Parent.Digest {
-				parentDigestFound = true
-				break
-			}
-			if digests[j].Digest == "" {
-				digests[j].Digest = entry.Parent.Digest
-				parentDigestFound = true
-				break
-			}
-		}
-		if !parentDigestFound {
-			digests = append(digests, v1beta1.ApplicationImageDigest{
-				Image:  entry.Parent.Reference,
-				Digest: entry.Parent.Digest,
-			})
-		}
-
-		sort.Slice(digests, func(i, j int) bool {
-			if digests[i].Image != digests[j].Image {
-				return digests[i].Image < digests[j].Image
-			}
-			return digests[i].Digest < digests[j].Digest
-		})
-		results[i].Status.ImageDigests = &digests
+	podman, err := m.podmanFactory(owner)
+	if err == nil && podman == nil {
+		return nil, fmt.Errorf("podman factory returned nil client")
 	}
+	return podman, err
+}
+
+func (m *manager) clearImageVolumeObservations(applicationID string) {
+	m.imageVolumeObservationsMu.Lock()
+	defer m.imageVolumeObservationsMu.Unlock()
+	maps.DeleteFunc(m.imageVolumeObservations, func(key imageVolumeObservationKey, _ cachedImageVolumeObservation) bool {
+		return key.applicationID == applicationID
+	})
+}
+
+type imageVolumeObservationKey struct {
+	applicationID string
+	volumeID      string
+	owner         v1beta1.Username
+}
+
+type cachedImageVolumeObservation struct {
+	lifetime  string
+	createdAt string
+	imageID   string
+	image     deltastatus.ApplicationImage
+}
+
+func (m *manager) cachedImageVolumeObservation(
+	inspection *client.PodmanVolumeInspect,
+	applicationID, lifetime, volumeID string,
+	owner v1beta1.Username,
+) (deltastatus.ApplicationImage, bool) {
+	if inspection == nil || inspection.Driver != "image" || !client.IsImmutablePodmanImageID(inspection.Options["image"]) {
+		return deltastatus.ApplicationImage{}, false
+	}
+	m.imageVolumeObservationsMu.Lock()
+	cached, ok := m.imageVolumeObservations[imageVolumeObservationKey{applicationID: applicationID, volumeID: volumeID, owner: owner}]
+	m.imageVolumeObservationsMu.Unlock()
+	if !ok || inspection.CreatedAt == "" || cached.lifetime != lifetime || cached.createdAt != inspection.CreatedAt || cached.imageID != inspection.Options["image"] {
+		return deltastatus.ApplicationImage{}, false
+	}
+	labels := inspection.Labels
+	if labels[client.PodmanDeltaVolumeApplicationLabel] != applicationID ||
+		labels[client.PodmanDeltaVolumeLifetimeLabel] != lifetime ||
+		labels[client.PodmanDeltaVolumeReferenceLabel] != cached.image.Image ||
+		labels[client.PodmanDeltaVolumeOwnerLabel] != string(owner) ||
+		labels[client.PodmanDeltaVolumeOCITypeLabel] != string(dependency.OCITypePodmanImage) ||
+		labels[client.PodmanDeltaVolumeDigestLabel] != cached.image.Digest {
+		return deltastatus.ApplicationImage{}, false
+	}
+	return cached.image, true
+}
+
+func podmanImageVolumeObservation(ctx context.Context, podman *client.Podman, inspection *client.PodmanVolumeInspect, applicationID, lifetime string, owner v1beta1.Username) (deltastatus.ApplicationImage, bool) {
+	if inspection == nil || applicationID == "" || lifetime == "" || inspection.Driver != "image" || !client.IsImmutablePodmanImageID(inspection.Options["image"]) {
+		return deltastatus.ApplicationImage{}, false
+	}
+	if podman == nil {
+		return deltastatus.ApplicationImage{}, false
+	}
+	labels := inspection.Labels
+	image := deltastatus.ApplicationImage{
+		Image:   labels[client.PodmanDeltaVolumeReferenceLabel],
+		Owner:   labels[client.PodmanDeltaVolumeOwnerLabel],
+		OCIType: labels[client.PodmanDeltaVolumeOCITypeLabel],
+		Digest:  labels[client.PodmanDeltaVolumeDigestLabel],
+	}
+	if labels[client.PodmanDeltaVolumeApplicationLabel] != applicationID || labels[client.PodmanDeltaVolumeLifetimeLabel] != lifetime || image.Image == "" || image.Owner != string(owner) || image.OCIType != string(dependency.OCITypePodmanImage) {
+		return deltastatus.ApplicationImage{}, false
+	}
+	if _, err := digest.Parse(image.Digest); err != nil {
+		return deltastatus.ApplicationImage{}, false
+	}
+	observedDigest, err := podman.ImageDigest(ctx, inspection.Options["image"])
+	if err != nil || observedDigest != image.Digest {
+		return deltastatus.ApplicationImage{}, false
+	}
+	return image, true
+}
+
+func addStatusImageDigest(status *v1beta1.DeviceApplicationStatus, image, imageDigest string) {
+	var digests []v1beta1.ApplicationImageDigest
+	if status.ImageDigests != nil {
+		digests = append(digests, *status.ImageDigests...)
+	}
+	for _, existing := range digests {
+		if existing.Image == image && existing.Digest == imageDigest {
+			return
+		}
+	}
+	digests = append(digests, v1beta1.ApplicationImageDigest{Image: image, Digest: imageDigest})
+	sort.Slice(digests, func(i, j int) bool {
+		if digests[i].Image != digests[j].Image {
+			return digests[i].Image < digests[j].Image
+		}
+		return digests[i].Digest < digests[j].Digest
+	})
+	status.ImageDigests = &digests
 }
 
 func aggregateAppStatuses(results []AppStatusResult) ([]v1beta1.DeviceApplicationStatus, v1beta1.DeviceApplicationsSummaryStatus) {

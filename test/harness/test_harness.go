@@ -2,6 +2,7 @@ package harness
 
 import (
 	"context"
+	stdcrypto "crypto"
 	"errors"
 	"fmt"
 	"io"
@@ -41,6 +42,7 @@ import (
 	"github.com/flightctl/flightctl/internal/util"
 	"github.com/flightctl/flightctl/internal/worker_client"
 	workerserver "github.com/flightctl/flightctl/internal/worker_server"
+	fcrypto "github.com/flightctl/flightctl/pkg/crypto"
 	"github.com/flightctl/flightctl/pkg/k8sclient"
 	"github.com/flightctl/flightctl/pkg/log"
 	"github.com/flightctl/flightctl/test/integration/integrationstack"
@@ -73,6 +75,7 @@ type TestHarness struct {
 	ctrl          *gomock.Controller
 
 	vulnerabilityEnabled bool
+	oidcProvider         *api.OIDCProviderSpec
 
 	// Redis connection params (must be set via WithRedis for ephemeral Redis isolation)
 	redisHost     string
@@ -99,6 +102,12 @@ type TestHarness struct {
 }
 
 type TestHarnessOption func(h *TestHarness)
+
+func WithOIDCProvider(spec api.OIDCProviderSpec) TestHarnessOption {
+	return func(h *TestHarness) {
+		h.oidcProvider = &spec
+	}
+}
 
 // createAdminIdentity creates a test admin identity with full permissions
 func createAdminIdentity() *identity.MappedIdentity {
@@ -215,6 +224,9 @@ func NewTestHarness(ctx context.Context, testDirPath string, goRoutineErrorHandl
 	}
 
 	serverCfg := *config.NewDefault()
+	if tempHarness.oidcProvider != nil {
+		serverCfg.Auth.OIDC = tempHarness.oidcProvider
+	}
 	testdb.ApplyIntegrationConnectionOverrides(&serverCfg)
 	serverLog := log.InitLogs("debug")
 	serverLog.SetOutput(os.Stdout)
@@ -227,7 +239,7 @@ func NewTestHarness(ctx context.Context, testDirPath string, goRoutineErrorHandl
 	deviceStore := devicestore.NewDeviceStore(db, serverLog.WithField("pkg", "device-store"))
 	fleetStore := fleetstore.NewFleetStore(db, serverLog.WithField("pkg", "fleet-store"))
 	enrollmentRequestStore := enrollmentrequeststore.NewEnrollmentRequestStore(db, serverLog.WithField("pkg", "enrollmentrequest-store"))
-	csrStore := certificatesigningrequeststore.NewCertificateSigningRequestStore(db, serverLog.WithField("pkg", "csr-store"))
+	csrStore := certificatesigningrequeststore.NewCertificateSigningRequestStore(db, serverLog.WithField("pkg", "csr-store"), serverCfg.CA.DeviceEnrollmentSignerName)
 	eventStore := eventstore.NewEventStore(db, serverLog.WithField("pkg", "event-store"))
 	serverCfg.Database.Name = dbName
 
@@ -239,7 +251,7 @@ func NewTestHarness(ctx context.Context, testDirPath string, goRoutineErrorHandl
 	// create certs
 	serverCfg.Service.CertStore = filepath.Join(testDirPath, "etc", "flightctl", "certs")
 	serverCfg.CA.InternalConfig.CertStore = serverCfg.Service.CertStore
-	ca, serverCerts, _, err := testutil.NewTestCerts(&serverCfg)
+	ca, serverCerts, enrollmentCerts, err := testutil.NewTestCerts(&serverCfg)
 	if err != nil {
 		return nil, fmt.Errorf("NewTestHarness: %w", err)
 	}
@@ -248,6 +260,16 @@ func NewTestHarness(ctx context.Context, testDirPath string, goRoutineErrorHandl
 
 	// Add admin identity to context for service calls
 	ctx = context.WithValue(ctx, consts.MappedIdentityCtxKey, createAdminIdentity())
+
+	enrollmentCertificatePEM, err := fcrypto.EncodeCertificatePEM(enrollmentCerts.Certs[0])
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("NewTestHarness: encoding enrollment certificate: %w", err)
+	}
+	if err := seedApprovedEnrollmentCredential(ctx, csrStore, serverCfg.CA.ClientBootstrapCertName, serverCfg.CA.DeviceEnrollmentSignerName, enrollmentCertificatePEM); err != nil {
+		cancel()
+		return nil, fmt.Errorf("NewTestHarness: %w", err)
+	}
 
 	provider := testutil.NewTestProvider(serverLog)
 
@@ -409,8 +431,11 @@ func NewTestHarness(ctx context.Context, testDirPath string, goRoutineErrorHandl
 	eventsSvc := events.NewServiceHandler(eventStore, workerClient, serverLog)
 	testHarness.Device = deviceservice.NewDeviceServiceHandler(deviceStore, nil, fleetStore, eventsSvc, kvStore, "", serverLog)
 	testHarness.Fleet = fleetservice.NewServiceHandler(fleetStore, nil, eventsSvc, serverLog)
-	testHarness.EnrollmentRequest = enrollmentrequestservice.NewServiceHandler(enrollmentRequestStore, deviceStore, csrStore, ca, kvStore, eventsSvc, serverLog, []string{}, "", "", nil, nil)
-	testHarness.CertificateSigningRequest = certificatesigningrequestservice.NewServiceHandler(csrStore, tpmcsr.NewVerifier(testHarness.EnrollmentRequest), ca, eventsSvc, serverLog, "", "")
+
+	var tpmVerifier tpmcsr.Verifier
+	testHarness.CertificateSigningRequest = certificatesigningrequestservice.NewServiceHandler(csrStore, &tpmVerifier, ca, eventsSvc, serverLog, "", "")
+	testHarness.EnrollmentRequest = enrollmentrequestservice.NewServiceHandler(enrollmentRequestStore, deviceStore, testHarness.CertificateSigningRequest, ca, kvStore, eventsSvc, serverLog, []string{}, "", "", nil, nil)
+	tpmVerifier = *tpmcsr.NewVerifier(testHarness.EnrollmentRequest)
 
 	// Only auto-start agent if not explicitly disabled via WithoutAutoStartAgent()
 	if !testHarness.skipAutoStart {
@@ -539,6 +564,54 @@ func addRouteTable(testDirPath string) error {
 	}
 	if err = os.Chmod(dst, info.Mode()); err != nil {
 		return fmt.Errorf("failed to chmod system route table %s: %w", routeTable, err)
+	}
+	return nil
+}
+
+// seedApprovedEnrollmentCredential binds the harness enrollment certificate to an
+// approved enrollment CSR so enrollment mTLS satisfies the credential contract.
+func seedApprovedEnrollmentCredential(ctx context.Context, csrStore certificatesigningrequeststore.Store, csrName, signerName string, certificatePEM []byte) error {
+	_, privateKey, err := fcrypto.NewKeyPair()
+	if err != nil {
+		return fmt.Errorf("generating enrollment CSR key: %w", err)
+	}
+	signerKey, ok := privateKey.(stdcrypto.Signer)
+	if !ok {
+		return fmt.Errorf("enrollment CSR key does not implement crypto.Signer")
+	}
+	request, err := fcrypto.MakeCSR(signerKey, csrName)
+	if err != nil {
+		return fmt.Errorf("creating enrollment CSR: %w", err)
+	}
+	csr := &domain.CertificateSigningRequest{
+		Metadata: domain.ObjectMeta{Name: &csrName},
+		Spec: domain.CertificateSigningRequestSpec{
+			Request:    request,
+			SignerName: signerName,
+			Usages:     &[]string{"clientAuth"},
+		},
+	}
+	if _, err := csrStore.Create(ctx, org.DefaultID, csr); err != nil {
+		return fmt.Errorf("creating enrollment CSR: %w", err)
+	}
+	issuedAt := time.Now().UTC()
+	_, _, _, err = csrStore.Mutate(ctx, org.DefaultID, csrName, nil, func(mutation *certificatesigningrequeststore.CertificateSigningRequestMutation) error {
+		if err := mutation.RequireExisting(); err != nil {
+			return err
+		}
+		mutation.CertificateSigningRequest.Status = &domain.CertificateSigningRequestStatus{
+			Certificate: &certificatePEM,
+			Conditions: []domain.Condition{{
+				Type:   domain.ConditionTypeCertificateSigningRequestApproved,
+				Status: domain.ConditionStatusTrue,
+				Reason: "Approved",
+			}},
+			IssuedAt: &issuedAt,
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("approving enrollment CSR: %w", err)
 	}
 	return nil
 }

@@ -81,6 +81,8 @@ ARG AGENT_CONFIG_FROM=
 ARG AGENT_CERTS_FROM=
 
 COPY --from=variant-context flightctl-e2e.tmpfiles.conf /usr/lib/tmpfiles.d/flightctl-e2e.tmpfiles.conf
+COPY --from=variant-context e2e-status-value.sh /usr/lib/flightctl/custom-info.d/e2eStatusValue
+RUN chmod 0755 /usr/lib/flightctl/custom-info.d/e2eStatusValue
 
 # Install CA trust, agent config and certs if provided
 RUN --mount=type=bind,from=project-bin,source=.,target=/build-context \
@@ -124,6 +126,13 @@ RUN --mount=type=bind,from=project-bin,source=.,target=/build-context \
         rm -rf /tmp/rpms; \
       fi; \
       systemctl enable flightctl-agent.service'
+
+# The flightctl-agent RPM recommends oci-delta, so dnf installs the released
+# oci-delta package over the pinned binary copied into prebase. Re-copy the
+# pinned build (OCI_DELTA_REF) so delta apply uses the tested version, and
+# restore the SELinux label the packaged binary would otherwise carry.
+COPY --from=oci-delta-build /out/oci-delta /usr/bin/oci-delta
+RUN restorecon -v /usr/bin/oci-delta 2>/dev/null || true
 
 LABEL org.opencontainers.image.source="https://github.com/flightctl/flightctl"
 LABEL org.opencontainers.image.version="${SOURCE_GIT_TAG}"

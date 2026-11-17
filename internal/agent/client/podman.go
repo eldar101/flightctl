@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,17 +15,25 @@ import (
 	"sync"
 	"time"
 
+	ref "github.com/distribution/reference"
 	"github.com/flightctl/flightctl/api/core/v1beta1"
 	deviceerrors "github.com/flightctl/flightctl/internal/agent/device/errors"
 	"github.com/flightctl/flightctl/internal/agent/device/fileio"
 	"github.com/flightctl/flightctl/pkg/executer"
 	"github.com/flightctl/flightctl/pkg/log"
 	"github.com/flightctl/flightctl/pkg/poll"
+	"github.com/opencontainers/go-digest"
 )
 
 const (
 	podmanCmd              = "podman"
 	defaultPullLogInterval = 30 * time.Second
+	// PodmanEventsConfigFilename names the process-scoped containers.conf override.
+	PodmanEventsConfigFilename = ".flightctl-podman-events.conf"
+	PodmanEventsConfigContents = "[engine]\nevents_container_create_inspect_data = true\n"
+
+	// PodmanImageDigestsListFormat lists registry digests in one Podman invocation.
+	PodmanImageDigestsListFormat = `{{printf "%s\t%s" .Digest (json .RepoDigests)}}`
 )
 
 const (
@@ -34,11 +43,23 @@ const (
 	artifactNotKnownErrorSubstring = "artifact not known"
 )
 
+const (
+	PodmanDeltaVolumeApplicationLabel = "io.flightctl.delta.application"
+	PodmanDeltaVolumeLifetimeLabel    = "io.flightctl.delta.lifetime"
+	PodmanDeltaVolumeReferenceLabel   = "io.flightctl.delta.reference"
+	PodmanDeltaVolumeDigestLabel      = "io.flightctl.delta.digest"
+	PodmanDeltaVolumeOwnerLabel       = "io.flightctl.delta.owner"
+	PodmanDeltaVolumeOCITypeLabel     = "io.flightctl.delta.oci-type"
+)
+
 // PodmanInspect represents the overall structure of podman inspect output
 type PodmanInspect struct {
-	Restarts int                   `json:"RestartCount"`
-	State    PodmanContainerState  `json:"State"`
-	Config   PodmanContainerConfig `json:"Config"`
+	IsInfra     bool                  `json:"IsInfra"`
+	Image       string                `json:"Image"`
+	ImageDigest string                `json:"ImageDigest"`
+	Restarts    int                   `json:"RestartCount"`
+	State       PodmanContainerState  `json:"State"`
+	Config      PodmanContainerConfig `json:"Config"`
 }
 
 // ContainerState represents the container state part of the podman inspect output
@@ -77,19 +98,56 @@ type ArtifactLayer struct {
 	Annotations map[string]string `json:"annotations,omitempty"`
 }
 
+// PodmanVolumeInspect contains the public volume identity needed to associate
+// an application volume with installed image content. It intentionally omits
+// Podman's private storage-image identity.
+type PodmanVolumeInspect struct {
+	Name      string            `json:"Name"`
+	Driver    string            `json:"Driver"`
+	CreatedAt string            `json:"CreatedAt"`
+	Labels    map[string]string `json:"Labels"`
+	Options   map[string]string `json:"Options"`
+}
+
+// PodmanContainerIdentity retains only image evidence from a create-event snapshot.
+// Podman encodes ContainerInspectData as a JSON string containing inspect JSON.
+type PodmanContainerIdentity struct {
+	ID          string `json:"Id"`
+	IsInfra     bool   `json:"IsInfra"`
+	Image       string `json:"Image"`
+	ImageDigest string `json:"ImageDigest"`
+}
+
+func (identity *PodmanContainerIdentity) UnmarshalJSON(data []byte) error {
+	var snapshot string
+	if err := json.Unmarshal(data, &snapshot); err != nil {
+		return nil // Optional malformed evidence must not discard lifecycle events.
+	}
+	type identityFields PodmanContainerIdentity
+	var fields identityFields
+	if err := json.Unmarshal([]byte(snapshot), &fields); err != nil {
+		return nil
+	}
+	*identity = PodmanContainerIdentity(fields)
+	return nil
+}
+
 // PodmanEvent represents the structure of a podman event as produced via a CLI events command.
 // It should be noted that the CLI represents events differently from libpod. (notably the time properties)
 // https://github.com/containers/podman/blob/main/cmd/podman/system/events.go#L81-L96
 type PodmanEvent struct {
-	ContainerExitCode *int              `json:"ContainerExitCode,omitempty"`
-	ID                string            `json:"ID"`
-	Image             string            `json:"Image"`
-	Name              string            `json:"Name"`
-	Status            string            `json:"Status"`
-	Type              string            `json:"Type"`
-	TimeNano          int64             `json:"timeNano"`
-	HealthStatus      string            `json:"health_status,omitempty"`
-	Attributes        map[string]string `json:"Attributes"`
+	// StoreOwner is attached by the watcher, never trusted from event JSON.
+	StoreOwner           *v1beta1.Username        `json:"-"`
+	ContainerInspectData *PodmanContainerIdentity `json:"ContainerInspectData,omitempty"`
+	ContainerExitCode    *int                     `json:"ContainerExitCode,omitempty"`
+	ID                   string                   `json:"ID"`
+	Image                string                   `json:"Image"`
+	Name                 string                   `json:"Name"`
+	Status               string                   `json:"Status"`
+	Type                 string                   `json:"Type"`
+	TimeNano             int64                    `json:"timeNano"`
+	HealthStatus         string                   `json:"health_status,omitempty"`
+	Attributes           map[string]string        `json:"Attributes"`
 }
 
 type Podman struct {
@@ -238,6 +296,11 @@ func (p *Podman) pullArtifact(ctx context.Context, artifact string, options *cli
 // for details on the expected structure of artifacts. Regular images are considered artifacts by
 // podman due to the intentional looseness of the spec.
 func (p *Podman) ExtractArtifact(ctx context.Context, artifact, destination string) (string, error) {
+	parsedArtifact, err := parseArtifactReference(artifact)
+	if err != nil {
+		return "", err
+	}
+
 	ctx, cancel := context.WithTimeout(ctx, p.timeout)
 	defer cancel()
 
@@ -245,7 +308,7 @@ func (p *Podman) ExtractArtifact(ctx context.Context, artifact, destination stri
 		return "", err
 	}
 
-	args := []string{"artifact", "extract", artifact, destination}
+	args := []string{"artifact", "extract", parsedArtifact.selector, destination}
 	stdout, stderr, exitCode := p.exec.ExecuteWithContext(ctx, podmanCmd, args...)
 	if exitCode != 0 {
 		return "", fmt.Errorf("artifact extract: %w", deviceerrors.FromStderr(stderr, exitCode))
@@ -278,6 +341,50 @@ func (p *Podman) ImageExists(ctx context.Context, image string) bool {
 	return exitCode == 0
 }
 
+// ImageID returns the immutable local identity selected by an image reference.
+// Callers use it transiently to inspect held content independently of moved tags.
+func (p *Podman) ImageID(ctx context.Context, image string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, p.timeout)
+	defer cancel()
+	stdout, stderr, exitCode := p.exec.ExecuteWithContext(ctx, podmanCmd, "image", "inspect", "--format", "{{.Id}}", image)
+	if exitCode != 0 {
+		return "", fmt.Errorf("get image ID: %s: %w", image, deviceerrors.FromStderr(stderr, exitCode))
+	}
+	return strings.TrimSpace(stdout), nil
+}
+
+// Tag binds an existing local image identity to another local image reference.
+func (p *Podman) Tag(ctx context.Context, source, target string) error {
+	ctx, cancel := context.WithTimeout(ctx, p.timeout)
+	defer cancel()
+
+	_, stderr, exitCode := p.exec.ExecuteWithContext(ctx, podmanCmd, "tag", source, target)
+	if exitCode != 0 {
+		return fmt.Errorf("tag image %s as %s: %w", source, target, deviceerrors.FromStderr(stderr, exitCode))
+	}
+	return nil
+}
+
+// ImageMetadata returns the local image ID, content digest, and repository digests.
+func (p *Podman) ImageMetadata(ctx context.Context, image string) (PodmanImageMetadata, error) {
+	return p.imageMetadata(ctx, image, "inspect image metadata", "parse image metadata")
+}
+
+func (p *Podman) imageMetadata(ctx context.Context, image, inspectDescription, parseDescription string) (PodmanImageMetadata, error) {
+	ctx, cancel := context.WithTimeout(ctx, p.timeout)
+	defer cancel()
+
+	stdout, stderr, exitCode := p.exec.ExecuteWithContext(ctx, podmanCmd, "image", "inspect", "--format", "{{json .}}", image)
+	if exitCode != 0 {
+		return PodmanImageMetadata{}, fmt.Errorf("%s: %s: %w", inspectDescription, image, deviceerrors.FromStderr(stderr, exitCode))
+	}
+	var metadata PodmanImageMetadata
+	if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &metadata); err != nil {
+		return PodmanImageMetadata{}, fmt.Errorf("%s for %s: %w", parseDescription, image, err)
+	}
+	return metadata, nil
+}
+
 // ImageDigest returns the digest of the specified image.
 // Returns empty string and error if the image does not exist or cannot be inspected.
 func (p *Podman) ImageDigest(ctx context.Context, image string) (string, error) {
@@ -296,24 +403,74 @@ func (p *Podman) ImageDigest(ctx context.Context, image string) (string, error) 
 // ImageDigests returns the content digest and repository digests of the specified image.
 // Repo digests are needed to compare local images with a registry's manifest digest.
 func (p *Podman) ImageDigests(ctx context.Context, image string) ([]string, error) {
+	metadata, err := p.imageMetadata(ctx, image, "get image digests", "parse image digests")
+	if err != nil {
+		return nil, err
+	}
+	return metadata.Digests(), nil
+}
+
+// ListImageDigests returns the content and repository digests for all images
+// with one Podman invocation.
+func (p *Podman) ListImageDigests(ctx context.Context) ([]string, error) {
 	ctx, cancel := context.WithTimeout(ctx, p.timeout)
 	defer cancel()
 
-	args := []string{"image", "inspect", "--format", "{{json .}}", image}
+	args := []string{"image", "ls", "--format", PodmanImageDigestsListFormat}
 	stdout, stderr, exitCode := p.exec.ExecuteWithContext(ctx, podmanCmd, args...)
 	if exitCode != 0 {
-		return nil, fmt.Errorf("get image digests: %s: %w", image, deviceerrors.FromStderr(stderr, exitCode))
+		return nil, fmt.Errorf("list image digests: %w", deviceerrors.FromStderr(stderr, exitCode))
 	}
 
-	var inspectResult struct {
-		Digest      string   `json:"Digest"`
-		RepoDigests []string `json:"RepoDigests"`
-	}
-	if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &inspectResult); err != nil {
-		return nil, fmt.Errorf("parse image digests for %s: %w", image, err)
+	imageDigests, err := decodePodmanImageDigests(stdout)
+	if err != nil {
+		return nil, fmt.Errorf("parse listed image digests: %w", err)
 	}
 
-	digests := make([]string, 0, len(inspectResult.RepoDigests)+1)
+	digests := make([]string, 0, len(imageDigests)*2)
+	for _, imageDigest := range imageDigests {
+		digests = appendImageDigests(digests, imageDigest)
+	}
+	return digests, nil
+}
+
+// PodmanImageMetadata is the digest and runtime identity reported by Podman.
+type PodmanImageMetadata struct {
+	ID          string   `json:"Id"`
+	Digest      string   `json:"Digest"`
+	RepoDigests []string `json:"RepoDigests"`
+}
+
+// Digests returns the content digest and repository digests reported by Podman.
+func (m PodmanImageMetadata) Digests() []string {
+	return appendImageDigests(nil, m)
+}
+
+func decodePodmanImageDigests(output string) ([]PodmanImageMetadata, error) {
+	output = strings.Trim(output, "\r\n")
+	if output == "" {
+		return []PodmanImageMetadata{}, nil
+	}
+
+	lines := strings.Split(output, "\n")
+	imageDigests := make([]PodmanImageMetadata, 0, len(lines))
+	for i, line := range lines {
+		line = strings.TrimSuffix(line, "\r")
+		digest, repoDigestsJSON, ok := strings.Cut(line, "\t")
+		if !ok {
+			return nil, fmt.Errorf("image digest line %d is missing its separator", i+1)
+		}
+
+		var repoDigests []string
+		if err := json.Unmarshal([]byte(repoDigestsJSON), &repoDigests); err != nil {
+			return nil, fmt.Errorf("parse repository digests on image line %d: %w", i+1, err)
+		}
+		imageDigests = append(imageDigests, PodmanImageMetadata{Digest: digest, RepoDigests: repoDigests})
+	}
+	return imageDigests, nil
+}
+
+func appendImageDigests(digests []string, inspectResult PodmanImageMetadata) []string {
 	if digest := strings.TrimSpace(inspectResult.Digest); digest != "" {
 		digests = append(digests, digest)
 	}
@@ -322,23 +479,28 @@ func (p *Podman) ImageDigests(ctx context.Context, image string) ([]string, erro
 			digests = append(digests, digest)
 		}
 	}
-	return digests, nil
+	return digests
 }
 
 // ArtifactExists returns true if the artifact exists in storage otherwise false.
 func (p *Podman) ArtifactExists(ctx context.Context, artifact string) bool {
+	parsedArtifact, err := parseArtifactReference(artifact)
+	if err != nil {
+		return false
+	}
+
 	ctx, cancel := context.WithTimeout(ctx, p.timeout)
 	defer cancel()
 
-	args := []string{"artifact", "inspect", artifact}
+	args := []string{"artifact", "inspect", parsedArtifact.selector}
 	_, _, exitCode := p.exec.ExecuteWithContext(ctx, podmanCmd, args...)
 	return exitCode == 0
 }
 
-func (p *Podman) artifactInspect(ctx context.Context, reference string) (*ArtifactInspect, error) {
+func (p *Podman) artifactInspect(ctx context.Context, selector string) (*ArtifactInspect, error) {
 	ctx, cancel := context.WithTimeout(ctx, p.timeout)
 	defer cancel()
-	args := []string{"artifact", "inspect", reference}
+	args := []string{"artifact", "inspect", selector}
 	stdout, stderr, exitCode := p.exec.ExecuteWithContext(ctx, podmanCmd, args...)
 	if exitCode != 0 {
 		return nil, fmt.Errorf("artifact inspect: %w", deviceerrors.FromStderr(stderr, exitCode))
@@ -354,29 +516,107 @@ func (p *Podman) artifactInspect(ctx context.Context, reference string) (*Artifa
 
 // ArtifactDigest returns the digest of the specified artifact.
 func (p *Podman) ArtifactDigest(ctx context.Context, reference string) (string, error) {
+	parsedReference, err := parseArtifactReference(reference)
+	if err != nil {
+		return "", err
+	}
+
+	observedDigest, err := p.artifactDigest(ctx, parsedReference)
+	if err != nil {
+		return "", err
+	}
+	return observedDigest.String(), nil
+}
+
+func (p *Podman) artifactDigest(ctx context.Context, parsedReference parsedArtifactReference) (digest.Digest, error) {
 	if err := p.EnsureArtifactSupport(ctx); err != nil {
 		return "", err
 	}
 
-	inspect, err := p.artifactInspect(ctx, reference)
+	inspect, err := p.artifactInspect(ctx, parsedReference.selector)
 	if err != nil {
 		return "", err
 	}
 
 	if inspect.Digest == "" {
-		return "", fmt.Errorf("artifact digest empty for %s", reference)
+		return "", fmt.Errorf("artifact digest empty for %s", parsedReference.named.String())
 	}
 
-	return inspect.Digest, nil
+	observedDigest, err := digest.Parse(inspect.Digest)
+	if err != nil {
+		return "", fmt.Errorf("invalid artifact digest for %s: %w", parsedReference.named.String(), err)
+	}
+	if parsedReference.digest != "" && observedDigest != parsedReference.digest {
+		return "", fmt.Errorf("artifact digest mismatch for %s: requested %s, observed %s", parsedReference.named.String(), parsedReference.digest, observedDigest)
+	}
+	return observedDigest, nil
+}
+
+type parsedArtifactReference struct {
+	selector string
+	digest   digest.Digest
+	named    ref.Named
+}
+
+func parseArtifactReference(reference string) (parsedArtifactReference, error) {
+	parsed, err := ref.Parse(reference)
+	if err != nil {
+		return parsedArtifactReference{}, fmt.Errorf("parse artifact reference %q: %w", reference, err)
+	}
+	named, ok := parsed.(ref.Named)
+	if !ok {
+		return parsedArtifactReference{}, fmt.Errorf("artifact reference %q has no repository name", reference)
+	}
+	parsedReference := parsedArtifactReference{selector: reference, named: named}
+	if canonical, ok := parsed.(ref.Canonical); ok {
+		if _, tagged := parsed.(ref.Tagged); tagged {
+			return parsedArtifactReference{}, fmt.Errorf("artifact reference %q combines a tag and digest", reference)
+		}
+		parsedDigest := canonical.Digest()
+		if err := parsedDigest.Validate(); err != nil {
+			return parsedArtifactReference{}, fmt.Errorf("invalid artifact digest for %s: %w", reference, err)
+		}
+		parsedReference.selector = parsedDigest.Encoded()
+		parsedReference.digest = parsedDigest
+	}
+	return parsedReference, nil
+}
+
+// ImmutableArtifactReference resolves a local artifact to a validated,
+// digest-pinned reference and the manifest digest used for extraction.
+func (p *Podman) ImmutableArtifactReference(ctx context.Context, reference string) (string, string, error) {
+	parsedReference, err := parseArtifactReference(reference)
+	if err != nil {
+		return reference, "", err
+	}
+	observedDigest, err := p.artifactDigest(ctx, parsedReference)
+	if err != nil {
+		return reference, "", err
+	}
+	return ref.TrimNamed(parsedReference.named).String() + "@" + observedDigest.String(), observedDigest.String(), nil
+}
+
+// IsImmutablePodmanImageID reports whether value is a full local Podman image ID.
+func IsImmutablePodmanImageID(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
 }
 
 // InspectArtifactAnnotations inspects an OCI artifact and returns its annotations map.
 func (p *Podman) InspectArtifactAnnotations(ctx context.Context, reference string) (map[string]string, error) {
+	parsedReference, err := parseArtifactReference(reference)
+	if err != nil {
+		return nil, err
+	}
+
 	if err := p.EnsureArtifactSupport(ctx); err != nil {
 		return nil, err
 	}
 
-	inspect, err := p.artifactInspect(ctx, reference)
+	inspect, err := p.artifactInspect(ctx, parsedReference.selector)
 	if err != nil {
 		return nil, err
 	}
@@ -393,8 +633,8 @@ func (p *Podman) ListImages(ctx context.Context) ([]string, error) {
 	// Use a format that handles both tagged and untagged images
 	// For tagged images: "repository:tag"
 	// For untagged images: use the image ID (short format)
-	// Note: When Repository is the string "<none>" (not empty), we need to check for it explicitly
-	args := []string{"image", "ls", "--format", "{{if and .Repository (ne .Repository \"<none>\")}}{{.Repository}}:{{.Tag}}{{else}}{{.ID}}{{end}}"}
+	// Digest-only images may have a repository but no tag; inspect them by ID.
+	args := []string{"image", "ls", "--format", "{{if and .Repository (ne .Repository \"<none>\") .Tag (ne .Tag \"<none>\")}}{{.Repository}}:{{.Tag}}{{else}}{{.ID}}{{end}}"}
 	stdout, stderr, exitCode := p.exec.ExecuteWithContext(ctx, podmanCmd, args...)
 	if exitCode != 0 {
 		return nil, fmt.Errorf("list images: %w", deviceerrors.FromStderr(stderr, exitCode))
@@ -776,6 +1016,31 @@ func (p *Podman) InspectVolumeOptionType(ctx context.Context, name string) (stri
 
 func (p *Podman) InspectVolumeMount(ctx context.Context, name string) (string, error) {
 	return p.inspectVolumeProperty(ctx, name, "{{.Mountpoint}}")
+}
+
+// InspectVolume returns only public Podman volume fields. In particular, it
+// does not infer an image ID from StorageID or inspect Podman's private state.
+func (p *Podman) InspectVolume(ctx context.Context, name string) (*PodmanVolumeInspect, error) {
+	ctx, cancel := context.WithTimeout(ctx, p.timeout)
+	defer cancel()
+
+	stdout, stderr, exitCode := p.exec.ExecuteWithContext(ctx, podmanCmd, "volume", "inspect", name, "--format", "{{json .}}")
+	if exitCode != 0 {
+		return nil, fmt.Errorf("inspect volume %s: %w", name, deviceerrors.FromStderr(stderr, exitCode))
+	}
+
+	var inspect PodmanVolumeInspect
+	if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &inspect); err == nil && inspect.Name != "" {
+		return &inspect, nil
+	}
+	var inspections []PodmanVolumeInspect
+	if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &inspections); err != nil {
+		return nil, fmt.Errorf("parse volume inspection for %s: %w", name, err)
+	}
+	if len(inspections) != 1 || inspections[0].Name == "" {
+		return nil, fmt.Errorf("parse volume inspection for %s: expected one named volume", name)
+	}
+	return &inspections[0], nil
 }
 
 func (p *Podman) RemoveVolumes(ctx context.Context, volumes ...string) error {

@@ -2,13 +2,17 @@ package enrollmentrequest
 
 import (
 	"context"
+	"reflect"
 
 	"github.com/flightctl/flightctl/internal/domain"
+	"github.com/flightctl/flightctl/internal/flterrors"
 	"github.com/flightctl/flightctl/internal/store"
 	"github.com/flightctl/flightctl/internal/store/model"
 	"github.com/google/uuid"
+	"github.com/samber/lo"
 	"github.com/sirupsen/logrus"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type Store interface {
@@ -17,10 +21,14 @@ type Store interface {
 	Create(ctx context.Context, orgId uuid.UUID, req *domain.EnrollmentRequest) (*domain.EnrollmentRequest, error)
 	Update(ctx context.Context, orgId uuid.UUID, req *domain.EnrollmentRequest) (*domain.EnrollmentRequest, *domain.EnrollmentRequest, error)
 	CreateOrUpdate(ctx context.Context, orgId uuid.UUID, enrollmentrequest *domain.EnrollmentRequest) (*domain.EnrollmentRequest, *domain.EnrollmentRequest, bool, error)
+	Mutate(ctx context.Context, orgId uuid.UUID, name string, previous *domain.EnrollmentRequest, apply EnrollmentRequestApplyFunc) (*domain.EnrollmentRequest, *domain.EnrollmentRequest, bool, error)
 	Get(ctx context.Context, orgId uuid.UUID, name string) (*domain.EnrollmentRequest, error)
 	List(ctx context.Context, orgId uuid.UUID, listParams store.ListParams) (*domain.EnrollmentRequestList, error)
 	Delete(ctx context.Context, orgId uuid.UUID, name string) (bool, error)
-	UpdateStatus(ctx context.Context, orgId uuid.UUID, enrollmentrequest *domain.EnrollmentRequest) (*domain.EnrollmentRequest, *domain.EnrollmentRequest, error)
+	// DenyEnrollmentRequestsForRevokedCredential denies up to limit pending
+	// Enrollment Requests bound to credentialName in one statement. Callers
+	// repeat it until it returns zero rows.
+	DenyEnrollmentRequestsForRevokedCredential(ctx context.Context, orgId uuid.UUID, credentialName string, limit int) (int64, error)
 }
 
 type EnrollmentRequestStore struct {
@@ -28,6 +36,41 @@ type EnrollmentRequestStore struct {
 	log          logrus.FieldLogger
 	genericStore *store.GenericStore[*model.EnrollmentRequest, model.EnrollmentRequest, domain.EnrollmentRequest, domain.EnrollmentRequestList]
 }
+
+// EnrollmentRequestMutation is the unit apply mutates. Handlers decide all field changes.
+// EnrollmentRequest is nil on the create path until apply assigns it.
+type EnrollmentRequestMutation struct {
+	EnrollmentRequest *domain.EnrollmentRequest
+}
+
+func (m *EnrollmentRequestMutation) Resource() *domain.EnrollmentRequest {
+	return m.EnrollmentRequest
+}
+
+func (m *EnrollmentRequestMutation) SetResource(resource *domain.EnrollmentRequest) {
+	m.EnrollmentRequest = resource
+}
+
+func (m *EnrollmentRequestMutation) Clone() (store.ResourceMutation[domain.EnrollmentRequest], error) {
+	cloned, err := store.CloneJSON(m.EnrollmentRequest)
+	if err != nil {
+		return nil, err
+	}
+	return &EnrollmentRequestMutation{EnrollmentRequest: cloned}, nil
+}
+
+// RequireExisting returns ErrResourceNotFound when EnrollmentRequest is nil (create path).
+func (m *EnrollmentRequestMutation) RequireExisting() error {
+	if m.EnrollmentRequest == nil {
+		return flterrors.ErrResourceNotFound
+	}
+	return nil
+}
+
+// EnrollmentRequestApplyFunc mutates m in place on every Mutate attempt.
+type EnrollmentRequestApplyFunc func(m *EnrollmentRequestMutation) error
+
+var _ store.ResourceMutation[domain.EnrollmentRequest] = (*EnrollmentRequestMutation)(nil)
 
 // Make sure we conform to the Store interface
 var _ Store = (*EnrollmentRequestStore)(nil)
@@ -80,6 +123,14 @@ func (s *EnrollmentRequestStore) InitialMigration(ctx context.Context) error {
 		}
 	}
 
+	if db.Dialector.Name() == "postgres" {
+		if err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_enrollment_requests_enrollment_certificate_name
+			ON enrollment_requests (org_id, (status->>'enrollmentCertificateName'))
+			WHERE deleted_at IS NULL`).Error; err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -107,7 +158,132 @@ func (s *EnrollmentRequestStore) Delete(ctx context.Context, orgId uuid.UUID, na
 	return s.genericStore.Delete(ctx, model.EnrollmentRequest{Resource: model.Resource{OrgID: orgId, Name: name}})
 }
 
-func (s *EnrollmentRequestStore) UpdateStatus(ctx context.Context, orgId uuid.UUID, resource *domain.EnrollmentRequest) (*domain.EnrollmentRequest, *domain.EnrollmentRequest, error) {
-	newEr, err := s.genericStore.UpdateStatus(ctx, orgId, resource)
-	return newEr, resource, err
+// Mutate applies an atomic create-or-update; apply decides which resource fields change.
+func (s *EnrollmentRequestStore) Mutate(ctx context.Context, orgId uuid.UUID, name string, previous *domain.EnrollmentRequest, apply EnrollmentRequestApplyFunc) (*domain.EnrollmentRequest, *domain.EnrollmentRequest, bool, error) {
+	if previous != nil && lo.FromPtr(previous.Metadata.Name) != name {
+		previous = nil
+	}
+	hooks := store.MutateHooks[domain.EnrollmentRequest]{
+		MaxRetries: lo.ToPtr(0),
+		Wrap: func(current *domain.EnrollmentRequest) store.ResourceMutation[domain.EnrollmentRequest] {
+			return &EnrollmentRequestMutation{EnrollmentRequest: current}
+		},
+		PersistCreate: func(ctx context.Context, orgId uuid.UUID, mutation store.ResourceMutation[domain.EnrollmentRequest]) (*domain.EnrollmentRequest, error) {
+			return s.Create(ctx, orgId, mutation.Resource())
+		},
+		PersistUpdate: s.persistMutation,
+	}
+	return s.genericStore.Mutate(ctx, orgId, name, previous, hooks, func(mutation store.ResourceMutation[domain.EnrollmentRequest]) error {
+		return apply(mutation.(*EnrollmentRequestMutation))
+	})
+}
+
+func (s *EnrollmentRequestStore) persistMutation(ctx context.Context, orgId uuid.UUID, name string, before *domain.EnrollmentRequest, mutation store.ResourceMutation[domain.EnrollmentRequest]) (bool, error) {
+	if before.Metadata.CreationTimestamp == nil {
+		return false, flterrors.ErrResourceVersionConflict
+	}
+	record, err := model.NewEnrollmentRequestFromApiResource(before)
+	if err != nil {
+		return false, err
+	}
+	record.OrgID = orgId
+	proposed, err := model.NewEnrollmentRequestFromApiResource(mutation.Resource())
+	if err != nil {
+		return false, err
+	}
+	updates := map[string]interface{}{
+		"status":           proposed.Status,
+		"resource_version": gorm.Expr("COALESCE(resource_version, 0) + 1"),
+	}
+	if !proposed.HasSameSpecAs(record) {
+		updates["spec"] = proposed.Spec
+		updates["generation"] = gorm.Expr("COALESCE(generation, 0) + 1")
+	}
+	if !reflect.DeepEqual(proposed.Labels, record.Labels) {
+		updates["labels"] = proposed.Labels
+	}
+	if !reflect.DeepEqual(proposed.Annotations, record.Annotations) {
+		updates["annotations"] = proposed.Annotations
+	}
+	result := s.getDB(ctx).Model(record).
+		Where("org_id = ? AND name = ? AND created_at = ? AND (resource_version IS NULL OR resource_version = ?)", orgId, name, *before.Metadata.CreationTimestamp, lo.FromPtr(record.ResourceVersion)).
+		Clauses(clause.Returning{}).Updates(updates)
+	if result.Error != nil {
+		return false, store.ErrorFromGormError(result.Error)
+	}
+	if result.RowsAffected != 1 {
+		return true, flterrors.ErrNoRowsUpdated
+	}
+	updated, err := record.ToApiResource()
+	mutation.SetResource(updated)
+	return false, err
+}
+
+// DenyEnrollmentRequestsForRevokedCredential denies up to limit pending
+// Enrollment Requests bound to credentialName. Approved and already-denied
+// requests are left unchanged, and the denial condition is merged in place.
+// Callers repeat the call until it returns zero rows.
+func (s *EnrollmentRequestStore) DenyEnrollmentRequestsForRevokedCredential(ctx context.Context, orgId uuid.UUID, credentialName string, limit int) (int64, error) {
+	if credentialName == "" || limit <= 0 {
+		return 0, nil
+	}
+	result := s.getDB(ctx).Exec(`
+		WITH batch AS (
+			SELECT name
+			FROM enrollment_requests
+			WHERE org_id = CAST(@org_id AS uuid)
+			  AND deleted_at IS NULL
+			  AND status->>'enrollmentCertificateName' = CAST(@credential_name AS text)
+			  AND COALESCE(status->'approval'->>'approved', 'false') <> 'true'
+			  AND NOT jsonb_path_exists(
+				  COALESCE(status, '{}'::jsonb),
+				  CAST(@path AS jsonpath),
+				  jsonb_build_object(
+					  'approved', CAST(@approved_type AS text),
+					  'denied',   CAST(@denied_type AS text),
+					  'status',   CAST(@condition_status AS text)
+				  )
+			  )
+			ORDER BY name
+			LIMIT CAST(@limit AS integer)
+			FOR UPDATE
+		)
+		UPDATE enrollment_requests er
+		SET status = jsonb_set(
+				COALESCE(er.status, '{}'::jsonb),
+				'{conditions}',
+				COALESCE((
+					SELECT jsonb_agg(condition_json ORDER BY ordinal)
+					FROM jsonb_array_elements(COALESCE(NULLIF(er.status->'conditions', 'null'::jsonb), '[]'::jsonb))
+						WITH ORDINALITY AS condition_rows(condition_json, ordinal)
+					WHERE condition_json->>'type' <> CAST(@condition_type AS text)
+				), '[]'::jsonb) || jsonb_build_array(jsonb_build_object(
+					'type', CAST(@condition_type AS text),
+					'status', CAST(@condition_status AS text),
+					'reason', CAST(@condition_reason AS text),
+					'message', CAST(@condition_message AS text),
+					'lastTransitionTime', to_jsonb(now())
+				)),
+				true
+			),
+			resource_version = COALESCE(er.resource_version, 0) + 1
+		FROM batch
+		WHERE er.org_id = CAST(@org_id AS uuid)
+		  AND er.name = batch.name
+	`, map[string]interface{}{
+		"org_id":            orgId,
+		"credential_name":   credentialName,
+		"approved_type":     string(domain.ConditionTypeEnrollmentRequestApproved),
+		"denied_type":       string(domain.ConditionTypeEnrollmentRequestDenied),
+		"condition_type":    string(domain.ConditionTypeEnrollmentRequestDenied),
+		"condition_status":  string(domain.ConditionStatusTrue),
+		"condition_reason":  domain.EnrollmentCredentialRevokedReason,
+		"condition_message": domain.EnrollmentCredentialRevokedEnrollmentRequestMessage(credentialName),
+		"path":              "$.conditions[*] ? ((@.type == $approved || @.type == $denied) && @.status == $status)",
+		"limit":             limit,
+	})
+	if result.Error != nil {
+		return 0, store.ErrorFromGormError(result.Error)
+	}
+	return result.RowsAffected, nil
 }

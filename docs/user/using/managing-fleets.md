@@ -51,6 +51,8 @@ Often, though, you would have separate organizations developing solutions and de
 
 Note that you have to define selectors so that no two fleets select the same device. Say you had one fleet select `region=east` and another `stage=production`, then both would select device A. When Flight Control detects this situation, it keeps the device in the fleet it is currently assigned to (if any) and signals the conflict by setting the "MultipleOwners" condition on affected devices to "true".
 
+You can also select devices by labels that Flight Control maintains from reported `systemInfo` and `customInfo` values. Configure the relevant [dynamic label mappings](managing-dynamic-mappings.md), then use the resulting label keys in fleet selectors, rollout batches, and templates.
+
 ### Selecting Devices into a Fleet on the Web UI
 
 ### Selecting Devices into a Fleet on the CLI
@@ -90,6 +92,7 @@ We also provide some helper functions:
 * `lower`: Change to lower case. For example, `{{ lower .metadata.labels.key }}`.
 * `replace`: Replace all occurrences of a substring with another string. For example, `{{ replace "old" "new" .metadata.labels.key }}`.
 * `getOrDefault`: Return a default value if accessing a missing label. For example, `{{ getOrDefault .metadata.labels "key" "default" }}`.
+* `deviceHasImageMode`: Report whether the device can apply an OS image. It takes no arguments and returns false only for a device labeled `feature.flightctl.io/os.mode: package`. For example, `{{ if deviceHasImageMode }}quay.io/org/os:v2{{ end }}`.
 
 You can also combine helpers in pipelines, for example `{{ getOrDefault .metadata.labels "key" "default" | upper | replace " " "-" }}`.
 
@@ -326,6 +329,12 @@ To start generation and continue the rollout immediately, set `maxWaitForDelta: 
 While a rollout is waiting for preparation, `fleet.status.conditions[]` includes `FleetDeltaPreparing` with status `True`. The `fleet.status.deltaGeneration.completed` and `fleet.status.deltaGeneration.total` fields report completed and total unique image pairs across OS and applications. Completed pairs include successful, failed, and rejected generation jobs. The condition message includes the same counts. `fleet.status.deltaGeneration.lastUpdated` records the last counter update. When `completed` equals `total`, every pair has reached a terminal state; inspect [Delta generation progress](troubleshooting.md#inspecting-delta-generation-progress) for per-pair results.
 
 See [Deployment delta generation configuration](../installing/installing-service-on-linux-configuration.md#delta-generation-configuration) for defaults shared by fleets and standalone devices. For generated hints and results, see [OS deltas](managing-devices.md#using-control-plane-generated-os-deltas) and [Application image deltas](managing-devices.md#using-application-image-deltas).
+
+#### Known limitations
+
+Rollout preparation generates deltas for the devices that are members of the fleet at that time. When a device joins the fleet afterward, Flight Control does not generate a new delta for it. The device uses an existing delta if one matches its current and target image digests; otherwise, it fetches the full image.
+
+To generate a delta for a newly joined device, apply an update to the fleet's device template after the device joins the fleet. Rollout preparation then runs again and includes the device's image pair.
 
 ### Defining a Device Selection Strategy
 

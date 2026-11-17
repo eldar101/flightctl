@@ -8,7 +8,7 @@ Additional developer documents:
 ## Building
 
 Prerequisites:
-* `git`, `make`, and `go` (>= 1.26), `openssl`, `openssl-devel`, `buildah`, `pam-devel`, `podman`, `podman-compose`, `container-selinux` (>= 2.241), `go-rpm-macros` (in case one needs to build RPM's), `python3`, and `python3-pyyaml` (or install PyYAML via pip)
+* `git`, `make`, and `go` (>= 1.27.3), `openssl`, `openssl-devel`, `buildah`, `pam-devel`, `podman`, `podman-compose`, `container-selinux` (>= 2.241), `go-rpm-macros` (in case one needs to build RPM's), `python3`, and `python3-pyyaml` (or install PyYAML via pip)
 
 Flightctl agent reports the status of running rootless containers. Ensure the podman socket is enabled:
 
@@ -24,9 +24,59 @@ To run unit tests, use `make unit-test`.  This requires installing gotestsum:
 
 `go install gotest.tools/gotestsum@latest`
 
+### Native Go FIPS builds
+
+Release builds use Red Hat Go Toolset 1.27.3 and the certified Go Cryptographic
+Module v1.0.0. `make` selects `GOFIPS140=v1.0.0` and
+`GOEXPERIMENT=strictfipsruntime` when the compiler identifies itself as Red Hat.
+The build records Red Hat's resolved snapshot identifier
+`v1.0.0-c2097c7c`; runtime version output reports `v1.0.0`.
+The Red Hat runtime activates FIPS mode on FIPS-enabled hosts. Set
+`GODEBUG=fips140=on` before starting a process to activate it explicitly, or
+`GODEBUG=fips140=only` when testing for non-approved cryptography.
+
+Inspect the client's runtime mode and module version with:
+
+```bash
+GODEBUG=fips140=on bin/flightctl version -o json
+```
+
+The `clientVersion.fipsMode` and `clientVersion.fipsModule` fields report the
+runtime state. The legacy `GOLANG_FIPS` and `OPENSSL_FORCE_FIPS_MODE` environment
+variables do not activate native Go FIPS mode. Explicit SSH crypto-policy
+overrides continue to select SSH algorithms independently of the runtime.
+
+Install the artifact validator with
+`go install github.com/flightctl/fips-validator@latest`, then run
+`make fips-validate` to validate containers. RPM builds install the pinned
+validator revision in `packaging/rpm/flightctl.spec` with `go install`.
+Its implementation and native Go FIPS policy are maintained in the
+[`flightctl/fips-validator`](https://github.com/flightctl/fips-validator)
+repository. It validates the certified module's embedded build settings and
+integrity section for Go 1.27 binaries, including stripped and static binaries,
+while retaining OpenSSL checks for older Go and other executables. Validation
+fails if a stripped Go executable's function table is missing, unreadable, or
+malformed.
+Bundled Helm and `oci-delta` executables are also built from pinned sources with
+the native FIPS module, so the image check covers their cryptography too. New
+certified snapshots should be reviewed and added in the validator repository
+before updating the pinned module revision.
+
+RPM builder images record a fingerprint of their compiler and Mock build inputs.
+`make rpm` rebuilds an outdated builder locally when those inputs change. This
+allows toolchain updates to be tested before the scheduled builder publication.
+Automatic refresh builds only the base and the selected Mock root's cache.
+Use `sudo ./hack/build_rpms.sh --rebuild-image` to refresh all configured roots.
+
+`DISABLE_FIPS=true` selects `GOFIPS140=off` for development and unsupported
+delivery targets such as the ARMv7 build. It does not change runtime settings
+for previously built binaries.
+
 To run integration tests, use `make integration-test`. This requires Podman (or Docker) - the test
 framework uses testcontainers to automatically start ephemeral Postgres, Redis, and Alertmanager
-instances. No manual setup is required.
+instances. No manual service deployment is required. Some suites also download tool images;
+see [Running VM-render integration tests](../../test/integration/tasks/vmrender/README.md)
+for the VM conversion image dependency and recovery steps.
 
 Key options for integration tests:
 - `INTEGRATION_PROCS=N` - Number of parallel processes (default: 4)
@@ -69,7 +119,7 @@ This naming scheme prevents conflicts when building and deploying containers acr
 
 **Available Make Targets:**
 
-- `make build-containers` - Build all service containers (defaults to `OS=el9`)
+- `make build-containers` - Build the service containers a deployment installs (defaults to `OS=el9`). The optional catalog collector is not among them; build it with `make flightctl-catalog-collector-container`.
 - `make clean-containers` - Remove containers for the current OS
 - `make bundle-containers` - Bundle containers for distribution
 
@@ -201,6 +251,10 @@ Only successful PR runs whose selected labels include `sanity` record a proof ca
 The observability stack (Prometheus) is managed by **testcontainers** in [test/e2e/infra/](../../test/e2e/infra/) and starts automatically when you run E2E tests.
 
 To use the Prometheus UI, run the E2E test suite (e.g. `make e2e-test` or `make in-cluster-e2e-test`). While tests run, the stack is up and the Prometheus web UI is typically accessible at `http://localhost:9090` (see `test/e2e/infra/auxiliary/` for details).
+
+## Extending the catalog collector
+
+To add custom sources, processors, destinations, or extensions, see [Extending the catalog collector](extending-catalog-collector.md). The guide explains shared component contracts, factory registration, configuration validation, and custom collector builds, with a source implementation example.
 
 ## Architecture
 

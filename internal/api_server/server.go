@@ -42,6 +42,7 @@ import (
 	resourcesyncservice "github.com/flightctl/flightctl/internal/service/resourcesync"
 	templateversionservice "github.com/flightctl/flightctl/internal/service/templateversion"
 	"github.com/flightctl/flightctl/internal/service/tpmcsr"
+	updatercatalogservice "github.com/flightctl/flightctl/internal/service/updatercatalog"
 	vulnerabilityfindingservice "github.com/flightctl/flightctl/internal/service/vulnerabilityfinding"
 	"github.com/flightctl/flightctl/internal/store"
 	authproviderstore "github.com/flightctl/flightctl/internal/store/authprovider"
@@ -179,6 +180,11 @@ func (s *Server) Run(ctx context.Context) error {
 		return err
 	}
 	defer publisher.Close()
+	labelSyncPublisher, err := worker_client.LabelSyncQueuePublisher(ctx, s.queuesProvider)
+	if err != nil {
+		return err
+	}
+	defer labelSyncPublisher.Close()
 	deltaPublisher, err := worker_client.DeltaQueuePublisher(ctx, s.queuesProvider)
 	if err != nil {
 		return err
@@ -188,20 +194,19 @@ func (s *Server) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	workerClient := worker_client.NewWorkerClient(publisher, s.log, worker_client.WithDeltaPublisher(deltaPublisher))
+	workerClient := worker_client.NewWorkerClient(publisher, s.log, worker_client.WithDeltaPublisher(deltaPublisher), worker_client.WithLabelSyncPublisher(labelSyncPublisher))
 
 	s.log.Println("Initializing API server")
 
-	// Construct the per-resource stores and service handlers this server needs, each wrapped
-	// with tracing. Cross-resource dependencies always go through the other resource's store,
-	// never its service, to avoid layering cycles (e.g. device depends on fleetStore, not
-	// fleetService).
+	// Construct stores for persistence and service handlers for resource workflows, each
+	// wrapped with tracing. Wire owning services and provider interfaces explicitly, and
+	// finish initializing the shared TPM verifier before serving requests.
 	vulnerabilityEnabled := s.cfg.VulnerabilityReporting != nil && s.cfg.VulnerabilityReporting.Enabled
 
 	deviceStore := devicestore.NewDeviceStore(s.db, s.log.WithField("pkg", "device-store"))
 	fleetStore := fleetstore.NewFleetStore(s.db, s.log.WithField("pkg", "fleet-store"))
 	enrollmentRequestStore := enrollmentrequeststore.NewEnrollmentRequestStore(s.db, s.log.WithField("pkg", "enrollmentrequest-store"))
-	csrStore := certificatesigningrequeststore.NewCertificateSigningRequestStore(s.db, s.log.WithField("pkg", "csr-store"))
+	csrStore := certificatesigningrequeststore.NewCertificateSigningRequestStore(s.db, s.log.WithField("pkg", "csr-store"), s.cfg.CA.DeviceEnrollmentSignerName)
 	templateVersionStore := templateversionstore.NewTemplateVersionStore(s.db, s.log.WithField("pkg", "templateversion-store"))
 	repositoryStore := repositorystore.NewRepositoryStore(s.db, s.log.WithField("pkg", "repository-store"))
 	resourceSyncStore := resourcesyncstore.NewResourceSyncStore(s.db, s.log.WithField("pkg", "resourcesync-store"))
@@ -211,24 +216,34 @@ func (s *Server) Run(ctx context.Context) error {
 	authProviderStore := authproviderstore.NewAuthProviderStore(s.db, s.log.WithField("pkg", "authprovider-store"))
 	vulnerabilityFindingStore := vulnerabilityfindingstore.NewVulnerabilityFindingStore(s.db, s.log.WithField("pkg", "vulnerabilityfinding-store"))
 
+	updaterProvider, err := updatercatalogservice.Bootstrap(ctx, s.db, s.cfg.FirmwareUpdaterCatalogFile)
+	if err != nil {
+		return fmt.Errorf("initialize approved updater catalog: %w", err)
+	}
+
 	eventsSvc := events.NewServiceHandler(eventStore, workerClient, s.log)
 
+	repositorySvc := repositoryservice.WrapWithTracing(
+		repositoryservice.NewServiceHandler(repositoryStore, eventsSvc, s.log))
 	deviceSvc := deviceservice.WrapWithTracing(
-		deviceservice.NewDeviceServiceHandler(deviceStore, catalogStore, fleetStore, eventsSvc, kvStore, s.cfg.Service.BaseAgentEndpointUrl, s.log))
+		deviceservice.NewDeviceServiceHandler(deviceStore, catalogStore, fleetStore, eventsSvc, kvStore, s.cfg.Service.BaseAgentEndpointUrl, s.log,
+			deviceservice.WithRepositoryGetter(repositorySvc.GetRepository), deviceservice.WithApprovedDescriptorProvider(updaterProvider)))
 	fleetSvc := fleetservice.WrapWithTracing(
-		fleetservice.NewServiceHandler(fleetStore, catalogStore, eventsSvc, s.log))
+		fleetservice.NewServiceHandler(fleetStore, catalogStore, eventsSvc, s.log,
+			fleetservice.WithRepositoryGetter(repositorySvc.GetRepository), fleetservice.WithApprovedDescriptorProvider(updaterProvider)))
 	enrollmentHookPolicyStore := enrollmenthookpolicystore.NewStore(s.db, s.log.WithField("pkg", "enrollmenthookpolicy-store"))
 	enrollmentHookPolicySvc := enrollmenthookpolicyservice.WrapWithTracing(
 		enrollmenthookpolicyservice.NewServiceHandler(enrollmentHookPolicyStore, eventsSvc, s.log))
 	notifySecretsStore := enrollmenthooknotifysecretsstore.NewStore(s.db, s.log.WithField("pkg", "enrollmenthooknotifysecrets-store"))
-	enrollmentRequestSvc := enrollmentrequestservice.WrapWithTracing(
-		enrollmentrequestservice.NewServiceHandler(enrollmentRequestStore, deviceStore, csrStore, s.ca, kvStore, eventsSvc, s.log, s.cfg.Service.TPMCAPaths, s.cfg.Service.BaseAgentEndpointUrl, s.cfg.Service.BaseUIUrl, enrollmentHookPolicySvc, notifySecretsStore))
+
+	var tpmVerifier tpmcsr.Verifier
 	csrSvc := certificatesigningrequestservice.WrapWithTracing(
-		certificatesigningrequestservice.NewServiceHandler(csrStore, tpmcsr.NewVerifier(enrollmentRequestSvc), s.ca, eventsSvc, s.log, s.cfg.Service.BaseAgentEndpointUrl, s.cfg.Service.BaseUIUrl))
+		certificatesigningrequestservice.NewServiceHandler(csrStore, &tpmVerifier, s.ca, eventsSvc, s.log, s.cfg.Service.BaseAgentEndpointUrl, s.cfg.Service.BaseUIUrl))
+	enrollmentRequestSvc := enrollmentrequestservice.WrapWithTracing(
+		enrollmentrequestservice.NewServiceHandler(enrollmentRequestStore, deviceStore, csrSvc, s.ca, kvStore, eventsSvc, s.log, s.cfg.Service.TPMCAPaths, s.cfg.Service.BaseAgentEndpointUrl, s.cfg.Service.BaseUIUrl, enrollmentHookPolicySvc, notifySecretsStore))
+	tpmVerifier = *tpmcsr.NewVerifier(enrollmentRequestSvc)
 	templateVersionSvc := templateversionservice.WrapWithTracing(
 		templateversionservice.NewServiceHandler(templateVersionStore, kvStore, eventsSvc, s.log))
-	repositorySvc := repositoryservice.WrapWithTracing(
-		repositoryservice.NewServiceHandler(repositoryStore, eventsSvc, s.log))
 	labelSyncMappingStore := labelsyncmappingstore.NewStore(s.db, s.log.WithField("pkg", "labelsyncmapping-store"))
 	labelSyncMappingSvc, err := labelsyncmappingservice.NewService(labelSyncMappingStore, deviceStore, eventsSvc, s.log)
 	if err != nil {
@@ -465,7 +480,7 @@ func (s *Server) Run(ctx context.Context) error {
 		ws.RegisterRoutes(r)
 	})
 
-	handler := otelhttp.NewHandler(router, "http-server")
+	handler := otelhttp.NewHandler(router, "http-server", otelhttp.WithServerName(s.cfg.Service.Address))
 	srv := fcmiddleware.NewHTTPServer(handler, s.log, s.cfg.Service.Address, s.cfg)
 
 	go func() {

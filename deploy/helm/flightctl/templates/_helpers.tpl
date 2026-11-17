@@ -689,30 +689,44 @@ Usage: {{- include "flightctl.vulnerabilityQuayCaVolumes" . | nindent X }}
 {{- /*
 Determine whether to use externalCertificate on edge-terminated routes.
 Returns: "true" or "false"
-- "auto" (default): use on fresh install; on upgrade, preserve existing behavior
-  by checking whether the specified route already has externalCertificate set.
+- "auto" (default): use the synchronous builtin certificate on install and
+  upgrade; for asynchronous certificates, wait until the generated Secret
+  exists or preserve the existing Route behavior.
 - "true": always use
 - "false": never use
-Usage: {{- $useExtCert := include "flightctl.useRouteExternalCertificate" (dict "root" . "routeName" "flightctl-ui") }}
+Usage: {{- $useExtCert := include "flightctl.useRouteExternalCertificate" (dict "root" . "routeName" "flightctl-ui" "secretName" "flightctl-ui-server-tls") }}
 */}}
 {{- define "flightctl.useRouteExternalCertificate" }}
   {{- $root := .root }}
   {{- $routeName := .routeName }}
+  {{- $secretName := .secretName }}
   {{- $val := $root.Values.global.routeExternalCertificate | default "auto" | toString }}
+  {{- $existingRoute := dict }}
+  {{- $existingSecret := dict }}
+  {{- $existingRouteUsesExternalCertificate := false }}
+  {{- if ne $val "false" }}
+    {{- $existingRoute = lookup "route.openshift.io/v1" "Route" $root.Release.Namespace $routeName }}
+    {{- $existingSecret = lookup "v1" "Secret" $root.Release.Namespace $secretName }}
+    {{- $existingRouteUsesExternalCertificate = and $existingRoute $existingRoute.spec $existingRoute.spec.tls (hasKey $existingRoute.spec.tls "externalCertificate") }}
+  {{- end }}
+  {{- $certificateMethod := include "flightctl.getCertificateGenerationMethod" $root }}
   {{- if eq $val "true" }}
-    {{- print "true" }}
+    {{- if and (eq $certificateMethod "cert-manager") (not $existingSecret) (not $existingRouteUsesExternalCertificate) }}
+      {{- print "false" }}
+    {{- else }}
+      {{- print "true" }}
+    {{- end }}
   {{- else if eq $val "false" }}
     {{- print "false" }}
   {{- else }}
-    {{- if $root.Release.IsInstall }}
+    {{- if $existingRouteUsesExternalCertificate }}
+      {{- print "true" }}
+    {{- else if $existingSecret }}
+      {{- print "true" }}
+    {{- else if eq (include "flightctl.getCertificateGenerationMethod" $root) "builtin" }}
       {{- print "true" }}
     {{- else }}
-      {{- $existingRoute := lookup "route.openshift.io/v1" "Route" $root.Release.Namespace $routeName }}
-      {{- if and $existingRoute $existingRoute.spec $existingRoute.spec.tls (hasKey $existingRoute.spec.tls "externalCertificate") }}
-        {{- print "true" }}
-      {{- else }}
-        {{- print "false" }}
-      {{- end }}
+      {{- print "false" }}
     {{- end }}
   {{- end }}
 {{- end }}
@@ -898,6 +912,7 @@ auth:
     {{- end }}
     {{- else }}
     oidc:
+        prompt: {{ if eq .Values.global.auth.oidc.prompt nil }}"select_account"{{ else }}{{ .Values.global.auth.oidc.prompt | quote }}{{ end }}
         oidcAuthority: {{ .Values.global.auth.oidc.issuer }}
         clientId: {{ .Values.global.auth.oidc.clientId }}
         {{- if .Values.global.auth.oidc.clientSecret }}
@@ -1024,4 +1039,30 @@ encryption:
           path: {{ printf "/root/.flightctl/encryption/%s" .file | quote }}
     {{- end }}
 {{- end }}
+{{- end -}}
+
+
+{{- define "flightctl.firmwareUpdaterCatalogConfig" -}}
+{{- if .Values.global.firmwareUpdaterCatalog.configMapName -}}
+firmwareUpdaterCatalogFile: /etc/flightctl/firmware/updaters.yaml
+{{- end -}}
+{{- end -}}
+
+{{- define "flightctl.firmwareUpdaterCatalogMount" -}}
+{{- if .Values.global.firmwareUpdaterCatalog.configMapName -}}
+- name: firmware-updater-catalog
+  mountPath: /etc/flightctl/firmware
+  readOnly: true
+{{- end -}}
+{{- end -}}
+
+{{- define "flightctl.firmwareUpdaterCatalogVolume" -}}
+{{- if .Values.global.firmwareUpdaterCatalog.configMapName -}}
+- name: firmware-updater-catalog
+  configMap:
+    name: {{ .Values.global.firmwareUpdaterCatalog.configMapName | quote }}
+    items:
+      - key: {{ .Values.global.firmwareUpdaterCatalog.key | quote }}
+        path: updaters.yaml
+{{- end -}}
 {{- end -}}

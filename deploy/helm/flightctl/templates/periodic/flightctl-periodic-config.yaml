@@ -8,6 +8,7 @@ metadata:
     flightctl.service: flightctl-periodic
 data:
   config.yaml: |-
+    {{- include "flightctl.firmwareUpdaterCatalogConfig" . | nindent 4 }}
     database:
         hostname: {{ include "flightctl.dbHostname" . }}
         type: "pgsql"
@@ -29,6 +30,9 @@ data:
     kv:
         hostname: flightctl-kv.{{ default .Release.Namespace .Values.global.internalNamespace }}.svc.cluster.local
         port: 6379
+    {{- $delta := default dict .Values.deltaGeneration }}
+    deltaGeneration:
+        completionTimeout: {{ default "10m" $delta.completionTimeout }}
     {{ if (default dict .Values.periodic).metrics }}
     metrics:
         enabled: {{ .Values.periodic.metrics.enabled }}

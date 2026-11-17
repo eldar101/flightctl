@@ -27,6 +27,8 @@ You can install the Flight Control Service on any certified Kubernetes distribut
 
 It is recommended to install `cert-manager` before installing Flight Control. When the Flight Control installer detects `cert-manager`, it will use it to issue and manage required CA and server TLS certificates. Otherwise, it falls back to creating certificates using Helm's built-in functions once, but does not manage them.
 
+The Helm chart provides initial `LabelSyncMapping` resources for each organization. To replace these defaults or disable their creation, see [Configuring initial mappings](../using/managing-dynamic-mappings.md#configure-initial-mappings).
+
 ### Configuring delta generation
 
 OS and application delta generation requires a valid, writable OCI storage target. Configure one using either option:
@@ -57,6 +59,8 @@ kubectl create secret generic delta-registry-creds \
 The files contain the registry username and password or token. The chart injects these credentials into the delta worker through the Secret, separately from the rendered service configuration.
 
 Ensure the registry is reachable from both the control plane and the device agent. See [Delta storage target access requirements](../using/managing-repositories.md#configuring-a-delta-storage-target) for credentials and TLS trust.
+
+The delta worker runs `oci-delta`, which must run as root with the `SYS_ADMIN` capability. The chart sets that security context on the delta-worker container. On OpenShift, it also creates a security context constraint (SCC) named `flightctl-delta-worker` for the delta-worker service account. A restricted policy otherwise assigns a non-root user id, and generation fails while creating the delta. If the installation namespace enforces a restricted or baseline Pod Security Standard, label that namespace `privileged`, as described for the image builder in the Helm chart README.
 
 You can also configure generation concurrency, job timeouts, and update wait defaults through Helm values. See [Delta generation configuration](installing-service-on-linux-configuration.md#delta-generation-configuration) for the shared `deltaGeneration` keys used by both Helm and Podman deployments.
 

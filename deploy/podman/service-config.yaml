@@ -30,6 +30,8 @@ global:
         - read
         - write
     oidc:
+      # Authorization prompt exposed to login clients. Empty string omits the parameter; omitted or null defaults to select_account.
+      prompt: "select_account"
       clientId: flightctl-client
       clientSecret:  # Optional: Client secret for OIDC provider (injected by token proxy)
       enabled: true
@@ -226,6 +228,10 @@ prometheus:
 #     scheme: https
 #     skipServerVerification: false
 #     # ca.crt: <base64-encoded PEM>
+#   maxConcurrentDeltaGenerations: 2
+#   timeout: 30m
+#   completionTimeout: 10m
+#   maxWaitForDelta: 10m
 
 # Automated dependency synchronization (optional).
 # Controls the global polling interval for git/HTTP dependency probes.

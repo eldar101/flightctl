@@ -43,7 +43,9 @@ The `flightctl-imagebuilder-worker` component requires elevated privileges to bu
 - Host device access (`/dev`, `/sys`, `/lib/modules`)
 - Capabilities: `SYS_ADMIN`, `MKNOD`, `SYS_CHROOT`, `SETFCAP`
 
-If your namespace enforces the "restricted" Pod Security Standard, you will see warnings during deployment. To suppress these warnings, configure the namespace labels:
+The `flightctl-delta-worker` component runs `oci-delta` to generate OS and application image deltas. The container must run as root and add `SYS_ADMIN`. A restricted policy assigns a non-root uid, and delta generation then fails while creating the delta.
+
+If your namespace enforces the "restricted" or "baseline" Pod Security Standard, you will see warnings during deployment. To suppress these warnings, configure the namespace labels:
 
 ```bash
 kubectl label namespace <namespace> \
@@ -52,7 +54,7 @@ kubectl label namespace <namespace> \
   pod-security.kubernetes.io/audit=privileged
 ```
 
-On OpenShift clusters, the chart automatically creates a SecurityContextConstraints (SCC) that grants the required permissions to the `flightctl-imagebuilder-worker` service account.
+On OpenShift clusters, the chart automatically creates a security context constraint (SCC) for the `flightctl-imagebuilder-worker` and `flightctl-delta-worker` service accounts.
 
 For additional ImageBuilder Worker configuration options (custom RPM repositories, RHEL entitlement certificates), see the [ImageBuilder configuration documentation](../../../docs/user/installing/configuring-imagebuilder.md).
 
@@ -86,7 +88,7 @@ helm install my-{{ .Name }} oci://quay.io/flightctl/charts/{{ .Name }} -f values
 helm install my-{{ .Name }} oci://quay.io/flightctl/charts/{{ .Name }} --namespace flightctl --create-namespace
 ```
 
-{{ if eq .Name "flightctl" }}
+{{ if or (eq .Name "flightctl") (eq .Name "redhat-rhem") }}
 ### Install from the OpenShift Software Catalog
 
 Prerequisites:
@@ -306,6 +308,23 @@ helm install my-flightctl oci://quay.io/flightctl/charts/flightctl -f values.acm
 # Combine multiple values files (later files override earlier ones)
 helm install my-flightctl oci://quay.io/flightctl/charts/flightctl -f values.yaml -f values.acm.yaml -f my-custom.yaml
 ```
+
+## Firmware updater catalog
+
+Set `global.firmwareUpdaterCatalog.configMapName` to an administrator-created
+ConfigMap containing the complete catalog under the data key selected by
+`global.firmwareUpdaterCatalog.key` (default `updaters.yaml`). The API process
+(including the agent API), worker, and periodic pods mount this input read-only.
+This configuration is independent of the application Catalog API.
+
+Provide identical ConfigMaps in the release namespace and, when different,
+`global.internalNamespace`. Use a new immutable ConfigMap name for each higher
+catalog revision so updating the Helm value rolls all authorization runtimes.
+There is no file watcher. Removing the ConfigMap name uses previously accepted
+database state; it does not erase authorization history or revoke releases.
+
+See the [updater catalog contract](../../../docs/developer/architecture/updater-catalog.md)
+for validation, retained revocations, failure recovery, and execution gates.
 
 ## Contributing
 
